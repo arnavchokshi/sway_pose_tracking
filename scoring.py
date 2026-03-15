@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
 from scipy.stats import circmean
+from scipy.signal import correlate
 
 from kinematics import (
     JOINT_NAMES,
@@ -160,7 +161,18 @@ def _compute_shape_and_timing_cdtw(
         if not (np.isnan(track_window[i]) or np.isnan(group_window[j]))
     ]
     shape_err = float(np.mean(shape_diffs)) if shape_diffs else float(dist / max(1, len(i_idx)))
-    timing_err = float(np.mean(j_idx.astype(float) - i_idx.astype(float))) if len(i_idx) > 0 else 0.0
+    
+    # Phase-Correlation for robust timing error over the entire window
+    if np.std(track_1d) == 0 or np.std(group_1d) == 0:
+        timing_err = 0.0
+    else:
+        t_norm = track_1d - np.mean(track_1d)
+        g_norm = group_1d - np.mean(group_1d)
+        corr = correlate(t_norm, g_norm, mode='full')
+        lags = np.arange(-len(g_norm) + 1, len(t_norm))
+        # Find peak correlation offset
+        timing_err = float(lags[np.argmax(corr)])
+        
     return shape_err, timing_err
 
 

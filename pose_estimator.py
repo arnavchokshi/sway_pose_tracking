@@ -108,6 +108,7 @@ class PoseEstimator:
         frame: np.ndarray,
         boxes: List[Tuple[float, float, float, float]],
         track_ids: List[int],
+        paddings: List[float] = None,
     ) -> Dict[int, Dict]:
         """
         Estimate 17 COCO keypoints for each bounding box.
@@ -116,6 +117,7 @@ class PoseEstimator:
             frame: RGB image (H, W, 3), uint8.
             boxes: List of (x1, y1, x2, y2) in xyxy format.
             track_ids: List of track IDs, one per box.
+            paddings: Optional list of padding bounds for each box.
 
         Returns:
             Dict mapping track_id to {"keypoints": (17, 3), "scores": (17,)}.
@@ -128,9 +130,14 @@ class PoseEstimator:
         # Do NOT loop over dancers — stacking into [N, 3, 256, 192] maximizes MPS/CUDA parallelism.
         assert len(boxes) == len(track_ids), "boxes and track_ids must be 1:1"
         img_h, img_w = frame.shape[:2]
-        # Expand bboxes by 15% to avoid cropping off limbs (e.g. fast hand raises)
+        
+        if paddings is None:
+            paddings = [BBOX_PADDING] * len(boxes)
+        assert len(paddings) == len(boxes), "paddings and boxes must match"
+
+        # Expand bboxes by dynamic padding to avoid cropping off limbs
         boxes_expanded = [
-            _expand_bbox(b, img_w, img_h) for b in boxes
+            _expand_bbox(b, img_w, img_h, pad) for b, pad in zip(boxes, paddings)
         ]
         # Convert boxes to COCO format (x, y, w, h). Format: list of boxes per image for batching.
         boxes_coco = [xyxy_to_coco(b) for b in boxes_expanded]

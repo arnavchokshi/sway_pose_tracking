@@ -1,11 +1,16 @@
 """
-Phase 2: Crossover Management — OKS-Based Dense Overlap Handling
+Phase 2: Crossover Management — OKS-Based Dense Overlap Handling (V3.4)
 
 Handles dancer overlaps using Object Keypoint Similarity (OKS):
 - Crossover Entry: When IoU > 0.6 between two track boxes, switch to OKS matching
 - OKS Occlusion Fallback: When total keypoint confidence < 0.3, suspend matching
   and project box forward using Constant Velocity Model (CVM)
 - Crossover Exit: When IoU < 0.4 for 3 consecutive frames, return to standard tracking
+
+V3.4 additions:
+- Visibility Scoring: Per-track visibility [0,1] using containment + foot-position depth
+- Keypoint Collision Dedup: Detect duplicate pose overlays via median keypoint distance
+- Hybrid CVM: CVM for first 5 frames of occlusion, then freeze + confidence decay
 
 Runs AFTER pose estimation (requires keypoints). All math vectorized with NumPy.
 """
@@ -30,7 +35,21 @@ OKS_OCCLUSION_THRESHOLD = 0.3  # Total keypoint confidence below this -> CVM gho
 
 # V3.0: Occlusion re-ID — align with track_buffer=90
 REID_MAX_FRAME_GAP = 90  # Max frames between dead track end and newborn start (3s @ 30 FPS)
-REID_MIN_OKS = 0.5  # Min OKS between last pose of dead and first pose of newborn to merge
+REID_MIN_OKS = 0.35
+
+# V3.4: Visibility scoring
+VISIBILITY_CONTAINMENT_THRESH = 0.7
+VISIBILITY_MIN_SCORE = 0.3
+
+# V3.4: Hybrid CVM constants
+CVM_MAX_FRAMES = 5
+CVM_VELOCITY_DECAY = 0.9
+CONF_DECAY_FACTOR = 0.85
+BLEND_FRAMES = 3
+
+# V3.4: Keypoint collision dedup thresholds
+COLLISION_KPT_DIST_FRAC = 0.2
+COLLISION_CENTER_DIST_FRAC = 0.3
 
 
 def _box_areas(boxes: np.ndarray) -> np.ndarray:
@@ -117,6 +136,102 @@ def _compute_velocity(
     return np.array([cx_curr - cx_prev, cy_curr - cy_prev], dtype=np.float64)
 
 
+def _compute_containment(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """
+    Fraction of box_a's area that is contained within box_b. [0, 1].
+    1.0 means box_a is fully inside box_b.
+    """
+    x1_inter = max(box_a[0], box_b[0])
+    y1_inter = max(box_a[1], box_b[1])
+    x2_inter = min(box_a[2], box_b[2])
+    y2_inter = min(box_a[3], box_b[3])
+    if x2_inter <= x1_inter or y2_inter <= y1_inter:
+        return 0.0
+    inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+    area_a = max((box_a[2] - box_a[0]) * (box_a[3] - box_a[1]), 1e-6)
+    return float(inter_area / area_a)
+
+
+def compute_visibility_scores(
+    boxes: List[Tuple[float, float, float, float]],
+    track_ids: List[int],
+) -> Dict[int, float]:
+    """
+    V3.4: Per-track visibility score [0, 1]. 0 = fully occluded behind another dancer.
+    Uses foot Y-position (ymax) for depth ordering: lower feet = closer to camera = in front.
+    A track is considered occluded when its box is largely contained within a box that
+    has lower feet (is in front).
+    """
+    n = len(boxes)
+    if n == 0:
+        return {}
+    scores = np.ones(n, dtype=np.float64)
+    boxes_arr = np.array(boxes, dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            containment = _compute_containment(boxes_arr[i], boxes_arr[j])
+            ymax_i = boxes_arr[i][3]
+            ymax_j = boxes_arr[j][3]
+            i_is_behind = ymax_i < ymax_j
+            if containment > VISIBILITY_CONTAINMENT_THRESH and i_is_behind:
+                scores[i] = min(scores[i], 1.0 - containment)
+    return {tid: float(scores[idx]) for idx, tid in enumerate(track_ids)}
+
+
+def deduplicate_collocated_poses(
+    frame_data: Dict[str, Any],
+    kpt_dist_frac: float = COLLISION_KPT_DIST_FRAC,
+    center_dist_frac: float = COLLISION_CENTER_DIST_FRAC,
+) -> None:
+    """
+    V3.4: Remove duplicate pose overlays on the same physical person.
+    Uses median keypoint distance (robust to hallucinated outlier keypoints) and
+    requires bbox centers to also be close (protects legitimate partner work).
+    Suppresses the lower-confidence track. Modifies frame_data in-place.
+    """
+    poses = frame_data.get("poses", {})
+    track_ids = frame_data.get("track_ids", [])
+    boxes = frame_data.get("boxes", [])
+    if len(track_ids) < 2:
+        return
+
+    to_suppress = set()
+    for i, tid_a in enumerate(track_ids):
+        if tid_a in to_suppress or tid_a not in poses:
+            continue
+        for j in range(i + 1, len(track_ids)):
+            tid_b = track_ids[j]
+            if tid_b in to_suppress or tid_b not in poses:
+                continue
+            kpts_a = poses[tid_a]["keypoints"]
+            kpts_b = poses[tid_b]["keypoints"]
+            if kpts_a.shape[0] < 17 or kpts_b.shape[0] < 17:
+                continue
+
+            per_kpt_dist = np.linalg.norm(kpts_a[:17, :2] - kpts_b[:17, :2], axis=1)
+            median_dist = float(np.median(per_kpt_dist))
+            bbox_h = max(boxes[i][3] - boxes[i][1], boxes[j][3] - boxes[j][1], 1.0)
+
+            if median_dist > kpt_dist_frac * bbox_h:
+                continue
+
+            center_a = np.array([(boxes[i][0]+boxes[i][2])/2, (boxes[i][1]+boxes[i][3])/2])
+            center_b = np.array([(boxes[j][0]+boxes[j][2])/2, (boxes[j][1]+boxes[j][3])/2])
+            center_dist = float(np.linalg.norm(center_a - center_b))
+            if center_dist > center_dist_frac * bbox_h:
+                continue
+
+            conf_a = float(np.mean(kpts_a[:17, 2]))
+            conf_b = float(np.mean(kpts_b[:17, 2]))
+            to_suppress.add(tid_b if conf_a >= conf_b else tid_a)
+
+    for tid in to_suppress:
+        if tid in poses:
+            del poses[tid]
+
+
 def apply_occlusion_reid(
     all_frame_data: List[Dict[str, Any]],
     max_frame_gap: int = REID_MAX_FRAME_GAP,
@@ -193,10 +308,42 @@ def apply_occlusion_reid(
 
     for fd in all_frame_data:
         track_ids = fd.get("track_ids", [])
+        if not track_ids:
+            continue
+            
+        boxes = fd.get("boxes", [])
         poses = fd.get("poses", {})
-        new_track_ids = [merge_map.get(tid, tid) for tid in track_ids]
-        new_poses = {merge_map.get(tid, tid): poses[tid] for tid in track_ids if tid in poses}
+        
+        unique_tids = {}  # mapped_tid -> (best_idx, score)
+        
+        for idx, tid in enumerate(track_ids):
+            mapped_tid = merge_map.get(tid, tid)
+            
+            # Score this detection to keep the best one if A and B overlap
+            score = 0.0
+            if tid in poses:
+                # Use keypoint confidence as primary score
+                kpts = poses[tid]["keypoints"]
+                score += sum(k[2] for k in kpts)
+            # Add area as secondary score
+            area = (boxes[idx][2] - boxes[idx][0]) * (boxes[idx][3] - boxes[idx][1])
+            score += area * 1e-6
+            
+            if mapped_tid not in unique_tids or score > unique_tids[mapped_tid][1]:
+                unique_tids[mapped_tid] = (idx, score, tid)
+                
+        # Reconstruct frame data without duplicates
+        new_track_ids = []
+        new_boxes = []
+        new_poses = {}
+        for mapped_tid, (original_idx, _, original_tid) in unique_tids.items():
+            new_track_ids.append(mapped_tid)
+            new_boxes.append(boxes[original_idx])
+            if original_tid in poses:
+                new_poses[mapped_tid] = poses[original_tid]
+                
         fd["track_ids"] = new_track_ids
+        fd["boxes"] = new_boxes
         fd["poses"] = new_poses
 
     return all_frame_data
@@ -234,6 +381,10 @@ def apply_crossover_refinement(
     track_last_pose: Dict[int, np.ndarray] = {}
     track_last_box: Dict[int, Tuple[float, float, float, float]] = {}
     track_velocity: Dict[int, np.ndarray] = {}
+    track_kpt_velocity: Dict[int, np.ndarray] = {}  # shape (17, 2)
+    track_occlusion_frames: Dict[int, int] = {}  # V3.4: frames spent occluded
+    track_frozen_pose: Dict[int, np.ndarray] = {}  # V3.4: pose frozen after CVM phase
+    track_re_emerging: Dict[int, int] = {}  # V3.4: blend-back frame counter
     pair_overlap_count: Dict[Tuple[int, int], int] = {}
     pair_in_crossover: Dict[Tuple[int, int], bool] = {}
 
@@ -283,14 +434,18 @@ def apply_crossover_refinement(
             pair_overlap_count[pair] = 0
             pair_in_crossover[pair] = True
 
-        # Process occlusion: ghost boxes with low keypoint confidence
+        # V3.4 Hybrid CVM: ghost boxes with low keypoint confidence
         new_boxes = list(boxes)
         for idx, tid in enumerate(tids):
             if tid not in poses:
                 continue
             kpts = poses[tid]["keypoints"]
             total_conf = _compute_total_keypoint_confidence(kpts)
+
             if total_conf < occlusion_thresh and tid in track_last_box and tid in track_velocity:
+                occ_frames = track_occlusion_frames.get(tid, 0) + 1
+                track_occlusion_frames[tid] = occ_frames
+
                 # CVM: project box forward
                 last_box = track_last_box[tid]
                 v = track_velocity[tid]
@@ -304,7 +459,47 @@ def apply_crossover_refinement(
                     new_cx + w / 2, new_cy + h / 2,
                 )
                 new_boxes[idx] = new_box
-                # Don't update track state from occluded pose
+
+                if tid in track_last_pose:
+                    if occ_frames <= CVM_MAX_FRAMES:
+                        # Phase 1: CVM extrapolation (frames 1-5) — preserve momentum
+                        if tid in track_kpt_velocity:
+                            v_kpt = track_kpt_velocity[tid]
+                            new_pose = track_last_pose[tid].copy()
+                            track_kpt_velocity[tid] = v_kpt * CVM_VELOCITY_DECAY
+                            new_pose[:17, :2] += track_kpt_velocity[tid]
+                            poses[tid]["keypoints"] = new_pose
+                            track_frozen_pose[tid] = new_pose.copy()
+                        else:
+                            poses[tid]["keypoints"] = track_last_pose[tid].copy()
+                            track_frozen_pose[tid] = track_last_pose[tid].copy()
+                    else:
+                        # Phase 2: Freeze pose + decay confidence (frames 6+)
+                        frozen = track_frozen_pose.get(tid, track_last_pose[tid]).copy()
+                        frozen[:17, 2] *= CONF_DECAY_FACTOR
+                        track_frozen_pose[tid] = frozen
+                        poses[tid]["keypoints"] = frozen
+                        poses[tid]["scores"] = frozen[:17, 2].copy()
+            else:
+                # Track is visible — handle re-emergence blending
+                prev_occ = track_occlusion_frames.get(tid, 0)
+                if prev_occ > 0 and tid in track_frozen_pose:
+                    blend_count = track_re_emerging.get(tid, 0) + 1
+                    track_re_emerging[tid] = blend_count
+                    if blend_count <= BLEND_FRAMES:
+                        t = blend_count / BLEND_FRAMES
+                        frozen = track_frozen_pose[tid]
+                        live = kpts.copy()
+                        blended = (1.0 - t) * frozen[:17] + t * live[:17]
+                        blended[:, 2] = live[:17, 2]
+                        poses[tid]["keypoints"] = blended
+                    else:
+                        track_re_emerging.pop(tid, None)
+                        track_frozen_pose.pop(tid, None)
+                else:
+                    track_re_emerging.pop(tid, None)
+                    track_frozen_pose.pop(tid, None)
+                track_occlusion_frames[tid] = 0
 
         fd["boxes"] = new_boxes
         boxes = new_boxes
@@ -340,14 +535,20 @@ def apply_crossover_refinement(
                 swap_map[i] = tid_j
                 swap_map[j] = tid_i
 
-        # Apply swaps: reassign track_ids and poses (box i's pose goes to new_tid)
+        # Apply swaps: reassign track_ids and poses
         if swap_map:
             new_track_ids = list(track_ids)
             new_poses = {tid: data for tid, data in poses.items()}
-            for idx, new_tid in swap_map.items():
-                old_tid = tids[idx]
-                new_track_ids[idx] = new_tid
-                new_poses[new_tid] = poses[old_tid]
+
+            for idx, old_tid in enumerate(track_ids):
+                if idx in swap_map:
+                    new_tid = swap_map[idx]
+                    new_track_ids[idx] = new_tid
+                    if old_tid in poses:
+                        new_poses[new_tid] = poses[old_tid]
+                        if old_tid in new_poses and old_tid != new_tid:
+                            del new_poses[old_tid]
+
             fd["track_ids"] = new_track_ids
             fd["poses"] = new_poses
             tids = new_track_ids
@@ -373,6 +574,12 @@ def apply_crossover_refinement(
                             track_velocity[tid] = _compute_velocity(
                                 tuple(pboxes[pidx]), tuple(boxes[idx])
                             )
+                            if tid in track_last_pose:
+                                prev_poses = pfd.get("poses", {})
+                                if tid in prev_poses:
+                                    pkpts = prev_poses[tid]["keypoints"]
+                                    if pkpts.shape[0] >= 17:
+                                        track_kpt_velocity[tid] = kpts[:17, :2] - pkpts[:17, :2]
                             break
 
     return all_frame_data

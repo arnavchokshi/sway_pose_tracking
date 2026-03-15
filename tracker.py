@@ -1,15 +1,9 @@
 """
-Detection & Tracking Module — YOLO11l + BoT-SORT (V3.3)
+Detection & Tracking Module — YOLO11l + BoT-SORT (V3.4)
 
 V3.0: Streaming 300-frame chunks, native FPS, YOLO11l conf=0.25.
-- Reads video in chunks to avoid full RAM load
-- Processes at native frame rate (30+ FPS) — no decimation
-- YOLO11l (Large) at 640x640, conf=0.25 for higher recall
-- BoT-SORT track_buffer=90 (3s at 30 FPS)
-- Wave 1 box stitch within 90 frames
-
-V3.3: YOLO runs on every frame (restored from V3.0) for better dancer detection.
-Coexistence dedup and min_hits removed — they were merging/dropping real dancers.
+V3.3: YOLO runs on every frame for better dancer detection.
+V3.4: Relative stitch radius (0.5x bbox height) + velocity-consistency check.
 
 Double-Layer Tracking: Base tracker + OKS crossover refinement (see crossover.py)
 handles dense overlaps when IoU > 0.6.
@@ -29,18 +23,70 @@ CHUNK_SIZE = 300
 DETECT_SIZE = 640
 
 # V3.0: YOLO confidence — lower to catch more dancers (pruning removes false positives)
-YOLO_CONF = 0.25
+YOLO_CONF = 0.40
 
-# Stitching params: occlusion drop-out recovery (V3.0: 90 frames = 3s @ 30 FPS)
-STITCH_MAX_FRAME_GAP = 90
+# YOLO detection stride: 1 = every frame, 2 = even frames only (2x speed, minimal accuracy loss)
+# Odd frames filled via linear interpolation before downstream phases.
+YOLO_DETECTION_STRIDE = 1
+
+# Stitching params: occlusion drop-out recovery (V3.0: 180 frames = 6s @ 30 FPS, or 3s @ 15fps YOLO)
+STITCH_MAX_FRAME_GAP = 60
+# V3.4: Relative stitch radius — fraction of track's last bbox height
+STITCH_RADIUS_BBOX_FRAC = 0.5
+# Fallback absolute radius when bbox height unavailable
 STITCH_MAX_PIXEL_RADIUS = 120.0
-STITCH_PREDICTED_RADIUS = 180.0
+STITCH_PREDICTED_RADIUS_FRAC = 0.75
+# Short-gap threshold: gaps this short use generous matching (no velocity check)
+SHORT_GAP_FRAMES = 20
 
 
 def _box_center(box: Tuple) -> Tuple[float, float]:
     """(x1,y1,x2,y2) -> (cx, cy)."""
     x1, y1, x2, y2 = box
     return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _compute_iou(box1: Tuple[float, float, float, float], box2: Tuple[float, float, float, float]) -> float:
+    """Compute Intersection over Union between two boxes (x1, y1, x2, y2)."""
+    x1_inter = max(box1[0], box2[0])
+    y1_inter = max(box1[1], box2[1])
+    x2_inter = min(box1[2], box2[2])
+    y2_inter = min(box1[3], box2[3])
+
+    if x2_inter <= x1_inter or y2_inter <= y1_inter:
+        return 0.0
+
+    inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = area1 + area2 - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def _fill_stride_gaps(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    stride: int,
+) -> None:
+    """
+    Fill missing frame entries when YOLO runs only every Nth frame.
+    Inserts linearly interpolated boxes for skipped frames. Modifies raw_tracks in place.
+    """
+    if stride <= 1:
+        return
+    for tid, entries in list(raw_tracks.items()):
+        sorted_entries = sorted(entries, key=lambda e: e[0])
+        new_entries = []
+        for i, (f, box, conf) in enumerate(sorted_entries):
+            new_entries.append((f, box, conf))
+            if i + 1 < len(sorted_entries):
+                next_f, next_box, _ = sorted_entries[i + 1]
+                for gap_f in range(f + 1, next_f):
+                    t = (gap_f - f) / (next_f - f)
+                    interp_box = _interpolate_box(box, next_box, t)
+                    new_entries.append((gap_f, interp_box, 0.5))
+        raw_tracks[tid] = sorted(new_entries, key=lambda e: e[0])
 
 
 def _interpolate_box_sequence(
@@ -80,28 +126,29 @@ def _estimate_track_velocity(entries: List[Tuple[int, Tuple, float]], n_tail: in
     return (vx, vy)
 
 
+def _bbox_height(box: Tuple) -> float:
+    """(x1,y1,x2,y2) -> height."""
+    return box[3] - box[1]
+
+
 def stitch_fragmented_tracks(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     total_frames: int,
     max_frame_gap: int = STITCH_MAX_FRAME_GAP,
-    max_pixel_radius: float = STITCH_MAX_PIXEL_RADIUS,
-    max_predicted_radius: float = STITCH_PREDICTED_RADIUS,
+    radius_bbox_frac: float = STITCH_RADIUS_BBOX_FRAC,
+    predicted_radius_frac: float = STITCH_PREDICTED_RADIUS_FRAC,
+    fallback_radius: float = STITCH_MAX_PIXEL_RADIUS,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
-    Stitch tracks that fragmented due to occlusion. When ID_A dies and ID_B appears
-    within max_frame_gap and near A's last or predicted position, merge B into A
-    with linear interpolation across the gap.
-
-    Uses velocity extrapolation: if A was moving before occlusion, predicts where
-    A would reappear and accepts B if B is near that predicted position (handles
-    performers moving while covered).
+    V3.4: Stitch tracks that fragmented due to occlusion. Uses relative stitch
+    radius (fraction of bbox height) instead of fixed pixel radius. Adds
+    velocity-consistency check to prevent merging unrelated tracks.
 
     Modifies raw_tracks in place and returns it.
     """
     if total_frames <= 0 or not raw_tracks:
         return raw_tracks
 
-    # Build: track_id -> (first_frame, last_frame, first_box, last_box, entries)
     track_info: Dict[int, Dict] = {}
     for tid, entries in raw_tracks.items():
         if not entries:
@@ -117,7 +164,6 @@ def stitch_fragmented_tracks(
             "entries": sorted_entries,
         }
 
-    # Iterate until no more stitch candidates (handles A->B->C chains)
     changed = True
     while changed:
         changed = False
@@ -132,12 +178,16 @@ def stitch_fragmented_tracks(
             info_a = track_info[tid_a]
             frame_a_last = info_a["last_frame"]
             cx_a, cy_a = _box_center(info_a["last_box"])
+            h_a = _bbox_height(info_a["last_box"])
 
-            # Velocity extrapolation: predict where A would be at B's first frame
+            # V3.4: Radius scales with bbox height
+            radius_last = max(radius_bbox_frac * h_a, fallback_radius * 0.5) if h_a > 0 else fallback_radius
             vx, vy = _estimate_track_velocity(info_a["entries"])
+            has_velocity = (vx != 0 or vy != 0)
+            radius_pred = max(predicted_radius_frac * h_a, fallback_radius * 0.75) if (has_velocity and h_a > 0) else radius_last
 
             best_b = None
-            best_dist = max(max_pixel_radius, max_predicted_radius) + 1.0
+            best_dist = max(radius_last, radius_pred) + 1.0
 
             for tid_b, info_b in list(track_info.items()):
                 if tid_b == tid_a:
@@ -148,24 +198,37 @@ def stitch_fragmented_tracks(
                     continue
                 cx_b, cy_b = _box_center(info_b["first_box"])
 
-                # Distance from A's last position (stationary occlusion)
+                short_gap = gap <= SHORT_GAP_FRAMES
+
+                # Short gaps: generous radius (1x bbox height), no velocity check
+                eff_radius_last = max(h_a, fallback_radius) if (short_gap and h_a > 0) else radius_last
+                eff_radius_pred = eff_radius_last if short_gap else radius_pred
+
                 dist_last = np.sqrt((cx_b - cx_a) ** 2 + (cy_b - cy_a) ** 2)
-                # Distance from A's predicted position (moving occlusion)
                 pred_cx = cx_a + vx * gap
                 pred_cy = cy_a + vy * gap
                 dist_pred = np.sqrt((cx_b - pred_cx) ** 2 + (cy_b - pred_cy) ** 2)
 
-                # Match if B is near last position OR near predicted position
-                radius_last = max_pixel_radius
-                radius_pred = max_predicted_radius if (vx != 0 or vy != 0) else max_pixel_radius
-                if (dist_last <= radius_last or dist_pred <= radius_pred) and min(dist_last, dist_pred) < best_dist:
-                    best_dist = min(dist_last, dist_pred)
+                spatial_ok = (dist_last <= eff_radius_last or dist_pred <= eff_radius_pred)
+                if not spatial_ok:
+                    continue
+
+                if not short_gap and has_velocity and len(info_b["entries"]) >= 3:
+                    vx_b, vy_b = _estimate_track_velocity(info_b["entries"], n_tail=min(5, len(info_b["entries"])))
+                    dot = vx * vx_b + vy * vy_b
+                    speed_a = np.sqrt(vx**2 + vy**2)
+                    speed_b = np.sqrt(vx_b**2 + vy_b**2)
+                    if speed_a > 1.0 and speed_b > 1.0 and dot < 0:
+                        continue
+
+                candidate_dist = min(dist_last, dist_pred)
+                if candidate_dist < best_dist:
+                    best_dist = candidate_dist
                     best_b = tid_b
 
             if best_b is None:
                 continue
 
-            # Merge: A + gap interpolation + B
             entries_a = info_a["entries"]
             entries_b = track_info[best_b]["entries"]
             box_a_last = info_a["last_box"]
@@ -187,8 +250,74 @@ def stitch_fragmented_tracks(
             }
             del track_info[best_b]
             changed = True
-            break  # Restart scan after modification
+            break
 
+    return raw_tracks
+
+
+def coalescence_deduplicate(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    iou_thresh: float = 0.65,
+    consecutive_frames: int = 10,
+) -> Dict[int, List[Tuple[int, Tuple, float]]]:
+    """
+    Remove duplicated tracks (ghosts). If two tracks overlap highly (IoU > iou_thresh)
+    for N consecutive frames, consider them the same person and delete the younger/shorter track.
+    
+    Returns raw_tracks modified in place.
+    """
+    # Restructure data to mapping of {frame: [(tid, box)...]}
+    frames_dict: Dict[int, List[Tuple[int, Tuple]]] = {}
+    track_age: Dict[int, int] = {}
+    for tid, entries in raw_tracks.items():
+        track_age[tid] = len(entries)
+        for f, box, _conf in entries:
+            if f not in frames_dict:
+                frames_dict[f] = []
+            frames_dict[f].append((tid, box))
+            
+    # Count consecutive overlaps between ID pairs
+    overlap_counts: Dict[Tuple[int, int], int] = {}
+    # tuple (tid1, tid2) where tid1 < tid2
+    
+    # Needs to be sorted so "consecutive" logic holds true
+    for f in sorted(frames_dict.keys()):
+        dets = frames_dict[f]
+        current_overlaps = set()
+        
+        for i in range(len(dets)):
+            for j in range(i + 1, len(dets)):
+                tid1, box1 = dets[i]
+                tid2, box2 = dets[j]
+                
+                iou = _compute_iou(box1, box2)
+                if iou > iou_thresh:
+                    pair = tuple(sorted([tid1, tid2]))
+                    current_overlaps.add(pair)
+                    
+        # Update running consecutive counts
+        to_delete = []
+        for pair in list(overlap_counts.keys()):
+            if pair not in current_overlaps:
+                del overlap_counts[pair]
+                
+        for pair in current_overlaps:
+            overlap_counts[pair] = overlap_counts.get(pair, 0) + 1
+
+    # Find IDs to kill
+    dead_ids = set()
+    for (tid1, tid2), count in overlap_counts.items():
+        if count >= consecutive_frames:
+            # Kill the younger track (the one with fewer total frames)
+            if track_age[tid1] >= track_age[tid2]:
+                dead_ids.add(tid2)
+            else:
+                dead_ids.add(tid1)
+                
+    for tid in dead_ids:
+        if tid in raw_tracks:
+            del raw_tracks[tid]
+            
     return raw_tracks
 
 
@@ -253,7 +382,14 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
         - frame_width: Video width
         - frame_height: Video height
     """
-    model = YOLO("yolo11l.pt")
+    model_path = "yolo11m.pt"
+    if Path("yolo11l.mlpackage").exists():
+        model_path = "yolo11l.mlpackage"
+    elif Path("yolo11m.mlpackage").exists():
+        model_path = "yolo11m.mlpackage"
+    
+    print(f"Loading detection model: {model_path}")
+    model = YOLO(model_path)
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
     total_frames = 0
     native_fps = 30.0
@@ -262,17 +398,32 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
 
     tracker_cfg = _get_tracker_config()
 
+    # Dynamic resolution scaling initialization
+    max_dancers_last_chunk = 0
+    current_detect_size = DETECT_SIZE
+
     for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, CHUNK_SIZE):
         native_fps = nfps
         frame_width = w_f
         frame_height = h_f
 
+        # Adjust detection size based on previous chunk crowd density
+        if max_dancers_last_chunk > 4:
+            current_detect_size = 960
+            # print(f"  [Dynamic Scaling] Crowd detected. Up-scaling YOLO resolution to {current_detect_size}x{current_detect_size}")
+        else:
+            current_detect_size = DETECT_SIZE
+
+        max_dancers_this_chunk = 0
+
         for frame_idx, frame in chunk_frames:
+            if frame_idx % YOLO_DETECTION_STRIDE != 0:
+                continue
             h_fr, w_fr = frame.shape[:2]
-            frame_low = cv2.resize(frame, (DETECT_SIZE, DETECT_SIZE))
+            frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
             frame_low_rgb = frame_low[:, :, ::-1]
-            scale_x = w_fr / DETECT_SIZE
-            scale_y = h_fr / DETECT_SIZE
+            scale_x = w_fr / current_detect_size
+            scale_y = h_fr / current_detect_size
 
             result = model.track(
                 frame_low_rgb,
@@ -288,9 +439,11 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
             track_ids = boxes_data["track_ids"]
             confs = boxes_data["confs"]
 
+            valid_dancers_this_frame = 0
             for i, (box, tid, conf) in enumerate(zip(boxes_low, track_ids, confs)):
                 if tid < 0:
                     continue
+                valid_dancers_this_frame += 1
                 x1, y1, x2, y2 = box
                 box_hr = (
                     float(x1 * scale_x), float(y1 * scale_y),
@@ -299,10 +452,14 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
                 if tid not in raw_tracks:
                     raw_tracks[tid] = []
                 raw_tracks[tid].append((frame_idx, box_hr, conf))
+            
+            max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
 
             if frame_idx == 0 or frame_idx == 30:
                 n = len([t for t in track_ids if t >= 0])
-                print(f"  Frame {frame_idx}: {n} persons")
+                print(f"  Frame {frame_idx}: {n} persons (YOLO resol: {current_detect_size})")
+
+        max_dancers_last_chunk = max_dancers_this_chunk
 
         total_frames += len(chunk_frames)
         del chunk_frames
@@ -311,6 +468,11 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
 
     # Post-tracking: stitch fragments from occlusion drop-outs
     raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
+    
+    # Wave 1.5: Coexistence deduplication to remove duplicate counts
+    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.50, consecutive_frames=5)
+    
+    _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
 
     return raw_tracks, total_frames, float(output_fps), None, float(native_fps), frame_width, frame_height
 

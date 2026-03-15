@@ -1,12 +1,17 @@
 """
-Phase 3 & 6: Track Pruning — V3.1 Resolution-Aware + Smart Mirror + Completeness
+Phase 3 & 6: Track Pruning — V3.4 Resolution-Aware + Smart Mirror + Completeness
 
-V3.1 Pruning:
+V3.4 Pruning (additions):
+- Spatial Outlier: Prune tracks > 2σ from group centroid (with min-spread floor + late-entrant safeguard)
+- Traversal Detector: Prune walkers (high straightness + low acceleration variance)
+- Bbox Size Outlier: Prune tracks with median bbox height outside 40–200% of group median
+- Sync Score: Post-pose prune tracks with near-zero correlation to group truth angles
+
+V3.1 Pruning (retained):
 - Duration: Must appear in > 20% of *possible* frames (first_frame to end), floor 30 frames (V3.2).
   Does not penalize late entrants.
-- Normalized Kinetic: Bbox center movement std > 5% of median dancer bbox height
+- Normalized Kinetic: Bbox center movement std > 3% of median dancer bbox height
   (resolution-agnostic across 720p, 1080p, 4K)
-- Min Bbox Height: Track median bbox height >= 35% of global median (V3.1: far-side dancers smaller)
 - Smart Mirror (Phase 6): Prune ONLY IF edge + inverted velocity + low lower-body conf
 - Completeness Audit (V3.2, after Phase 4): Lifetime Peak Lower-Body — max(knee,ankle)<0.25 AND mean_shoulder>0.40
   (seated corner observers, floorwork/skirts; runs before Phase 5 to save OKS computation)
@@ -22,12 +27,69 @@ SHOULDER_INDICES = (5, 6)
 LOWER_BODY_PEAK_INDICES = (13, 14, 15, 16)  # knees + ankles for Lifetime Peak Lower-Body Audit
 
 # V3.3: Kinetic threshold = this fraction of median dancer bbox height (0.03 keeps side dancers)
-KINETIC_STD_FRAC = 0.03
+KINETIC_STD_FRAC = 0.05
 
 # V3.0 Smart mirror: outer 10% of frame
 EDGE_MARGIN_FRAC = 0.10
 # Min fraction of frames a track must be "on edge" to be considered
 EDGE_PRESENCE_FRAC = 0.3
+
+# Optional stage polygon definition: List of (x, y) normalized coordinates [0.0, 1.0]
+# e.g., [(0.1, 0.2), (0.9, 0.2), (1.0, 0.9), (0.0, 0.9)]
+STAGE_POLYGON_NORMALIZED = None
+
+def point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> bool:
+    """Ray-casting algorithm for point in polygon."""
+    n = len(polygon)
+    inside = False
+    if n == 0: return False
+    p1x, p1y = polygon[0]
+    for i in range(1, n + 1):
+        p2x, p2y = polygon[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+def prune_by_stage_polygon(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    frame_width: int,
+    frame_height: int,
+    polygon_normalized: List[Tuple[float, float]] = STAGE_POLYGON_NORMALIZED,
+) -> Set[int]:
+    """
+    Remove tracks where the median bottom-center (feet) of the bbox falls outside the explicit stage polygon.
+    """
+    if not polygon_normalized or frame_width <= 0 or frame_height <= 0 or not surviving_ids:
+        return set()
+    
+    # Convert normalized polygon to pixel coordinates
+    polygon_px = [(px * frame_width, py * frame_height) for px, py in polygon_normalized]
+    
+    to_prune = set()
+    for track_id in surviving_ids:
+        if track_id not in raw_tracks:
+            continue
+        entries = raw_tracks[track_id]
+        if not entries:
+            continue
+        # Check median bottom-center position
+        feet_x = [(box[0] + box[2]) / 2 for _, box, _ in entries]
+        feet_y = [box[3] for _, box, _ in entries]
+            
+        med_x = float(np.median(feet_x))
+        med_y = float(np.median(feet_y))
+        
+        if not point_in_polygon(med_x, med_y, polygon_px):
+            to_prune.add(track_id)
+            
+    return to_prune
 
 
 def prune_tracks(
@@ -177,6 +239,146 @@ def prune_geometric_mirrors(
     return to_prune
 
 
+# V3.4: Spatial outlier — minimum std floor as fraction of frame dimension
+SPATIAL_MIN_SPREAD_FRAC = 0.05
+SPATIAL_OUTLIER_STD_FACTOR = 2.0
+
+
+def _is_approaching_group(
+    entries: List[Tuple[int, Tuple, float]],
+    group_centroid: np.ndarray,
+) -> bool:
+    """
+    True if track's net movement is toward the group centroid (late entrant).
+    Compares distance-to-centroid of first quarter vs last quarter of the track.
+    """
+    if len(entries) < 4:
+        return False
+    sorted_entries = sorted(entries, key=lambda e: e[0])
+    q = max(1, len(sorted_entries) // 4)
+    early = sorted_entries[:q]
+    late = sorted_entries[-q:]
+    early_center = np.median([((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in early], axis=0)
+    late_center = np.median([((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in late], axis=0)
+    dist_early = np.linalg.norm(early_center - group_centroid)
+    dist_late = np.linalg.norm(late_center - group_centroid)
+    return dist_late < dist_early * 0.7
+
+
+def prune_spatial_outliers(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    frame_width: int,
+    frame_height: int,
+    outlier_std_factor: float = SPATIAL_OUTLIER_STD_FACTOR,
+) -> Set[int]:
+    """
+    V3.4: Prune tracks whose median position is far from the dance group centroid.
+    Uses a minimum spread floor to prevent false pruning during tight formations.
+    Late entrants approaching the group are protected.
+    """
+    if len(surviving_ids) < 3 or frame_width <= 0 or frame_height <= 0:
+        return set()
+
+    track_centers: Dict[int, np.ndarray] = {}
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        entries = raw_tracks[tid]
+        centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in entries]
+        track_centers[tid] = np.median(centers, axis=0)
+
+    if len(track_centers) < 3:
+        return set()
+
+    all_centers = np.array(list(track_centers.values()))
+    group_centroid = np.median(all_centers, axis=0)
+    group_std = np.std(all_centers, axis=0)
+    min_spread = np.array([frame_width * SPATIAL_MIN_SPREAD_FRAC,
+                           frame_height * SPATIAL_MIN_SPREAD_FRAC])
+    group_std = np.maximum(group_std, min_spread)
+
+    to_prune: Set[int] = set()
+    for tid, center in track_centers.items():
+        normalized_dist = np.abs(center - group_centroid) / group_std
+        if np.max(normalized_dist) > outlier_std_factor:
+            if not _is_approaching_group(raw_tracks[tid], group_centroid):
+                to_prune.add(tid)
+
+    return to_prune
+
+
+SHORT_TRACK_MIN_FRAC = 0.20
+
+
+def prune_short_tracks(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    total_frames: int,
+    min_frac: float = SHORT_TRACK_MIN_FRAC,
+) -> Set[int]:
+    """
+    Prune tracks present in less than min_frac of total video frames.
+    Unlike the duration filter in prune_tracks (which uses possible lifespan),
+    this uses total video length as the denominator so walkers and passersby
+    who appear briefly get pruned regardless of when they entered.
+    """
+    if total_frames <= 0:
+        return set()
+
+    min_frames = int(total_frames * min_frac)
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in raw_tracks:
+            continue
+        if len(raw_tracks[tid]) < min_frames:
+            to_prune.add(tid)
+
+    return to_prune
+
+
+# V3.4: Bbox size outlier band
+BBOX_SIZE_MIN_FRAC = 0.40
+BBOX_SIZE_MAX_FRAC = 2.00
+
+
+def prune_bbox_size_outliers(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    min_frac: float = BBOX_SIZE_MIN_FRAC,
+    max_frac: float = BBOX_SIZE_MAX_FRAC,
+) -> Set[int]:
+    """
+    V3.4: Prune tracks whose median bbox height is outside 40–200% of the group median.
+    Only applies when 3+ tracks survive (avoids over-pruning small groups).
+    """
+    if len(surviving_ids) < 3:
+        return set()
+
+    track_median_heights: Dict[int, float] = {}
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        heights = [b[3] - b[1] for _, b, _ in raw_tracks[tid] if b[3] - b[1] > 0]
+        if heights:
+            track_median_heights[tid] = float(np.median(heights))
+
+    if len(track_median_heights) < 3:
+        return set()
+
+    group_median_h = float(np.median(list(track_median_heights.values())))
+    if group_median_h <= 0:
+        return set()
+
+    to_prune: Set[int] = set()
+    for tid, med_h in track_median_heights.items():
+        ratio = med_h / group_median_h
+        if ratio < min_frac or ratio > max_frac:
+            to_prune.add(tid)
+
+    return to_prune
+
+
 # V3.2: Corner detection for completeness audit — outer fraction on each axis
 CORNER_MARGIN_X_FRAC = 0.15   # outer 15% left/right
 CORNER_MARGIN_Y_FRAC = 0.20   # outer 20% top/bottom
@@ -255,7 +457,8 @@ def prune_completeness_audit(
                     shoulder_confs.append(float(scores[i]))
         if not lower_peak_confs or not shoulder_confs:
             continue
-        max_lower_peak = float(np.max(lower_peak_confs))
+        # Use 95th percentile to ignore 1-2 frame hallucination spikes
+        robust_lower_peak = float(np.percentile(lower_peak_confs, 95))
         mean_shoulder_conf = float(np.mean(shoulder_confs))
 
         in_corner = _track_in_corner(raw_tracks, track_id, frame_width, frame_height)
@@ -266,7 +469,7 @@ def prune_completeness_audit(
             thresh_low = max_lower_peak_thresh
             thresh_shoulder = mean_shoulder_thresh
 
-        if max_lower_peak < thresh_low and mean_shoulder_conf > thresh_shoulder:
+        if robust_lower_peak < thresh_low and mean_shoulder_conf > thresh_shoulder:
             to_prune.add(track_id)
     return to_prune
 
@@ -395,6 +598,64 @@ def prune_mirror_tracks(
         ratio = low_conf_count / len(frame_scores_list)
         if ratio > max_low_conf_ratio:
             to_prune.add(track_id)
+    return to_prune
+
+
+# V3.4: Sync score pruning — minimum correlation to keep a track
+SYNC_SCORE_MIN = 0.10
+
+
+def prune_low_sync_tracks(
+    all_frame_data: List[Dict[str, Any]],
+    surviving_ids: Set[int],
+    min_sync_score: float = SYNC_SCORE_MIN,
+) -> Set[int]:
+    """
+    V3.4 Post-pose pruning: remove tracks with near-zero angular correlation to the group truth.
+    Non-dancers (standing, sitting, walking) have ~0 correlation across all 6 joint angles.
+    Uses max-across-joints so a soloist syncing on even 1 joint is protected.
+    Very conservative threshold (0.10) to avoid harming canons/subgroups.
+    """
+    from kinematics import compute_joint_angles_vectorized, JOINT_NAMES
+    from scoring import _build_keypoints_array, _compute_group_truth, CONFIDENCE_THRESHOLD
+
+    if len(surviving_ids) < 3 or len(all_frame_data) < 30:
+        return set()
+
+    kpts_arr, tid_to_idx, _ = _build_keypoints_array(all_frame_data)
+    num_frames, num_tracks, _, _ = kpts_arr.shape
+    if num_tracks < 3:
+        return set()
+
+    angles = compute_joint_angles_vectorized(kpts_arr, confidence_threshold=CONFIDENCE_THRESHOLD)
+    group_truth = _compute_group_truth(angles)
+
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in tid_to_idx:
+            continue
+        t_idx = tid_to_idx[tid]
+        max_corr = 0.0
+        for j in range(6):
+            track_series = angles[:, t_idx, j]
+            group_series = group_truth[:, j]
+            valid = ~np.isnan(track_series) & ~np.isnan(group_series)
+            if np.sum(valid) < 15:
+                continue
+            t_vals = track_series[valid]
+            g_vals = group_series[valid]
+            t_std = np.std(t_vals)
+            g_std = np.std(g_vals)
+            if t_std < 1e-6 or g_std < 1e-6:
+                continue
+            corr = float(np.corrcoef(t_vals, g_vals)[0, 1])
+            if np.isnan(corr):
+                continue
+            max_corr = max(max_corr, abs(corr))
+
+        if max_corr < min_sync_score:
+            to_prune.add(tid)
+
     return to_prune
 
 
