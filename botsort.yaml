@@ -1,0 +1,16 @@
+# Sway Pose V3.0 — occlusion-tolerant tracker config
+# track_buffer=90 → 3s memory @ 30 FPS; match_thresh=0.7 → forgiving re-association
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 90  # V3.0: 3 seconds @ 30 FPS — handle occlusions
+match_thresh: 0.7  # Slightly lower for Kalman drift during occlusion gaps
+fuse_score: True
+
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

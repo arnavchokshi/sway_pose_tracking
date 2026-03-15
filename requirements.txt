@@ -1,0 +1,12 @@
+torch>=2.0.0
+protobuf>=4.25.0,<5  # >=5 removes GetPrototype, breaks onnx/ultralytics
+torchvision>=0.15.0
+ultralytics>=8.0.0
+lap>=0.5.12
+opencv-python>=4.8.0
+numpy>=1.24.0
+transformers>=4.40.0
+Pillow>=10.0.0
+fastdtw>=0.3.4
+scipy>=1.10.0
+pyts>=0.15.0
