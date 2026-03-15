@@ -57,10 +57,14 @@ from track_pruning import (
     prune_spatial_outliers,
     prune_short_tracks,
     prune_bbox_size_outliers,
+    prune_bad_aspect_ratio,
     prune_smart_mirrors,
     prune_low_sync_tracks,
+    prune_low_confidence_tracks,
+    prune_jittery_tracks,
     prune_completeness_audit,
     prune_by_stage_polygon,
+    log_pruned_tracks,
     raw_tracks_to_per_frame,
 )
 from pose_estimator import PoseEstimator
@@ -118,6 +122,34 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def log_resource_usage(phase_name: str = "") -> None:
+    """Log current CPU, RAM, and GPU usage for hardware sizing (e.g. cloud server)."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    p = psutil.Process()
+    # Process memory (RSS) in GB
+    rss_gb = p.memory_info().rss / (1024**3)
+    # System memory
+    vmem = psutil.virtual_memory()
+    sys_used_gb = vmem.used / (1024**3)
+    sys_total_gb = vmem.total / (1024**3)
+    cpu_pct = p.cpu_percent(interval=0.1) if hasattr(p, "cpu_percent") else 0
+    try:
+        sys_cpu_pct = psutil.cpu_percent(interval=0.1)
+    except Exception:
+        sys_cpu_pct = 0
+    parts = [f"RAM: {sys_used_gb:.1f}/{sys_total_gb:.1f} GB (process: {rss_gb:.2f} GB)", f"CPU: {cpu_pct:.0f}% (system: {sys_cpu_pct:.0f}%)"]
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / (1024**3)
+        r = torch.cuda.memory_reserved() / (1024**3)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        parts.append(f"GPU: {a:.2f} GB alloc / {r:.2f} GB reserved (device total: {total:.1f} GB)")
+    prefix = "  [Resources" + (f" @ {phase_name}" if phase_name else "") + "] "
+    print(prefix + " | ".join(parts))
+
+
 def main():
     import argparse
     import time
@@ -164,6 +196,7 @@ def main():
 
     device = get_device()
     print(f"Using device: {device}")
+    log_resource_usage("startup")
 
     total_start = time.time()
 
@@ -174,6 +207,7 @@ def main():
         str(video_path)
     )
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("1-detection+tracking")
 
     # ── Phase 3: Pre-pose pruning (V3.4 enhanced) ───────────────────────
     print("\n[2/9] Track pruning (duration, kinetic, spatial, traversal, bbox size, mirrors)...")
@@ -181,10 +215,17 @@ def main():
     surviving_ids = prune_tracks(raw_tracks, total_frames)
     initial_count = len(raw_tracks)
 
+    # Log tracks that failed duration+kinetic filter
+    duration_kinetic_pruned = set(raw_tracks.keys()) - surviving_ids
+    if duration_kinetic_pruned:
+        print(f"  Pruned {len(duration_kinetic_pruned)} tracks (duration/kinetic filter)")
+        log_pruned_tracks(raw_tracks, duration_kinetic_pruned, "duration/kinetic", frame_width, frame_height)
+
     stage_pruned_ids = prune_by_stage_polygon(raw_tracks, surviving_ids, frame_width, frame_height)
     surviving_ids = surviving_ids - stage_pruned_ids
     if stage_pruned_ids:
         print(f"  Pruned {len(stage_pruned_ids)} tracks outside stage polygon")
+        log_pruned_tracks(raw_tracks, stage_pruned_ids, "stage_polygon", frame_width, frame_height)
 
     spatial_pruned_ids = prune_spatial_outliers(
         raw_tracks, surviving_ids, frame_width, frame_height
@@ -192,6 +233,7 @@ def main():
     surviving_ids = surviving_ids - spatial_pruned_ids
     if spatial_pruned_ids:
         print(f"  Pruned {len(spatial_pruned_ids)} spatial outliers (far from group)")
+        log_pruned_tracks(raw_tracks, spatial_pruned_ids, "spatial_outlier", frame_width, frame_height)
 
     short_pruned_ids = prune_short_tracks(
         raw_tracks, surviving_ids, total_frames
@@ -199,11 +241,19 @@ def main():
     surviving_ids = surviving_ids - short_pruned_ids
     if short_pruned_ids:
         print(f"  Pruned {len(short_pruned_ids)} short tracks (<20% of video)")
+        log_pruned_tracks(raw_tracks, short_pruned_ids, "short_track", frame_width, frame_height)
 
     bbox_pruned_ids = prune_bbox_size_outliers(raw_tracks, surviving_ids)
     surviving_ids = surviving_ids - bbox_pruned_ids
     if bbox_pruned_ids:
         print(f"  Pruned {len(bbox_pruned_ids)} bbox size outliers")
+        log_pruned_tracks(raw_tracks, bbox_pruned_ids, "bbox_size", frame_width, frame_height)
+
+    aspect_pruned_ids = prune_bad_aspect_ratio(raw_tracks, surviving_ids)
+    surviving_ids = surviving_ids - aspect_pruned_ids
+    if aspect_pruned_ids:
+        print(f"  Pruned {len(aspect_pruned_ids)} non-person aspect ratios (wider than tall)")
+        log_pruned_tracks(raw_tracks, aspect_pruned_ids, "aspect_ratio", frame_width, frame_height)
 
     geometric_mirror_ids = prune_geometric_mirrors(
         raw_tracks, surviving_ids, frame_width, frame_height
@@ -211,10 +261,12 @@ def main():
     surviving_ids = surviving_ids - geometric_mirror_ids
     if geometric_mirror_ids:
         print(f"  Pruned {len(geometric_mirror_ids)} geometric mirrors (edge + inverted velocity)")
+        log_pruned_tracks(raw_tracks, geometric_mirror_ids, "geometric_mirror", frame_width, frame_height)
 
     tracking_results = raw_tracks_to_per_frame(raw_tracks, total_frames, surviving_ids)
     print(f"  Kept {len(surviving_ids)} of {initial_count} tracks after pre-pose pruning")
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("2-pruning")
 
     # ── Phase 4: Pose estimation with visibility scoring ─────────────────
     model_id = "usyd-community/vitpose-plus-large" if args.pose_model == "large" else "usyd-community/vitpose-plus-base"
@@ -341,6 +393,7 @@ def main():
     if occluded_skips:
         print(f"  Skipped {occluded_skips} occluded track-frames (visibility < 0.3)")
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("3-pose")
 
     # Build all_frame_data_pre for downstream phases
     all_frame_data_pre = []
@@ -365,13 +418,15 @@ def main():
     if dedup_count:
         print(f"  Removed {dedup_count} duplicate pose overlays")
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("4-dedup")
 
     # ── Phase 6: Occlusion re-ID + crossover refinement ──────────────────
     print("\n[5/9] Occlusion re-ID + crossover refinement (hybrid CVM)...")
     t0 = time.time()
     apply_occlusion_reid(all_frame_data_pre)
-    apply_crossover_refinement(all_frame_data_pre)
+    apply_crossover_refinement(all_frame_data_pre, frame_width=frame_width, frame_height=frame_height)
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("5-crossover")
 
     # ── Phase 7: Post-pose pruning (sync score + smart mirror + completeness) ─
     print("\n[6/9] Post-pose pruning (sync score + smart mirror + completeness)...")
@@ -380,25 +435,43 @@ def main():
     sync_prune_ids = prune_low_sync_tracks(all_frame_data_pre, surviving_ids)
     if sync_prune_ids:
         print(f"  Pruned {len(sync_prune_ids)} tracks with low sync score (non-dancers)")
+        log_pruned_tracks(raw_tracks, sync_prune_ids, "low_sync", frame_width, frame_height)
 
     mirror_prune_ids = prune_smart_mirrors(
         raw_tracks, surviving_ids, [fd["poses"] for fd in all_frame_data_pre], frame_width
     )
     if mirror_prune_ids:
         print(f"  Pruned {len(mirror_prune_ids)} mirror tracks")
+        log_pruned_tracks(raw_tracks, mirror_prune_ids, "smart_mirror", frame_width, frame_height)
 
     completeness_prune_ids = prune_completeness_audit(
         raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height
     )
     if completeness_prune_ids:
         print(f"  Pruned {len(completeness_prune_ids)} tracks (seated/partial-body observers)")
+        log_pruned_tracks(raw_tracks, completeness_prune_ids, "completeness", frame_width, frame_height)
 
-    phase7_prune_ids = sync_prune_ids | mirror_prune_ids | completeness_prune_ids
+    low_conf_prune_ids = prune_low_confidence_tracks(
+        surviving_ids, [fd["poses"] for fd in all_frame_data_pre]
+    )
+    if low_conf_prune_ids:
+        print(f"  Pruned {len(low_conf_prune_ids)} tracks with low mean keypoint confidence (non-person)")
+        log_pruned_tracks(raw_tracks, low_conf_prune_ids, "low_confidence", frame_width, frame_height)
+
+    jitter_prune_ids = prune_jittery_tracks(
+        raw_tracks, surviving_ids, [fd["poses"] for fd in all_frame_data_pre]
+    )
+    if jitter_prune_ids:
+        print(f"  Pruned {len(jitter_prune_ids)} tracks with excessive keypoint jitter (non-person)")
+        log_pruned_tracks(raw_tracks, jitter_prune_ids, "jitter", frame_width, frame_height)
+
+    phase7_prune_ids = sync_prune_ids | mirror_prune_ids | completeness_prune_ids | low_conf_prune_ids | jitter_prune_ids
     surviving_after_prune = set()
     for fd in all_frame_data_pre:
         surviving_after_prune.update(t for t in fd["track_ids"] if t not in phase7_prune_ids)
     print(f"  {len(surviving_after_prune)} tracks after post-pose pruning")
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("6-post-prune")
 
     # ── Phase 8: Temporal smoothing (1 Euro, conf<0.3 guard) ─────────────
     print("\n[7/9] Temporal smoothing (1 Euro filter)...")
@@ -413,8 +486,9 @@ def main():
         poses_raw = fd_pre["poses"]
 
         poses_filtered = {tid: data for tid, data in poses_raw.items() if tid not in phase7_prune_ids}
-        boxes_filtered = [b for b, tid in zip(boxes, track_ids) if tid not in phase7_prune_ids]
-        track_ids_filtered = [tid for tid in track_ids if tid not in phase7_prune_ids]
+        # Filter out pruned tracks AND tracks that have no pose data (stripped by dedup)
+        boxes_filtered = [b for b, tid in zip(boxes, track_ids) if tid not in phase7_prune_ids and tid in poses_filtered]
+        track_ids_filtered = [tid for tid in track_ids if tid not in phase7_prune_ids and tid in poses_filtered]
 
         frame_time = fidx / output_fps
         smoothed_poses = smoother.smooth_frame(poses_filtered, frame_time)
@@ -431,6 +505,7 @@ def main():
         })
 
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("7-smoothing")
 
     # ── Phase 9: Spatio-temporal scoring (circmean, cDTW, per-joint) ─────
     print("\n[8/9] Spatio-temporal scoring...")
@@ -445,6 +520,7 @@ def main():
             fd["timing_errors"] = scoring_data.get("timing_errors", [{} for _ in all_frame_data])[i]
 
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("8-scoring")
 
     # ── Phase 10: Export & visualization ──────────────────────────────────
     print("\n[9/9] Rendering and exporting...")
@@ -457,9 +533,11 @@ def main():
         output_dir=output_dir,
     )
     print(f"  └─ {time.time() - t0:.1f}s")
+    log_resource_usage("9-export")
     total_elapsed = time.time() - total_start
     print(f"\nDone. Outputs in {output_dir}")
     print(f"Total pipeline: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
+    log_resource_usage("final")
 
 
 if __name__ == "__main__":

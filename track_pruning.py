@@ -1,7 +1,12 @@
 """
-Phase 3 & 6: Track Pruning — V3.4 Resolution-Aware + Smart Mirror + Completeness
+Phase 3 & 6: Track Pruning — V3.5 Non-Person Object Detection
 
-V3.4 Pruning (additions):
+V3.5 Pruning (additions):
+- Bbox Aspect Ratio: Pre-pose prune tracks with median width/height > 1.2 (non-person objects)
+- Mean Keypoint Confidence: Post-pose prune tracks with mean ViTPose confidence < 0.45
+- Keypoint Jitter: Post-pose prune tracks with frame-to-frame jitter/bbox_height > 0.10
+
+V3.4 Pruning (retained):
 - Spatial Outlier: Prune tracks > 2σ from group centroid (with min-spread floor + late-entrant safeguard)
 - Traversal Detector: Prune walkers (high straightness + low acceleration variance)
 - Bbox Size Outlier: Prune tracks with median bbox height outside 40–200% of group median
@@ -18,7 +23,7 @@ V3.1 Pruning (retained):
 """
 
 import numpy as np
-from typing import Dict, List, Tuple, Set, Any
+from typing import Dict, List, Tuple, Set, Any, Optional
 
 # COCO lower-body keypoint indices: knees (13, 14), ankles (15, 16) — used by Smart Mirror
 LOWER_BODY_INDICES = (13, 14, 15, 16)
@@ -379,6 +384,137 @@ def prune_bbox_size_outliers(
     return to_prune
 
 
+# V3.5: Bbox aspect ratio — person bboxes are taller than wide
+ASPECT_RATIO_MAX = 1.2
+
+
+def prune_bad_aspect_ratio(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    max_aspect: float = ASPECT_RATIO_MAX,
+) -> Set[int]:
+    """
+    V3.5: Prune tracks whose median bbox is wider than tall (non-person objects
+    like bags, tables, equipment). Person bounding boxes always have height > width.
+    Only applies when 3+ tracks survive.
+    """
+    if len(surviving_ids) < 3:
+        return set()
+
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        ratios = []
+        for _, box, _ in raw_tracks[tid]:
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            if h > 0:
+                ratios.append(w / h)
+        if ratios and float(np.median(ratios)) > max_aspect:
+            to_prune.add(tid)
+
+    return to_prune
+
+
+# V3.5: Post-pose mean keypoint confidence — non-persons get uniformly low scores
+MEAN_CONFIDENCE_MIN = 0.45
+
+
+def prune_low_confidence_tracks(
+    surviving_ids: Set[int],
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    min_mean_conf: float = MEAN_CONFIDENCE_MIN,
+) -> Set[int]:
+    """
+    V3.5 Post-pose: Prune tracks where the mean keypoint confidence across all
+    frames is below threshold. ViTPose on non-person objects produces uniformly
+    low confidence (~0.35) vs real dancers (0.81+).
+    Only applies when 3+ tracks survive.
+    """
+    if len(surviving_ids) < 3:
+        return set()
+
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        all_confs: List[float] = []
+        for poses in raw_poses_by_frame:
+            if tid not in poses:
+                continue
+            data = poses[tid]
+            scores = data.get("scores")
+            if scores is None and "keypoints" in data:
+                kp = data["keypoints"]
+                if hasattr(kp, 'shape') and kp.shape[1] > 2:
+                    scores = kp[:, 2]
+                elif isinstance(kp, list) and kp and len(kp[0]) > 2:
+                    scores = [k[2] for k in kp]
+            if scores is not None:
+                all_confs.extend(float(s) for s in scores)
+        if all_confs and np.mean(all_confs) < min_mean_conf:
+            to_prune.add(tid)
+
+    return to_prune
+
+
+# V3.5: Post-pose keypoint jitter — non-persons have wildly unstable keypoints
+JITTER_RATIO_MAX = 0.10
+
+
+def prune_jittery_tracks(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    max_jitter: float = JITTER_RATIO_MAX,
+) -> Set[int]:
+    """
+    V3.5 Post-pose: Prune tracks with excessive frame-to-frame keypoint jitter
+    normalized by bbox height. Non-person objects produce jitter/h ~0.20 vs
+    real dancers at 0.01-0.03.
+    Only applies when 3+ tracks survive.
+    """
+    if len(surviving_ids) < 3:
+        return set()
+
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        heights = [b[3] - b[1] for _, b, _ in raw_tracks[tid] if b[3] - b[1] > 0]
+        if not heights:
+            continue
+        med_h = float(np.median(heights))
+        if med_h <= 0:
+            continue
+
+        kpts_by_frame: Dict[int, np.ndarray] = {}
+        for fidx, poses in enumerate(raw_poses_by_frame):
+            if tid not in poses:
+                continue
+            data = poses[tid]
+            kp = data.get("keypoints")
+            if kp is None:
+                continue
+            kp = np.asarray(kp)
+            if kp.ndim == 2 and kp.shape[0] >= 17:
+                kpts_by_frame[fidx] = kp[:17, :2] if kp.shape[1] >= 2 else kp[:17]
+
+        sorted_fidxs = sorted(kpts_by_frame.keys())
+        displacements: List[float] = []
+        for i in range(1, len(sorted_fidxs)):
+            f_prev, f_curr = sorted_fidxs[i - 1], sorted_fidxs[i]
+            if f_curr - f_prev > 2:
+                continue
+            diff = kpts_by_frame[f_curr] - kpts_by_frame[f_prev]
+            dists = np.sqrt(np.sum(diff ** 2, axis=1))
+            displacements.extend(dists.tolist())
+
+        if displacements and np.mean(displacements) / med_h > max_jitter:
+            to_prune.add(tid)
+
+    return to_prune
+
+
 # V3.2: Corner detection for completeness audit — outer fraction on each axis
 CORNER_MARGIN_X_FRAC = 0.15   # outer 15% left/right
 CORNER_MARGIN_Y_FRAC = 0.20   # outer 20% top/bottom
@@ -657,6 +793,39 @@ def prune_low_sync_tracks(
             to_prune.add(tid)
 
     return to_prune
+
+
+def log_pruned_tracks(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    pruned_ids: Set[int],
+    rule_name: str,
+    frame_width: int = 0,
+    frame_height: int = 0,
+) -> None:
+    """Print per-track diagnostics for every pruned track so root-cause is visible in logs."""
+    if not pruned_ids:
+        return
+    for tid in sorted(pruned_ids):
+        entries = raw_tracks.get(tid, [])
+        n_frames = len(entries)
+        if not entries:
+            print(f"    [PRUNED by {rule_name}] track {tid}: no entries")
+            continue
+        centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in entries]
+        med_cx = float(np.median([c[0] for c in centers]))
+        med_cy = float(np.median([c[1] for c in centers]))
+        heights = [b[3] - b[1] for _, b, _ in entries if b[3] - b[1] > 0]
+        med_h = float(np.median(heights)) if heights else 0.0
+        first_f = min(e[0] for e in entries)
+        last_f = max(e[0] for e in entries)
+        pos_label = ""
+        if frame_width > 0 and frame_height > 0:
+            x_pct = med_cx / frame_width * 100
+            y_pct = med_cy / frame_height * 100
+            pos_label = f" pos=({x_pct:.0f}%x, {y_pct:.0f}%y)"
+        print(f"    [PRUNED by {rule_name}] track {tid}: {n_frames} frames "
+              f"(f{first_f}-{last_f}), median_center=({med_cx:.0f},{med_cy:.0f}){pos_label}, "
+              f"median_h={med_h:.0f}")
 
 
 def raw_tracks_to_per_frame(

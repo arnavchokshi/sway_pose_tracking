@@ -108,8 +108,10 @@ def draw_frame(
     """
     out = frame.copy()
 
-    # Draw boxes and labels
+    # Draw boxes and labels — only for tracks that have valid pose data
     for i, (box, tid) in enumerate(zip(boxes, track_ids)):
+        if tid not in poses:
+            continue
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), BOX_COLOR, 2)
         label = f"ID:{tid}"

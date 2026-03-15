@@ -23,7 +23,7 @@ CHUNK_SIZE = 300
 DETECT_SIZE = 640
 
 # V3.0: YOLO confidence — lower to catch more dancers (pruning removes false positives)
-YOLO_CONF = 0.40
+YOLO_CONF = 0.25
 
 # YOLO detection stride: 1 = every frame, 2 = even frames only (2x speed, minimal accuracy loss)
 # Odd frames filled via linear interpolation before downstream phases.
@@ -321,6 +321,115 @@ def coalescence_deduplicate(
     return raw_tracks
 
 
+def merge_complementary_tracks(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    max_center_dist_frac: float = 0.5,
+) -> Dict[int, List[Tuple[int, Tuple, float]]]:
+    """
+    Merge track pairs that cover complementary (non-overlapping) time segments
+    of the same person — e.g. BoT-SORT assigns ID 4 for frames 0-150 and 260-385,
+    and ID 17 for frames 152-258.  Stitch/re-ID miss this because neither track
+    is cleanly "dead" before the other is "born".
+
+    Criteria for merging:
+      1. Zero temporal overlap (no shared frames).
+      2. At every transition boundary the bbox centers are within
+         max_center_dist_frac * bbox_height of each other.
+
+    The shorter track is merged into the longer one.
+    Modifies raw_tracks in place and returns it.
+    """
+    if len(raw_tracks) < 2:
+        return raw_tracks
+
+    tid_list = list(raw_tracks.keys())
+    frame_sets: Dict[int, set] = {}
+    sorted_entries: Dict[int, list] = {}
+    for tid in tid_list:
+        entries = sorted(raw_tracks[tid], key=lambda e: e[0])
+        sorted_entries[tid] = entries
+        frame_sets[tid] = {e[0] for e in entries}
+
+    changed = True
+    while changed:
+        changed = False
+        tid_list = list(raw_tracks.keys())
+        for i in range(len(tid_list)):
+            if changed:
+                break
+            tid_a = tid_list[i]
+            if tid_a not in raw_tracks:
+                continue
+            for j in range(i + 1, len(tid_list)):
+                tid_b = tid_list[j]
+                if tid_b not in raw_tracks:
+                    continue
+
+                if frame_sets[tid_a] & frame_sets[tid_b]:
+                    continue
+
+                entries_a = sorted_entries[tid_a]
+                entries_b = sorted_entries[tid_b]
+
+                # Find transition boundaries: segments where one ends and the
+                # other starts (or vice versa).  Check bbox proximity at each.
+                all_entries = sorted(entries_a + entries_b, key=lambda e: e[0])
+                boundaries_ok = True
+                boundary_count = 0
+
+                prev_owner = None
+                prev_box = None
+                for entry in all_entries:
+                    fidx, box, _ = entry
+                    owner = tid_a if fidx in frame_sets[tid_a] else tid_b
+                    if prev_owner is not None and owner != prev_owner:
+                        boundary_count += 1
+                        h = max(_bbox_height(prev_box), _bbox_height(box), 1.0)
+                        cx1, cy1 = _box_center(prev_box)
+                        cx2, cy2 = _box_center(box)
+                        dist = np.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
+                        if dist > max_center_dist_frac * h:
+                            boundaries_ok = False
+                            break
+                    prev_owner = owner
+                    prev_box = box
+
+                if not boundaries_ok or boundary_count == 0:
+                    continue
+
+                # Merge: keep the longer track's ID
+                if len(entries_a) >= len(entries_b):
+                    keep, kill = tid_a, tid_b
+                else:
+                    keep, kill = tid_b, tid_a
+
+                merged = sorted(raw_tracks[keep] + raw_tracks[kill], key=lambda e: e[0])
+
+                # Interpolate gaps at each transition boundary
+                gap_entries = []
+                for k in range(len(merged) - 1):
+                    f_cur = merged[k][0]
+                    f_nxt = merged[k + 1][0]
+                    if f_nxt - f_cur > 1:
+                        gap_entries.extend(
+                            _interpolate_box_sequence(merged[k][1], merged[k + 1][1], f_cur, f_nxt)
+                        )
+                merged = sorted(merged + gap_entries, key=lambda e: e[0])
+
+                raw_tracks[keep] = merged
+                del raw_tracks[kill]
+                sorted_entries[keep] = merged
+                frame_sets[keep] = {e[0] for e in merged}
+                if kill in sorted_entries:
+                    del sorted_entries[kill]
+                if kill in frame_sets:
+                    del frame_sets[kill]
+                changed = True
+                break
+
+    return raw_tracks
+
+
 def _get_tracker_config() -> str:
     """Return tracker config path. Prefer local occlusion-tolerant config (V3.0: track_buffer=90)."""
     cfg_dir = Path(__file__).resolve().parent
@@ -471,7 +580,10 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
     
     # Wave 1.5: Coexistence deduplication to remove duplicate counts
     raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.50, consecutive_frames=5)
-    
+
+    # Wave 1.6: Merge complementary tracks (same person, alternating IDs, zero overlap)
+    raw_tracks = merge_complementary_tracks(raw_tracks)
+
     _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
 
     return raw_tracks, total_frames, float(output_fps), None, float(native_fps), frame_width, frame_height

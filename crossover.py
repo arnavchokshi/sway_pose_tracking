@@ -46,10 +46,15 @@ CVM_MAX_FRAMES = 5
 CVM_VELOCITY_DECAY = 0.9
 CONF_DECAY_FACTOR = 0.85
 BLEND_FRAMES = 3
+# V3.5: CVM displacement cap — fraction of bbox height per frame
+CVM_MAX_DISPLACEMENT_FRAC = 0.3
+# V3.5: CVM overlap freeze — don't project into another live track
+CVM_OVERLAP_FREEZE_IOU = 0.5
 
 # V3.4: Keypoint collision dedup thresholds
-COLLISION_KPT_DIST_FRAC = 0.2
-COLLISION_CENTER_DIST_FRAC = 0.3
+# V3.5: Relaxed from 0.2/0.3 to catch nearby phantoms (e.g. 67px apart at bbox_h=165px)
+COLLISION_KPT_DIST_FRAC = 0.35
+COLLISION_CENTER_DIST_FRAC = 0.5
 
 
 def _box_areas(boxes: np.ndarray) -> np.ndarray:
@@ -231,6 +236,18 @@ def deduplicate_collocated_poses(
         if tid in poses:
             del poses[tid]
 
+    # Also strip suppressed tracks from boxes and track_ids so phantom boxes
+    # don't persist downstream (CVM, rendering, scoring).
+    if to_suppress:
+        new_boxes = []
+        new_track_ids = []
+        for box, tid in zip(boxes, track_ids):
+            if tid not in to_suppress:
+                new_boxes.append(box)
+                new_track_ids.append(tid)
+        frame_data["boxes"] = new_boxes
+        frame_data["track_ids"] = new_track_ids
+
 
 def apply_occlusion_reid(
     all_frame_data: List[Dict[str, Any]],
@@ -303,6 +320,83 @@ def apply_occlusion_reid(
                 merge_map[tid_b] = tid_a
                 break  # One merge per dead track
 
+    # --- Pass 2: Complementary track merge (non-overlapping alternating IDs) ---
+    # Catches cases like track 4 (frames 0-150, 260-385) and track 17 (152-258)
+    # where neither is cleanly "dead" before the other is "born".
+    track_frame_sets: Dict[int, set] = {}
+    for f_idx, fd in enumerate(all_frame_data):
+        for tid in fd.get("track_ids", []):
+            if tid not in track_frame_sets:
+                track_frame_sets[tid] = set()
+            track_frame_sets[tid].add(f_idx)
+
+    all_tids = list(track_info.keys())
+    for i in range(len(all_tids)):
+        tid_a = all_tids[i]
+        if tid_a not in track_info or tid_a in merge_map or tid_a in merge_map.values():
+            continue
+        for j in range(i + 1, len(all_tids)):
+            tid_b = all_tids[j]
+            if tid_b not in track_info or tid_b in merge_map or tid_b in merge_map.values():
+                continue
+            if tid_a == tid_b:
+                continue
+
+            frames_a = track_frame_sets.get(tid_a, set())
+            frames_b = track_frame_sets.get(tid_b, set())
+            if frames_a & frames_b:
+                continue
+
+            # Check OKS at transition boundaries
+            info_a = track_info[tid_a]
+            info_b = track_info[tid_b]
+
+            # Try both orderings: A ends then B starts, and B ends then A starts
+            oks_scores = []
+            if info_a["last_frame"] < info_b["first_frame"]:
+                gap = info_b["first_frame"] - info_a["last_frame"]
+                if gap <= max_frame_gap:
+                    area = (info_a["last_box"][2] - info_a["last_box"][0]) * (info_a["last_box"][3] - info_a["last_box"][1])
+                    oks_scores.append(_compute_oks(info_a["last_pose"], info_b["first_pose"], max(area, 1.0)))
+            if info_b["last_frame"] < info_a["first_frame"]:
+                gap = info_a["first_frame"] - info_b["last_frame"]
+                if gap <= max_frame_gap:
+                    area = (info_b["last_box"][2] - info_b["last_box"][0]) * (info_b["last_box"][3] - info_b["last_box"][1])
+                    oks_scores.append(_compute_oks(info_b["last_pose"], info_a["first_pose"], max(area, 1.0)))
+
+            # For alternating tracks, check boundaries in temporal order
+            if not oks_scores:
+                all_frames_sorted = sorted(frames_a | frames_b)
+                prev_owner = None
+                for fidx in all_frames_sorted:
+                    owner = tid_a if fidx in frames_a else tid_b
+                    if prev_owner is not None and owner != prev_owner:
+                        # Transition boundary — get poses from adjacent frames
+                        prev_fd = all_frame_data[fidx - 1] if fidx > 0 else None
+                        curr_fd = all_frame_data[fidx]
+                        if prev_fd is not None:
+                            prev_tid = prev_owner
+                            curr_tid = owner
+                            prev_poses = prev_fd.get("poses", {})
+                            curr_poses = curr_fd.get("poses", {})
+                            if prev_tid in prev_poses and curr_tid in curr_poses:
+                                pk = prev_poses[prev_tid].get("keypoints")
+                                ck = curr_poses[curr_tid].get("keypoints")
+                                if pk is not None and ck is not None and pk.shape[0] >= 17 and ck.shape[0] >= 17:
+                                    prev_boxes = prev_fd.get("boxes", [])
+                                    prev_tids = prev_fd.get("track_ids", [])
+                                    if prev_tid in prev_tids:
+                                        pidx = prev_tids.index(prev_tid)
+                                        if pidx < len(prev_boxes):
+                                            area = (prev_boxes[pidx][2] - prev_boxes[pidx][0]) * (prev_boxes[pidx][3] - prev_boxes[pidx][1])
+                                            oks_scores.append(_compute_oks(pk, ck, max(area, 1.0)))
+                    prev_owner = owner
+
+            if oks_scores and np.mean(oks_scores) >= min_oks:
+                keep = tid_a if len(frames_a) >= len(frames_b) else tid_b
+                kill = tid_b if keep == tid_a else tid_a
+                merge_map[kill] = keep
+
     if not merge_map:
         return all_frame_data
 
@@ -355,6 +449,8 @@ def apply_crossover_refinement(
     iou_exit: float = IOU_CROSSOVER_EXIT,
     exit_frames: int = CROSSOVER_EXIT_FRAMES,
     occlusion_thresh: float = OKS_OCCLUSION_THRESHOLD,
+    frame_width: int = 1920,
+    frame_height: int = 1080,
 ) -> List[Dict[str, Any]]:
     """
     Refine track assignments during dense dancer overlaps using OKS.
@@ -446,19 +542,50 @@ def apply_crossover_refinement(
                 occ_frames = track_occlusion_frames.get(tid, 0) + 1
                 track_occlusion_frames[tid] = occ_frames
 
-                # CVM: project box forward
+                # CVM: project box forward with displacement cap
                 last_box = track_last_box[tid]
                 v = track_velocity[tid]
                 cx = (last_box[0] + last_box[2]) / 2
                 cy = (last_box[1] + last_box[3]) / 2
                 w = last_box[2] - last_box[0]
                 h = last_box[3] - last_box[1]
-                new_cx, new_cy = cx + v[0], cy + v[1]
+
+                # V3.5: Cap displacement at CVM_MAX_DISPLACEMENT_FRAC * bbox_height
+                max_disp = CVM_MAX_DISPLACEMENT_FRAC * max(h, 1.0)
+                disp = np.sqrt(v[0] ** 2 + v[1] ** 2)
+                if disp > max_disp and disp > 0:
+                    scale = max_disp / disp
+                    v = np.array([v[0] * scale, v[1] * scale])
+
+                new_cx = cx + v[0]
+                new_cy = cy + v[1]
+
+                # V3.5: Clamp to frame bounds
+                new_cx = max(w / 2, min(frame_width - w / 2, new_cx))
+                new_cy = max(h / 2, min(frame_height - h / 2, new_cy))
+
                 new_box = (
                     new_cx - w / 2, new_cy - h / 2,
                     new_cx + w / 2, new_cy + h / 2,
                 )
-                new_boxes[idx] = new_box
+
+                # V3.5: Freeze if projected box overlaps another live track
+                freeze = False
+                new_box_arr = np.array([[new_box[0], new_box[1], new_box[2], new_box[3]]])
+                for other_idx, other_tid in enumerate(tids):
+                    if other_idx == idx:
+                        continue
+                    other_box = new_boxes[other_idx]
+                    other_arr = np.array([[other_box[0], other_box[1], other_box[2], other_box[3]]])
+                    both = np.vstack([new_box_arr, other_arr])
+                    iou_val = _compute_iou_matrix(both)[0, 1]
+                    if iou_val > CVM_OVERLAP_FREEZE_IOU:
+                        freeze = True
+                        break
+
+                if not freeze:
+                    new_boxes[idx] = new_box
+                # else: keep original box position (frozen)
 
                 if tid in track_last_pose:
                     if occ_frames <= CVM_MAX_FRAMES:
