@@ -1,5 +1,5 @@
 """
-Detection & Tracking Module — YOLO11l + BoT-SORT (V3.0)
+Detection & Tracking Module — YOLO11l + BoT-SORT (V3.3)
 
 V3.0: Streaming 300-frame chunks, native FPS, YOLO11l conf=0.25.
 - Reads video in chunks to avoid full RAM load
@@ -7,6 +7,9 @@ V3.0: Streaming 300-frame chunks, native FPS, YOLO11l conf=0.25.
 - YOLO11l (Large) at 640x640, conf=0.25 for higher recall
 - BoT-SORT track_buffer=90 (3s at 30 FPS)
 - Wave 1 box stitch within 90 frames
+
+V3.3: YOLO runs on every frame (restored from V3.0) for better dancer detection.
+Coexistence dedup and min_hits removed — they were merging/dropping real dancers.
 
 Double-Layer Tracking: Base tracker + OKS crossover refinement (see crossover.py)
 handles dense overlaps when IoU > 0.6.
@@ -266,7 +269,6 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
 
         for frame_idx, frame in chunk_frames:
             h_fr, w_fr = frame.shape[:2]
-            frame_rgb = frame[:, :, ::-1]
             frame_low = cv2.resize(frame, (DETECT_SIZE, DETECT_SIZE))
             frame_low_rgb = frame_low[:, :, ::-1]
             scale_x = w_fr / DETECT_SIZE
@@ -303,7 +305,6 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
                 print(f"  Frame {frame_idx}: {n} persons")
 
         total_frames += len(chunk_frames)
-        # Release chunk memory
         del chunk_frames
 
     output_fps = native_fps
