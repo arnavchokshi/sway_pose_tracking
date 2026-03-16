@@ -76,7 +76,14 @@ from crossover import (
 )
 from smoother import PoseSmoother
 from scoring import process_all_frames_scoring_vectorized
-from visualizer import render_and_export
+from visualizer import (
+    render_and_export,
+    render_phase_clip,
+    stitch_montage,
+    draw_boxes_only,
+    draw_frame_with_boxes,
+    draw_frame,
+)
 
 
 def _interpolate_pose_gaps(
@@ -183,6 +190,12 @@ def main():
         choices=[1, 2],
         help="Run pose every Nth frame; interpolate others. 2 = ~2x faster.",
     )
+    parser.add_argument(
+        "--montage",
+        action="store_true",
+        default=False,
+        help="Generate a pipeline montage video showing each phase.",
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video_path)
@@ -193,6 +206,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     (Path("input")).mkdir(exist_ok=True)
     (Path("models")).mkdir(exist_ok=True)
+
+    montage_clips = []
+    montage_dir = output_dir / "_montage_clips"
+    if args.montage:
+        montage_dir.mkdir(parents=True, exist_ok=True)
 
     device = get_device()
     print(f"Using device: {device}")
@@ -208,6 +226,22 @@ def main():
     )
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("1-detection+tracking")
+
+    if args.montage:
+        montage_clip_frames = int(native_fps * 6)
+        montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        all_ids = set(raw_tracks.keys())
+        all_tracking = raw_tracks_to_per_frame(raw_tracks, total_frames, all_ids)
+        all_fd = [{"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"],
+                    "poses": {}} for i, t in enumerate(all_tracking)]
+        montage_clips.append(render_phase_clip(
+            video_path, all_fd, "Stage 1: Detection",
+            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            native_fps, output_fps, montage_dir / "01_detection.mp4",
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="All raw YOLO bounding boxes (noise and all)",
+        ))
 
     # ── Phase 3: Pre-pose pruning (V3.4 enhanced) ───────────────────────
     print("\n[2/9] Track pruning (duration, kinetic, spatial, traversal, bbox size, mirrors)...")
@@ -473,6 +507,23 @@ def main():
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("6-post-prune")
 
+    if args.montage:
+        postprune_fd = []
+        for fd_pre in all_frame_data_pre:
+            filt_poses = {tid: d for tid, d in fd_pre["poses"].items() if tid not in phase7_prune_ids}
+            filt_boxes = [b for b, tid in zip(fd_pre["boxes"], fd_pre["track_ids"]) if tid not in phase7_prune_ids and tid in filt_poses]
+            filt_tids = [tid for tid in fd_pre["track_ids"] if tid not in phase7_prune_ids and tid in filt_poses]
+            postprune_fd.append({"frame_idx": fd_pre["frame_idx"], "boxes": filt_boxes,
+                                  "track_ids": filt_tids, "poses": filt_poses})
+        montage_clips.append(render_phase_clip(
+            video_path, postprune_fd, "Stage 2: Pruning",
+            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            native_fps, output_fps, montage_dir / "02_pruning.mp4",
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="Only surviving dancer boxes after all pruning",
+        ))
+
     # ── Phase 8: Temporal smoothing (1 Euro, conf<0.3 guard) ─────────────
     print("\n[7/9] Temporal smoothing (1 Euro filter)...")
     t0 = time.time()
@@ -522,6 +573,16 @@ def main():
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("8-scoring")
 
+    if args.montage:
+        montage_clips.append(render_phase_clip(
+            video_path, all_frame_data, "Stage 3: Pose Estimation",
+            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            native_fps, output_fps, montage_dir / "03_pose.mp4",
+            clip_duration=6.0,
+            start_frame=montage_start + montage_clip_frames * 2,
+            caption="Boxes + skeleton overlays on dancers",
+        ))
+
     # ── Phase 10: Export & visualization ──────────────────────────────────
     print("\n[9/9] Rendering and exporting...")
     t0 = time.time()
@@ -534,6 +595,24 @@ def main():
     )
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("9-export")
+
+    if args.montage:
+        montage_clips.append(render_phase_clip(
+            video_path, all_frame_data, "Stage 4: Scoring",
+            lambda f, d: draw_frame(f, d["boxes"], d["track_ids"], d["poses"],
+                                     deviations=d.get("deviations"),
+                                     shape_errors=d.get("shape_errors"),
+                                     timing_errors=d.get("timing_errors")),
+            native_fps, output_fps, montage_dir / "04_scoring.mp4",
+            clip_duration=6.0,
+            start_frame=montage_start + montage_clip_frames * 3,
+            caption="Colored heatmap skeletons (final output)",
+        ))
+        print("\n  Stitching montage...")
+        stitch_montage(montage_clips, output_dir / "montage.mp4", native_fps)
+        import shutil as _shutil
+        _shutil.rmtree(montage_dir, ignore_errors=True)
+
     total_elapsed = time.time() - total_start
     print(f"\nDone. Outputs in {output_dir}")
     print(f"Total pipeline: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")

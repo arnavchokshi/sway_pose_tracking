@@ -427,9 +427,16 @@ def prune_low_confidence_tracks(
     min_mean_conf: float = MEAN_CONFIDENCE_MIN,
 ) -> Set[int]:
     """
-    V3.5 Post-pose: Prune tracks where the mean keypoint confidence across all
-    frames is below threshold. ViTPose on non-person objects produces uniformly
-    low confidence (~0.35) vs real dancers (0.81+).
+    V3.5 Post-pose: Prune tracks where keypoint confidence is consistently low.
+    ViTPose on non-person objects produces uniformly low confidence (~0.35) vs
+    real dancers (0.81+).
+
+    Uses the 75th percentile of per-frame mean confidence instead of a raw
+    overall mean.  This prevents false-pruning of dancers who enter from the
+    frame edge: early frames (partially visible) drag down the mean, but once
+    fully visible the per-frame confidence rises well above threshold.
+    Non-person objects remain uniformly low across all frames.
+
     Only applies when 3+ tracks survive.
     """
     if len(surviving_ids) < 3:
@@ -437,7 +444,7 @@ def prune_low_confidence_tracks(
 
     to_prune: Set[int] = set()
     for tid in surviving_ids:
-        all_confs: List[float] = []
+        frame_means: List[float] = []
         for poses in raw_poses_by_frame:
             if tid not in poses:
                 continue
@@ -450,8 +457,8 @@ def prune_low_confidence_tracks(
                 elif isinstance(kp, list) and kp and len(kp[0]) > 2:
                     scores = [k[2] for k in kp]
             if scores is not None:
-                all_confs.extend(float(s) for s in scores)
-        if all_confs and np.mean(all_confs) < min_mean_conf:
+                frame_means.append(float(np.mean([float(s) for s in scores])))
+        if frame_means and float(np.percentile(frame_means, 75)) < min_mean_conf:
             to_prune.add(tid)
 
     return to_prune

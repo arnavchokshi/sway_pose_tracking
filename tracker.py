@@ -579,7 +579,7 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
     raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
     
     # Wave 1.5: Coexistence deduplication to remove duplicate counts
-    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.50, consecutive_frames=5)
+    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.70, consecutive_frames=10)
 
     # Wave 1.6: Merge complementary tracks (same person, alternating IDs, zero overlap)
     raw_tracks = merge_complementary_tracks(raw_tracks)

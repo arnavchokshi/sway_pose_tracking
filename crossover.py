@@ -37,8 +37,9 @@ OKS_OCCLUSION_THRESHOLD = 0.3  # Total keypoint confidence below this -> CVM gho
 REID_MAX_FRAME_GAP = 90  # Max frames between dead track end and newborn start (3s @ 30 FPS)
 REID_MIN_OKS = 0.35
 
-# V3.4: Visibility scoring
-VISIBILITY_CONTAINMENT_THRESH = 0.7
+# V3.4: Visibility scoring — 0.85 allows pose estimation for partially visible
+# dancers in dense formations (ViTPose handles partial visibility well)
+VISIBILITY_CONTAINMENT_THRESH = 0.85
 VISIBILITY_MIN_SCORE = 0.3
 
 # V3.4: Hybrid CVM constants
@@ -49,7 +50,9 @@ BLEND_FRAMES = 3
 # V3.5: CVM displacement cap — fraction of bbox height per frame
 CVM_MAX_DISPLACEMENT_FRAC = 0.3
 # V3.5: CVM overlap freeze — don't project into another live track
-CVM_OVERLAP_FREEZE_IOU = 0.5
+# 0.85: allows CVM box to pass through overlaps during crossovers while
+# still preventing full collision with unrelated tracks
+CVM_OVERLAP_FREEZE_IOU = 0.85
 
 # V3.4: Keypoint collision dedup thresholds
 # V3.5: Relaxed from 0.2/0.3 to catch nearby phantoms (e.g. 67px apart at bbox_h=165px)
