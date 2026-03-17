@@ -23,7 +23,8 @@ CHUNK_SIZE = 300
 DETECT_SIZE = 640
 
 # V3.0: YOLO confidence — lower to catch more dancers (pruning removes false positives)
-YOLO_CONF = 0.25
+# V3.6: 0.22 to improve recall for front/left dancers; pruning removes false positives
+YOLO_CONF = 0.22
 
 # YOLO detection stride: 1 = every frame, 2 = even frames only (2x speed, minimal accuracy loss)
 # Odd frames filled via linear interpolation before downstream phases.
@@ -138,6 +139,7 @@ def stitch_fragmented_tracks(
     radius_bbox_frac: float = STITCH_RADIUS_BBOX_FRAC,
     predicted_radius_frac: float = STITCH_PREDICTED_RADIUS_FRAC,
     fallback_radius: float = STITCH_MAX_PIXEL_RADIUS,
+    max_speed_bbox_frac: float = 0.25,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     V3.4: Stitch tracks that fragmented due to occlusion. Uses relative stitch
@@ -197,6 +199,14 @@ def stitch_fragmented_tracks(
                 if gap <= 0 or gap > max_frame_gap:
                     continue
                 cx_b, cy_b = _box_center(info_b["first_box"])
+                h_b = _bbox_height(info_b["first_box"])
+
+                # V3.7: Reject stitch when bbox sizes differ drastically (head vs full body).
+                # Prevents merging audience head (ID 58) with late-entrant dancer.
+                if h_a > 0 and h_b > 0:
+                    ratio = max(h_a, h_b) / min(h_a, h_b)
+                    if ratio > 1.6:
+                        continue
 
                 short_gap = gap <= SHORT_GAP_FRAMES
 
@@ -211,6 +221,9 @@ def stitch_fragmented_tracks(
 
                 spatial_ok = (dist_last <= eff_radius_last or dist_pred <= eff_radius_pred)
                 if not spatial_ok:
+                    continue
+
+                if (dist_last / gap) > max(h_a * max_speed_bbox_frac, 30.0):
                     continue
 
                 if not short_gap and has_velocity and len(info_b["entries"]) >= 3:
@@ -257,8 +270,8 @@ def stitch_fragmented_tracks(
 
 def coalescence_deduplicate(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
-    iou_thresh: float = 0.65,
-    consecutive_frames: int = 10,
+    iou_thresh: float = 0.85,
+    consecutive_frames: int = 15,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     Remove duplicated tracks (ghosts). If two tracks overlap highly (IoU > iou_thresh)
@@ -324,6 +337,7 @@ def coalescence_deduplicate(
 def merge_complementary_tracks(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     max_center_dist_frac: float = 0.5,
+    max_speed_bbox_frac: float = 0.25,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     Merge track pairs that cover complementary (non-overlapping) time segments
@@ -379,20 +393,31 @@ def merge_complementary_tracks(
 
                 prev_owner = None
                 prev_box = None
+                prev_fidx = None
                 for entry in all_entries:
                     fidx, box, _ = entry
                     owner = tid_a if fidx in frame_sets[tid_a] else tid_b
                     if prev_owner is not None and owner != prev_owner:
                         boundary_count += 1
-                        h = max(_bbox_height(prev_box), _bbox_height(box), 1.0)
+                        h_prev = _bbox_height(prev_box)
+                        h_cur = _bbox_height(box)
+                        h = max(h_prev, h_cur, 1.0)
+                        if h_prev > 0 and h_cur > 0:
+                            ratio = max(h_prev, h_cur) / min(h_prev, h_cur)
+                            if ratio > 1.6:
+                                boundaries_ok = False
+                                break
                         cx1, cy1 = _box_center(prev_box)
                         cx2, cy2 = _box_center(box)
                         dist = np.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
-                        if dist > max_center_dist_frac * h:
+                        gap = max(1, fidx - prev_fidx)
+                        speed = dist / gap
+                        if dist > max_center_dist_frac * h or speed > max(h * max_speed_bbox_frac, 30.0):
                             boundaries_ok = False
                             break
                     prev_owner = owner
                     prev_box = box
+                    prev_fidx = fidx
 
                 if not boundaries_ok or boundary_count == 0:
                     continue
@@ -424,6 +449,118 @@ def merge_complementary_tracks(
                     del sorted_entries[kill]
                 if kill in frame_sets:
                     del frame_sets[kill]
+                changed = True
+                break
+
+    return raw_tracks
+
+
+def merge_coexisting_fragments(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    max_center_dist_frac: float = 0.5,
+    min_overlap_frames: int = 5,
+    min_proximity_ratio: float = 0.6,
+) -> Dict[int, List[Tuple[int, Tuple, float]]]:
+    """
+    Merge two tracks that COEXIST (same frames) when their bbox centers are very close.
+    Catches BoT-SORT assigning two IDs to the same person (e.g. "directly above" duplicates).
+
+    Criteria:
+      1. Tracks overlap in time (share at least min_overlap_frames).
+      2. For at least min_proximity_ratio of overlapping frames, centers are within
+         max_center_dist_frac * bbox_height of each other.
+    Keeps the longer track, merges the shorter into it.
+    Modifies raw_tracks in place.
+    """
+    if len(raw_tracks) < 2:
+        return raw_tracks
+
+    frame_sets: Dict[int, set] = {}
+    sorted_entries: Dict[int, list] = {}
+    for tid in raw_tracks:
+        entries = sorted(raw_tracks[tid], key=lambda e: e[0])
+        sorted_entries[tid] = entries
+        frame_sets[tid] = {e[0] for e in entries}
+
+    frame_to_entries: Dict[int, Dict[int, Tuple]] = {}
+    for tid, entries in sorted_entries.items():
+        for f, box, conf in entries:
+            if f not in frame_to_entries:
+                frame_to_entries[f] = {}
+            frame_to_entries[f][tid] = box
+
+    changed = True
+    while changed:
+        changed = False
+        tid_list = list(raw_tracks.keys())
+        for i in range(len(tid_list)):
+            if changed:
+                break
+            tid_a = tid_list[i]
+            if tid_a not in raw_tracks:
+                continue
+            for j in range(i + 1, len(tid_list)):
+                tid_b = tid_list[j]
+                if tid_b not in raw_tracks:
+                    continue
+
+                overlap = frame_sets[tid_a] & frame_sets[tid_b]
+                if len(overlap) < min_overlap_frames:
+                    continue
+
+                proximity_count = 0
+                height_ratios = []
+                iou_sum, iou_n = 0.0, 0
+                for f in overlap:
+                    if tid_a not in frame_to_entries.get(f, {}) or tid_b not in frame_to_entries.get(f, {}):
+                        continue
+                    box_a = frame_to_entries[f][tid_a]
+                    box_b = frame_to_entries[f][tid_b]
+                    cx_a, cy_a = _box_center(box_a)
+                    cx_b, cy_b = _box_center(box_b)
+                    h_a, h_b = _bbox_height(box_a), _bbox_height(box_b)
+                    h = max(h_a, h_b, 1.0)
+                    dist = np.sqrt((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2)
+                    if dist <= max_center_dist_frac * h:
+                        proximity_count += 1
+                    if h_a > 0 and h_b > 0:
+                        height_ratios.append(max(h_a, h_b) / min(h_a, h_b))
+                    iou_sum += _compute_iou(box_a, box_b)
+                    iou_n += 1
+
+                if proximity_count < min_proximity_ratio * len(overlap):
+                    continue
+                if height_ratios and np.median(height_ratios) > 1.6:
+                    continue  # V3.7: Don't merge head with full-body (different people)
+                # V3.7: Require substantial IoU — "same person, two IDs" = overlapping boxes.
+                # Side-by-side dancers = low IoU; merging them loses real people.
+                if iou_n >= 3:
+                    mean_iou = iou_sum / iou_n
+                    if mean_iou < 0.25:
+                        continue
+
+                keep = tid_a if len(sorted_entries[tid_a]) >= len(sorted_entries[tid_b]) else tid_b
+                kill = tid_b if keep == tid_a else tid_a
+
+                keep_entries = {e[0]: e for e in raw_tracks[keep]}
+                for e in raw_tracks[kill]:
+                    if e[0] not in keep_entries:
+                        keep_entries[e[0]] = e
+                merged = sorted(keep_entries.values(), key=lambda e: e[0])
+
+                raw_tracks[keep] = merged
+                del raw_tracks[kill]
+                sorted_entries[keep] = merged
+                frame_sets[keep] = {e[0] for e in merged}
+                del sorted_entries[kill]
+                del frame_sets[kill]
+                # Rebuild frame_to_entries for remaining tracks
+                frame_to_entries.clear()
+                for t in raw_tracks:
+                    for f, box, conf in raw_tracks[t]:
+                        if f not in frame_to_entries:
+                            frame_to_entries[f] = {}
+                        frame_to_entries[f][t] = box
                 changed = True
                 break
 
@@ -579,10 +716,13 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
     raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
     
     # Wave 1.5: Coexistence deduplication to remove duplicate counts
-    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.70, consecutive_frames=10)
+    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.85, consecutive_frames=15)
 
     # Wave 1.6: Merge complementary tracks (same person, alternating IDs, zero overlap)
     raw_tracks = merge_complementary_tracks(raw_tracks)
+
+    # Wave 1.7: Merge coexisting fragments (same person, two IDs, spatially close — e.g. ID 51 above ID 2)
+    raw_tracks = merge_coexisting_fragments(raw_tracks)
 
     _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
 

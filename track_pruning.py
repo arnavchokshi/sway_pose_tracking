@@ -31,11 +31,11 @@ LOWER_BODY_INDICES = (13, 14, 15, 16)
 SHOULDER_INDICES = (5, 6)
 LOWER_BODY_PEAK_INDICES = (13, 14, 15, 16)  # knees + ankles for Lifetime Peak Lower-Body Audit
 
-# V3.3: Kinetic threshold = this fraction of median dancer bbox height (0.03 keeps side dancers)
-KINETIC_STD_FRAC = 0.05
+# V3.3: Kinetic threshold = this fraction of median dancer bbox height (0.02 keeps side dancers)
+KINETIC_STD_FRAC = 0.02
 
-# V3.0 Smart mirror: outer 10% of frame
-EDGE_MARGIN_FRAC = 0.10
+# V3.0 Smart mirror: outer 15% of frame
+EDGE_MARGIN_FRAC = 0.15
 # Min fraction of frames a track must be "on edge" to be considered
 EDGE_PRESENCE_FRAC = 0.3
 
@@ -56,8 +56,8 @@ def point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> 
                 if x <= max(p1x, p2x):
                     if p1y != p2y:
                         xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                    if p1x == p2x or x <= xinters:
-                        inside = not inside
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
         p1x, p1y = p2x, p2y
     return inside
 
@@ -303,17 +303,96 @@ def prune_spatial_outliers(
                            frame_height * SPATIAL_MIN_SPREAD_FRAC])
     group_std = np.maximum(group_std, min_spread)
 
+    # V3.6: Foreground dancers (lower y = closer to camera) get relaxed threshold
+    foreground_y_frac = 0.35
+    foreground_y_thresh = frame_height * (1.0 - foreground_y_frac)
+
     to_prune: Set[int] = set()
     for tid, center in track_centers.items():
         normalized_dist = np.abs(center - group_centroid) / group_std
-        if np.max(normalized_dist) > outlier_std_factor:
+        eff_factor = outlier_std_factor
+        if center[1] >= foreground_y_thresh:
+            eff_factor = outlier_std_factor * 1.25
+        if np.max(normalized_dist) > eff_factor:
             if not _is_approaching_group(raw_tracks[tid], group_centroid):
                 to_prune.add(tid)
 
     return to_prune
 
 
-SHORT_TRACK_MIN_FRAC = 0.20
+SHORT_TRACK_MIN_FRAC = 0.15
+
+# V3.6: Audience region — bottom-right corner often has seated/partial audience
+AUDIENCE_REGION_X_MIN_FRAC = 0.75  # Right 25% of frame
+AUDIENCE_REGION_Y_MIN_FRAC = 0.70  # Bottom 30% of frame
+AUDIENCE_REGION_WINDOW_FRAMES = 120  # Check first ~4s at 30fps
+
+# V3.6: Late-entrant short-span — ghosts that appear late and last briefly
+LATE_ENTRANT_START_FRAC = 0.35  # Track starts after 35% of video
+LATE_ENTRANT_MAX_SPAN_FRAC = 0.17  # Span (last-first) < 17% pruned. Track 61 (75 frames) kept as late entrant.
+
+
+def prune_audience_region(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    frame_width: int,
+    frame_height: int,
+    x_min_frac: float = AUDIENCE_REGION_X_MIN_FRAC,
+    y_min_frac: float = AUDIENCE_REGION_Y_MIN_FRAC,
+    window_frames: int = AUDIENCE_REGION_WINDOW_FRAMES,
+) -> Set[int]:
+    """
+    V3.6: Prune tracks whose median position (in early frames) falls in the audience zone.
+    Bottom-right corner often has seated audience (head/shoulders only). Catches
+    tracks like ID 58 that should have been pruned.
+    """
+    if frame_width <= 0 or frame_height <= 0 or not surviving_ids:
+        return set()
+    x_thresh = frame_width * x_min_frac
+    y_thresh = frame_height * y_min_frac
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        entries = [e for e in raw_tracks[tid] if e[0] < window_frames]
+        if not entries:
+            continue
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for _, b, _ in entries]
+        med_cx = float(np.median([c[0] for c in centers]))
+        med_cy = float(np.median([c[1] for c in centers]))
+        if med_cx >= x_thresh and med_cy >= y_thresh:
+            to_prune.add(tid)
+    return to_prune
+
+
+def prune_late_entrant_short_span(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    total_frames: int,
+    start_frac: float = LATE_ENTRANT_START_FRAC,
+    max_span_frac: float = LATE_ENTRANT_MAX_SPAN_FRAC,
+) -> Set[int]:
+    """
+    V3.6: Prune tracks that start late in the video AND have a short contiguous span.
+    Catches ghosts, reflection fragments, and brief passersby that slip past duration filter
+    (which uses possible_frames from first_frame, not total video).
+    """
+    if total_frames <= 0:
+        return set()
+    start_thresh = int(total_frames * start_frac)
+    max_span = int(total_frames * max_span_frac)
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        entries = raw_tracks[tid]
+        sorted_entries = sorted(entries, key=lambda e: e[0])
+        first_f = sorted_entries[0][0]
+        last_f = sorted_entries[-1][0]
+        span = last_f - first_f + 1
+        if first_f >= start_thresh and span < max_span:
+            to_prune.add(tid)
+    return to_prune
 
 
 def prune_short_tracks(
@@ -352,10 +431,11 @@ def prune_bbox_size_outliers(
     surviving_ids: Set[int],
     min_frac: float = BBOX_SIZE_MIN_FRAC,
     max_frac: float = BBOX_SIZE_MAX_FRAC,
+    frame_height: int = 0,
 ) -> Set[int]:
     """
     V3.4: Prune tracks whose median bbox height is outside 40–200% of the group median.
-    Only applies when 3+ tracks survive (avoids over-pruning small groups).
+    V3.6: Foreground dancers (lower in frame) get relaxed max (250%) to avoid pruning front row.
     """
     if len(surviving_ids) < 3:
         return set()
@@ -375,17 +455,28 @@ def prune_bbox_size_outliers(
     if group_median_h <= 0:
         return set()
 
+    foreground_tracks: Set[int] = set()
+    if frame_height > 0:
+        for tid in surviving_ids:
+            if tid not in raw_tracks or not raw_tracks[tid]:
+                continue
+            centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in raw_tracks[tid]]
+            med_cy = float(np.median([c[1] for c in centers]))
+            if med_cy >= frame_height * 0.65:
+                foreground_tracks.add(tid)
+
     to_prune: Set[int] = set()
     for tid, med_h in track_median_heights.items():
         ratio = med_h / group_median_h
-        if ratio < min_frac or ratio > max_frac:
+        eff_max = max_frac * 1.25 if tid in foreground_tracks else max_frac
+        if ratio < min_frac or ratio > eff_max:
             to_prune.add(tid)
 
     return to_prune
 
 
 # V3.5: Bbox aspect ratio — person bboxes are taller than wide
-ASPECT_RATIO_MAX = 1.2
+ASPECT_RATIO_MAX = 2.5
 
 
 def prune_bad_aspect_ratio(
@@ -560,10 +651,10 @@ def prune_completeness_audit(
     raw_poses_by_frame: List[Dict[int, Dict]],
     frame_width: int = 1920,
     frame_height: int = 1080,
-    max_lower_peak_thresh: float = 0.25,
-    mean_shoulder_thresh: float = 0.40,
-    corner_max_lower_thresh: float = 0.35,
-    corner_mean_shoulder_thresh: float = 0.35,
+    max_lower_peak_thresh: float = 0.35,
+    mean_shoulder_thresh: float = 0.35,
+    corner_max_lower_thresh: float = 0.45,
+    corner_mean_shoulder_thresh: float = 0.25,
 ) -> Set[int]:
     """
     V3.2 Phase 6: Lifetime Peak Lower-Body Audit — prune seated corner observers (head/shoulders only).
@@ -573,8 +664,8 @@ def prune_completeness_audit(
     For tracks NOT in corner: use strict thresholds to avoid pruning real dancers with skirts.
 
     Prune IF:
-      - Corner track: max_lower_peak < 0.35 AND mean_shoulder_conf > 0.35
-      - Non-corner: max_lower_peak < 0.25 AND mean_shoulder_conf > 0.40 (unchanged)
+      - Corner track: max_lower_peak < 0.45 AND mean_shoulder_conf > 0.25
+      - Non-corner: max_lower_peak < 0.35 AND mean_shoulder_conf > 0.35
     """
     to_prune: Set[int] = set()
     for track_id in surviving_ids:
@@ -752,12 +843,14 @@ def prune_low_sync_tracks(
     all_frame_data: List[Dict[str, Any]],
     surviving_ids: Set[int],
     min_sync_score: float = SYNC_SCORE_MIN,
+    raw_tracks: Optional[Dict[int, List[Tuple[int, Tuple, float]]]] = None,
+    total_frames: int = 0,
 ) -> Set[int]:
     """
     V3.4 Post-pose pruning: remove tracks with near-zero angular correlation to the group truth.
     Non-dancers (standing, sitting, walking) have ~0 correlation across all 6 joint angles.
     Uses max-across-joints so a soloist syncing on even 1 joint is protected.
-    Very conservative threshold (0.10) to avoid harming canons/subgroups.
+    V3.7: Exempt late-entrant short tracks — they have few frames so correlation is unreliable.
     """
     from kinematics import compute_joint_angles_vectorized, JOINT_NAMES
     from scoring import _build_keypoints_array, _compute_group_truth, CONFIDENCE_THRESHOLD
@@ -765,7 +858,7 @@ def prune_low_sync_tracks(
     if len(surviving_ids) < 3 or len(all_frame_data) < 30:
         return set()
 
-    kpts_arr, tid_to_idx, _ = _build_keypoints_array(all_frame_data)
+    kpts_arr, tid_to_idx, track_ids_per_frame = _build_keypoints_array(all_frame_data)
     num_frames, num_tracks, _, _ = kpts_arr.shape
     if num_tracks < 3:
         return set()
@@ -777,6 +870,14 @@ def prune_low_sync_tracks(
     for tid in surviving_ids:
         if tid not in tid_to_idx:
             continue
+        # Late-entrant safeguard: tracks starting after 25% of video with <100 frames often
+        # have unreliable sync (sparse pose data); may be real late entrant.
+        if raw_tracks and total_frames > 0 and tid in raw_tracks:
+            entries = raw_tracks[tid]
+            first_f = min(e[0] for e in entries)
+            n_frames = len(entries)
+            if first_f >= total_frames * 0.25 and n_frames < 100:
+                continue  # Don't sync-prune; could be late entrant
         t_idx = tid_to_idx[tid]
         max_corr = 0.0
         for j in range(6):
@@ -802,12 +903,48 @@ def prune_low_sync_tracks(
     return to_prune
 
 
+def get_pruned_track_info(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    tid: int,
+    rule_name: str,
+    frame_width: int = 0,
+    frame_height: int = 0,
+) -> dict:
+    """Return structured info for one pruned track (for JSON logging)."""
+    entries = raw_tracks.get(tid, [])
+    if not entries:
+        return {"track_id": tid, "rule": rule_name, "n_frames": 0}
+    centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in entries]
+    med_cx = float(np.median([c[0] for c in centers]))
+    med_cy = float(np.median([c[1] for c in centers]))
+    heights = [b[3] - b[1] for _, b, _ in entries if b[3] - b[1] > 0]
+    widths = [b[2] - b[0] for _, b, _ in entries if b[2] - b[0] > 0]
+    med_h = float(np.median(heights)) if heights else 0.0
+    med_w = float(np.median(widths)) if widths else 0.0
+    first_f = min(e[0] for e in entries)
+    last_f = max(e[0] for e in entries)
+    info = {
+        "track_id": tid,
+        "rule": rule_name,
+        "n_frames": len(entries),
+        "frame_range": [first_f, last_f],
+        "median_center": [round(med_cx, 1), round(med_cy, 1)],
+        "median_h": round(med_h, 1),
+        "median_w": round(med_w, 1),
+        "aspect_ratio": round(med_w / med_h, 2) if med_h > 0 else None,
+    }
+    if frame_width > 0 and frame_height > 0:
+        info["pos_pct"] = [round(100 * med_cx / frame_width, 1), round(100 * med_cy / frame_height, 1)]
+    return info
+
+
 def log_pruned_tracks(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     pruned_ids: Set[int],
     rule_name: str,
     frame_width: int = 0,
     frame_height: int = 0,
+    prune_log: Optional[list] = None,
 ) -> None:
     """Print per-track diagnostics for every pruned track so root-cause is visible in logs."""
     if not pruned_ids:
@@ -815,6 +952,8 @@ def log_pruned_tracks(
     for tid in sorted(pruned_ids):
         entries = raw_tracks.get(tid, [])
         n_frames = len(entries)
+        if prune_log is not None:
+            prune_log.append(get_pruned_track_info(raw_tracks, tid, rule_name, frame_width, frame_height))
         if not entries:
             print(f"    [PRUNED by {rule_name}] track {tid}: no entries")
             continue

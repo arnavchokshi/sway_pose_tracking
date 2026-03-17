@@ -12,11 +12,12 @@ The pipeline processes video in a **linear, streaming** flow to avoid RAM bloat.
 |-------|------|---------|
 | 1 | Streaming Ingestion & Detection | 300‑frame chunks, native FPS, YOLO11x/m at 640/960 |
 | 2 | High‑Tenacity Tracking & Box Stitching | BoT‑SORT + Wave 1 bbox stitch with relative radius & velocity consistency |
-| 3 | Resolution‑Aware Box Pruning (Enhanced) | Duration, kinetic, spatial outliers, traversal (walkers), bbox size, geometric mirrors |
+| 3 | Resolution‑Aware Box Pruning (Enhanced) | Duration, kinetic, spatial outliers, short tracks, bbox size, aspect ratio, geometric mirrors |
 | 4 | High‑Fidelity Pose Estimation (Visibility‑Aware) | ViTPose, fp16 MPS, batched [N,3,256,192], visibility scoring to skip occluded tracks |
-| 5 | Keypoint Collision Dedup | Remove duplicate pose overlays on the same physical person |
-| 6 | Skeleton Re‑Association (Hybrid CVM) | OKS re‑ID + crossover refinement with hybrid CVM + freeze/decay |
-| 7 | Post‑Pose Pruning | Sync‑score pruning (non‑dancers) + Smart Mirror pruning |
+| 5 | Skeleton Re‑Association (Hybrid CVM) | OKS re‑ID + crossover refinement with hybrid CVM + freeze/decay |
+| 5.5 | Collision Handling (Locked State) | Suspend ID swaps during overlap; Temporal OKS audit on exit |
+| 6 | Keypoint Collision Dedup | Remove duplicate pose overlays on the same physical person |
+| 7 | Post‑Pose Pruning | Sync + Smart Mirrors + Completeness + Low Confidence + Jitter |
 | 8 | Temporal Smoothing | 1 Euro Filter with conf&lt;0.3 guard |
 | 9 | Spatio‑Temporal Scoring & Visualization | Group Truth + cDTW + per‑joint heatmaps, JSON + MP4 export |
 
@@ -62,7 +63,7 @@ Maintain long‑lived, stable IDs through occlusions and crossings.
 ### What Happens
 
 1. **BoT‑SORT:** `track_buffer=90` (≈3 s at 30 FPS), tuned thresholds in `botsort.yaml`.
-2. **Wave 1 Stitching (BBox, V3.4):** When ID_A dies and ID_B appears within `STITCH_MAX_FRAME_GAP` frames:
+2. **Wave 1 Stitching (BBox, V3.4):** When ID_A dies and ID_B appears within `STITCH_MAX_FRAME_GAP` frames (default 60):
    - Compute A’s last center and velocity.
    - Use a **relative radius** derived from A’s bbox height (e.g. 0.5× for stationary, 0.75× for predicted re‑appearance), with a small absolute fallback.
    - Merge B into A if B spawns near A’s last position or predicted position and has **velocity direction consistent** with A (dot product &gt; 0).
@@ -83,18 +84,15 @@ Same `raw_tracks` with stitched and deduplicated IDs; no fragment gaps within 90
 
 Remove non‑dancers (audience, walkers, seated people) and obvious mirrors while keeping side/far dancers.
 
-### Rules (V3.4)
+### Rules (V3.4 / V3.5)
 
 1. **Duration:** Track must appear in &gt; **20%** of its *possible* lifespan (`possible_frames = total_frames - first_frame`), with a hard floor of **30 frames**. Late entrants are not penalized.
-2. **Normalized Kinetic Pruning:** Bounding box center movement std must exceed `KINETIC_STD_FRAC = 0.03` times the median dancer bbox height (resolution‑agnostic).
+2. **Normalized Kinetic Pruning:** Bounding box center movement std must exceed `KINETIC_STD_FRAC = 0.05` times the median dancer bbox height (resolution‑agnostic).
 3. **Spatial Outlier Filter:** Compute median center for each track that survives duration + kinetic. Compute group centroid and std across all such centers. Prune tracks whose normalized distance exceeds **2σ**, using a **minimum spread floor** (`0.05 * frame_dimension`) to avoid false positives when dancers are tightly clustered. Late entrants moving toward the group centroid are preserved.
-4. **Traversal Detector (Walkers):** For each track, compute:
-   - `straightness = total_displacement / path_length`
-   - `traversal_frac = total_displacement / frame_width`
-   - acceleration variance (2nd derivative of center positions), normalized by bbox height.  
-   Prune **only** if **all** hold: `straightness > 0.7`, `traversal_frac > 0.3`, `normalized_accel_var < 0.02`. Walkers have high straightness and near‑zero acceleration; dancers accelerating/braking to new formations are kept.
+4. **Short Tracks:** Prune tracks present in less than **20%** of *total* video frames (walkers/passersby who enter briefly).
 5. **Bbox Size Outliers:** For surviving tracks (≥3), compute median bbox height per track and group median. Prune tracks whose median height is &lt; **40%** or &gt; **200%** of the group median.
-6. **Geometric Mirrors:** Pre‑pose filtering based on edge presence and inverted x‑velocity relative to group mean, to strip obvious mirrors early and save ViTPose compute.
+6. **Bbox Aspect Ratio (V3.5):** Prune tracks with median width/height &gt; 1.2 (non‑person objects like bags, tables).
+7. **Geometric Mirrors:** Pre‑pose filtering based on edge presence and inverted x‑velocity relative to group mean, to strip obvious mirrors early and save ViTPose compute.
 
 ### Output
 
@@ -117,7 +115,7 @@ Get high‑fidelity skeletons for every visible dancer while **skipping pose** f
 3. **Dynamic Bbox Padding:** Default 15%; shrinks to 10% for slow, stable boxes; expands to 25% for fast motion or large bbox deltas to avoid cutting off limbs.
 4. **Visibility Scoring (V3.4):** For each frame:
    - Compute **containment** between boxes and use **foot Y‑position (ymax)** to infer depth: lower feet = closer to camera.
-   - For each track, visibility ∈ [0,1] is reduced when its box is heavily contained inside a box whose feet are lower.
+   - For each track, visibility ∈ [0,1] is reduced when its box is heavily contained (threshold **0.85**) inside a box whose feet are lower.
    - Tracks with visibility &lt; 0.3 **skip ViTPose**; they receive a decayed copy of their last good pose instead (confidence ×0.85 per skip).
 5. Coordinates are mapped back to global image space.
 
@@ -135,43 +133,17 @@ raw_poses_by_frame: List[Dict[int, {"keypoints": (17,3), "scores": (17,)}]]
 
 ---
 
-## Phase 5: Keypoint Collision Dedup
+## Phase 5: Skeleton Re‑Association (Hybrid CVM)
 
 **Module:** `crossover.py`
 
 ### Goal
 
-Prevent multiple pose overlays from being drawn on the **same physical person** when tracking fragments or crossover mis‑assignments occur.
+Handle occlusion‑induced ID breaks and crossovers **after** pose estimation using OKS and a hybrid CVM model that is smooth for micro‑occlusions and robust for long occlusions. Runs **before** collision dedup so re‑ID merges fragments first.
 
 ### What Happens
 
-For each frame:
-
-1. For every pair of tracks with poses:
-   - Compute per‑keypoint distances and take the **median** (robust to 1–2 hallucinated keypoints).
-   - Compute bbox height and centers for both tracks.
-2. Apply two gates:
-   - **Gate 1:** median keypoint distance &lt; 0.2× bbox height → skeletons are collocated.
-   - **Gate 2:** center distance &lt; 0.3× bbox height → bboxes are nearly on top of each other (protects partner work where skeletons can be close but bboxes are offset).
-3. If both gates pass, suppress the track with lower average keypoint confidence.
-
-### Output
-
-Per‑frame `poses` dictionaries with duplicate overlays removed.
-
----
-
-## Phase 6: Skeleton Re‑Association (Hybrid CVM)
-
-**Module:** `crossover.py`
-
-### Goal
-
-Handle occlusion‑induced ID breaks and crossovers **after** pose estimation using OKS and a hybrid CVM model that is smooth for micro‑occlusions and robust for long occlusions.
-
-### What Happens
-
-1. **Wave 2 OKS Re‑ID:** `apply_occlusion_reid()` scans dead vs newborn tracks. If OKS between dead track’s last pose and newborn’s first pose ≥ 0.5 within 90 frames, newborn is merged into the old ID.
+1. **Wave 2 OKS Re‑ID:** `apply_occlusion_reid()` scans dead vs newborn tracks. If OKS between dead track’s last pose and newborn’s first pose ≥ **0.35** within 90 frames, newborn is merged into the old ID.
 2. **Crossover Refinement (OKS):** `apply_crossover_refinement()`:
    - Detects overlapping pairs with IoU &gt; 0.6.
    - Compares how well each current pose matches each track’s **previous** pose using OKS.
@@ -185,11 +157,69 @@ Handle occlusion‑induced ID breaks and crossovers **after** pose estimation us
    - **Re‑emergence:**  
      When live keypoint confidence returns &gt;= 0.3, blend from frozen to live pose over 3 frames to avoid visual snapping.
 
----
+### Output
+
+Stitched and refined track IDs; crossover swaps applied.
 
 ---
 
-## Phase 7: Post‑Pose Pruning (Sync + Smart Mirrors)
+## Phase 5.5: Collision Handling (Locked State)
+
+**Module:** `crossover.py` (within `apply_crossover_refinement`)
+
+### Goal
+
+Avoid premature "who is who?" decisions during dense overlaps by entering a **locked state** where identities are held in suspension until dancers separate, then resolve using a Temporal OKS Audit.
+
+### What Happens
+
+1. **Collision State Detection:**
+   - Trigger: Two bounding boxes have IoU &gt; **0.6** for **3 consecutive** frames.
+   - Action: Flag both IDs as `in_collision = True`.
+   - Logic: While `in_collision` is true, **disable** ID swapping and re‑ID logic. The tracker continues, but no identity commitment is made.
+
+2. **Collision Exit (Temporal OKS Audit):**
+   - Trigger: IoU drops below **0.3** → collision has ended.
+   - Lookback: Take the last **5 clean** frames (pre‑collision) for ID A and ID B (keypoint confidence ≥ 0.3).
+   - Lookahead: Take the first **5 clean** frames (post‑collision) for both IDs.
+   - Cross‑match: Compute average OKS for:
+     - **Standard path:** (Pre‑A → Post‑A) + (Pre‑B → Post‑B)
+     - **Swapped path:** (Pre‑A → Post‑B) + (Pre‑B → Post‑A)
+   - Correction: If the swapped path has **≥ 0.05** higher cumulative OKS than the standard path, force an ID swap in all frames following the collision.
+
+### Output
+
+Corrected track IDs after collision events; no swaps applied during the collision window.
+
+---
+
+## Phase 6: Keypoint Collision Dedup
+
+**Module:** `crossover.py`
+
+### Goal
+
+Prevent multiple pose overlays from being drawn on the **same physical person** when tracking fragments or crossover mis‑assignments occur. Runs **after** re‑ID so fragments are merged first.
+
+### What Happens
+
+For each frame:
+
+1. For every pair of tracks with poses:
+   - Compute per‑keypoint distances and take the **median** (robust to 1–2 hallucinated keypoints).
+   - Compute bbox height and centers for both tracks.
+2. Apply two gates:
+   - **Gate 1:** median keypoint distance &lt; **0.35×** bbox height → skeletons are collocated.
+   - **Gate 2:** center distance &lt; **0.5×** bbox height → bboxes are nearly on top of each other (protects partner work where skeletons can be close but bboxes are offset).
+3. If both gates pass, suppress the track with lower average keypoint confidence.
+
+### Output
+
+Per‑frame `poses` dictionaries with duplicate overlays removed.
+
+---
+
+## Phase 7: Post‑Pose Pruning (Sync + Smart Mirrors + V3.5)
 
 **Module:** `track_pruning.py`
 
@@ -211,6 +241,12 @@ After sync pruning, `prune_smart_mirrors()` removes mirrors that satisfy **all**
 1. Track spends a significant fraction of time in the **outer 10%** of the frame horizontally.
 2. Mean x‑velocity is **inverted** relative to the group’s mean x‑velocity.
 3. Lower‑body keypoints (knees, ankles) have low average confidence (&lt; 0.3).
+
+### V3.5 Additional Pruning
+
+4. **Completeness Audit:** Prune tracks with lifetime peak lower‑body confidence &lt; 0.25 and mean shoulder confidence &gt; 0.40 (seated corner observers, floorwork/skirts).
+5. **Low Mean Confidence:** Prune tracks whose 75th‑percentile per‑frame mean keypoint confidence &lt; **0.45** (non‑person objects get uniformly low ViTPose scores).
+6. **Jitter Pruning:** Prune tracks with excessive frame‑to‑frame keypoint jitter normalized by bbox height (&gt; **0.10** = non‑person).
 
 Output is a final set of surviving dancer track IDs.
 
@@ -286,8 +322,9 @@ Video (MP4)
 [3] prune_tracks (duration + kinetic)
     ├─ prune_by_stage_polygon (optional)
     ├─ prune_spatial_outliers (min-spread floor, late-entrant aware)
-    ├─ prune_traversal_tracks (walkers)
+    ├─ prune_short_tracks (<20% of total frames)
     ├─ prune_bbox_size_outliers
+    ├─ prune_bad_aspect_ratio (V3.5)
     └─ prune_geometric_mirrors
         → surviving_ids → raw_tracks_to_per_frame → tracking_results
     │
@@ -298,13 +335,15 @@ Video (MP4)
         → raw_poses_by_frame
     │
     ▼
-[5] deduplicate_collocated_poses (median keypoint distance + center gate)
+[5] apply_occlusion_reid (OKS ≥ 0.35) + apply_crossover_refinement (hybrid CVM + OKS crossover)
+    ├─ Phase 5.5: in_collision (IoU>0.6 for 3 frames) → suspend swaps
+    └─ On exit (IoU<0.3): Temporal OKS audit (5 lookback + 5 lookahead) → swap if swapped path wins
     │
     ▼
-[6] apply_occlusion_reid (OKS > 0.5) + apply_crossover_refinement (hybrid CVM + OKS crossover)
+[6] deduplicate_collocated_poses (median keypoint distance + center gate)
     │
     ▼
-[7] prune_low_sync_tracks (low correlation to group truth) + prune_smart_mirrors (edge+velocity+low lower-body)
+[7] prune_low_sync_tracks + prune_smart_mirrors + prune_completeness_audit + prune_low_confidence_tracks + prune_jittery_tracks
     │
     ▼
 [8] PoseSmoother (1 Euro, conf<0.3 guard) → smoothed poses
@@ -324,36 +363,40 @@ render_and_export → data.json + <video>_poses.mp4 (dual-signal heatmap)
 |----------|-----------|---------|--------|
 | `tracker.py` | `CHUNK_SIZE` | 300 | Frames per streaming chunk |
 | `tracker.py` | `YOLO_CONF` | 0.25 | Detection confidence threshold |
-| `tracker.py` | `CHUNK_SIZE` | 300 | Frames per streaming chunk |
-| `tracker.py` | `STITCH_MAX_FRAME_GAP` | 180 | Max frames for Wave 1 bbox stitch |
+| `tracker.py` | `STITCH_MAX_FRAME_GAP` | 60 | Max frames for Wave 1 bbox stitch |
 | `tracker.py` | `STITCH_RADIUS_BBOX_FRAC` | 0.5 | Stationary stitch radius as fraction of bbox height |
 | `tracker.py` | `STITCH_PREDICTED_RADIUS_FRAC` | 0.75 | Predicted stitch radius fraction when velocity is known |
 | `tracker.py` | `STITCH_MAX_PIXEL_RADIUS` | 120.0 | Fallback absolute radius when bbox height unavailable |
 | `track_pruning.py` | `min_duration_ratio` | 0.20 | Min fraction of *possible* frames track must appear |
-| `track_pruning.py` | `KINETIC_STD_FRAC` | 0.03 | Kinetic threshold = 3% of median bbox height |
+| `track_pruning.py` | `KINETIC_STD_FRAC` | 0.05 | Kinetic threshold = 5% of median bbox height |
 | `track_pruning.py` | `SPATIAL_MIN_SPREAD_FRAC` | 0.05 | Min spread floor (fraction of frame width/height) for spatial outliers |
 | `track_pruning.py` | `SPATIAL_OUTLIER_STD_FACTOR` | 2.0 | Normalized distance threshold for spatial outliers |
-| `track_pruning.py` | `TRAVERSAL_STRAIGHTNESS` | 0.7 | Straightness threshold for traversal pruning |
-| `track_pruning.py` | `TRAVERSAL_MIN_FRAC` | 0.3 | Min fraction of frame width a traversal must cover |
-| `track_pruning.py` | `TRAVERSAL_MAX_ACCEL_VAR` | 0.02 | Max normalized acceleration variance for walkers |
+| `track_pruning.py` | `SHORT_TRACK_MIN_FRAC` | 0.20 | Min fraction of *total* frames for short-track pruning |
 | `track_pruning.py` | `BBOX_SIZE_MIN_FRAC` | 0.40 | Min median bbox height as fraction of group median |
 | `track_pruning.py` | `BBOX_SIZE_MAX_FRAC` | 2.00 | Max median bbox height as fraction of group median |
+| `track_pruning.py` | `ASPECT_RATIO_MAX` | 1.2 | Max width/height for person bbox (V3.5) |
 | `track_pruning.py` | `EDGE_MARGIN_FRAC` | 0.10 | Outer 10% of frame for mirror rule |
 | `track_pruning.py` | `min_lower_body_conf` | 0.3 | Lower-body conf threshold for mirror |
 | `track_pruning.py` | `SYNC_SCORE_MIN` | 0.10 | Min max-correlation with group truth to keep a track |
+| `track_pruning.py` | `MEAN_CONFIDENCE_MIN` | 0.45 | Min 75th‑pctl per‑frame mean keypoint conf (V3.5) |
+| `track_pruning.py` | `JITTER_RATIO_MAX` | 0.10 | Max keypoint jitter / bbox height (V3.5) |
 | `botsort.yaml` | `new_track_thresh` | 0.35 | Min conf to spawn new track ID (V3.1: pick up side-dancers) |
 | `botsort.yaml` | `min_hits` | 3 | Track must be detected 3 consecutive frames to become confirmed |
 | `pose_estimator.py` | `model_name` | vitpose-plus-base/large | ViTPose++ model |
 | `pose_estimator.py` | `BBOX_PADDING` | 0.15 | Base bbox padding before cropping (dynamic in `main.py`) |
 | `crossover.py` | `REID_MAX_FRAME_GAP` | 90 | Max frames for Wave 2 OKS stitch |
-| `crossover.py` | `REID_MIN_OKS` | 0.5 | Min OKS to merge tracks |
-| `crossover.py` | `VISIBILITY_CONTAINMENT_THRESH` | 0.7 | Containment threshold for occlusion visibility scoring |
+| `crossover.py` | `REID_MIN_OKS` | 0.35 | Min OKS to merge tracks |
+| `crossover.py` | `VISIBILITY_CONTAINMENT_THRESH` | 0.85 | Containment threshold for occlusion visibility scoring |
 | `crossover.py` | `VISIBILITY_MIN_SCORE` | 0.3 | Visibility cutoff used in `main.py` to skip ViTPose |
+| `crossover.py` | `COLLISION_ENTRY_IOU` / `COLLISION_ENTRY_CONSECUTIVE` | 0.6 / 3 | IoU and frames to enter collision (locked) state |
+| `crossover.py` | `COLLISION_EXIT_IOU` | 0.3 | IoU below which collision ends (Temporal OKS audit runs) |
+| `crossover.py` | `TEMPORAL_OKS_LOOKBACK` / `TEMPORAL_OKS_LOOKAHEAD` | 5 / 5 | Clean frames for pre‑ and post‑collision OKS audit |
+| `crossover.py` | `TEMPORAL_OKS_SWAP_MARGIN` | 0.05 | Swapped path must exceed standard by this to force ID swap |
 | `crossover.py` | `CVM_MAX_FRAMES` | 5 | Frames of CVM extrapolation before freezing pose |
 | `crossover.py` | `CONF_DECAY_FACTOR` | 0.85 | Confidence decay per occluded frame after CVM ends |
 | `crossover.py` | `BLEND_FRAMES` | 3 | Frames to blend from frozen to live pose on re-emergence |
-| `crossover.py` | `COLLISION_KPT_DIST_FRAC` | 0.2 | Median keypoint distance fraction for collision gate 1 |
-| `crossover.py` | `COLLISION_CENTER_DIST_FRAC` | 0.3 | Center distance fraction for collision gate 2 |
+| `crossover.py` | `COLLISION_KPT_DIST_FRAC` | 0.35 | Median keypoint distance fraction for collision gate 1 |
+| `crossover.py` | `COLLISION_CENTER_DIST_FRAC` | 0.5 | Center distance fraction for collision gate 2 |
 | `smoother.py` | `SMOOTH_CONF_THRESHOLD` | 0.3 | Skip smoothing below this |
 | `smoother.py` | `min_cutoff`, `beta` | 1.0, 0.7 | 1 Euro filter params |
 | `scoring.py` | `RIPPLE_STD_THRESHOLD` | 30.0 | Std (deg) above which deviations=NaN |

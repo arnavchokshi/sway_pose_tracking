@@ -1,0 +1,52 @@
+# Ground Truth: IMG_0256.mov
+# Captured from user feedback — use for benchmark verification and parameter tuning.
+
+video_path: /Users/arnavchokshi/Desktop/IMG_0256.mov
+
+# ── Expected counts ────────────────────────────────────────────────────────
+# At the very start: 7 dancers in center + 1 on back right = 8 total
+expected_tracks_at_start: 8
+
+# At the end (after late entrant): 9 total
+expected_tracks_at_end: 9
+
+# 1 new dancer enters frame at ~11 seconds
+late_entrant_seconds: 11
+late_entrant_tolerance_seconds: 4  # First appearance within ±4s of 11s (7-15s)
+expected_late_entrants: 1
+
+# Overall unique dancers across entire video
+expected_total_unique_tracks: 9
+
+# ID consistency: never more than this many people in a single frame (ghost if exceeded)
+expected_max_tracks_in_single_frame: 9
+
+# ── Must prune (non-dancers) ────────────────────────────────────────────────
+# These should NOT appear in the final output
+
+prune_rules:
+  - description: "Person bottom-right at start — only head visible (audience)"
+    region: "bottom-right"   # Right 25%, bottom 30% of frame
+    region_x_min: 0.75        # Right quarter
+    region_y_min: 0.70        # Bottom 30%
+    when: "from start"
+    frames_range: [0, 60]    # First ~2 seconds
+
+  - description: "Mirror reflections"
+    region: "edges"          # Outer 10% of frame (handled by smart mirror prune)
+    note: "Mirror/window reflections in frame — use geometric + smart mirror pruning"
+
+  - description: "Window reflections"
+    note: "Same as mirror — edge presence + inverted velocity typically catches these"
+
+# ── Frame windows for counting ─────────────────────────────────────────────
+# "At start" = first N frames; "at end" = last N frames
+start_window_frames: 60   # ~2 seconds at 30fps
+end_window_frames: 60    # ~2 seconds at 30fps
+
+# ── Spatial region for "person to prune" check ───────────────────────────────
+# If any surviving track has median bbox center in this region during start window,
+# that indicates we FAILED to prune the bottom-right audience member
+prune_region_bottom_right:
+  x_min_frac: 0.75   # Right 25% of frame
+  y_min_frac: 0.70   # Bottom 30% of frame

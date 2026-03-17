@@ -1,13 +1,15 @@
 # Sway Pose V3.0 — occlusion-tolerant tracker config
 # (OC-SORT not in Ultralytics; uses BoT-SORT with same params)
-# track_buffer=90 → 3s memory @ 30 FPS; match_thresh=0.7 → forgiving re-association
+# track_buffer=90 → 3s memory @ 30 FPS
+# new_track_thresh=0.45 → fewer spurious IDs in dense dance scenes
+# match_thresh=0.6 → easier re-association during overlaps
 
 tracker_type: botsort
 track_high_thresh: 0.25
 track_low_thresh: 0.1
-new_track_thresh: 0.25
+new_track_thresh: 0.45
 track_buffer: 90
-match_thresh: 0.7
+match_thresh: 0.6
 fuse_score: True
 
 gmc_method: sparseOptFlow

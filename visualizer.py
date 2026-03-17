@@ -179,6 +179,9 @@ def draw_frame(
     """
     out = frame.copy()
 
+    # Draw green bounding boxes + track ID labels (for review / feedback)
+    out = draw_boxes_only(out, boxes, track_ids)
+
     # Draw skeletons for each tracked person
     for tid, data in poses.items():
         keypoints = data["keypoints"]

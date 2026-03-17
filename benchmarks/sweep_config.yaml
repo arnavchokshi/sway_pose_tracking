@@ -1,0 +1,49 @@
+# Sweep config for IMG_0256 ground truth
+# Priority: ID consistency — one person = one ID, no drops, no ghosts, merge occlusion fragments
+
+ground_truth: benchmarks/IMG_0256_ground_truth.yaml
+video_path: /Users/arnavchokshi/Desktop/IMG_0256.mov
+output_dir: output
+stop_on_pass: true
+
+param_sets:
+  - name: baseline
+    params: {}
+
+  # Re-ID first (top priority): merge fragments when dancer reappears after occlusion
+  - name: reid_aggressive
+    params: { REID_MIN_OKS: 0.25, REID_MAX_FRAME_GAP: 150 }
+  - name: reid_more_aggressive
+    params: { REID_MIN_OKS: 0.20, REID_MAX_FRAME_GAP: 180 }
+  - name: reid_relax_oks
+    params: { REID_MIN_OKS: 0.30, REID_MAX_FRAME_GAP: 120 }
+  - name: reid_wider_gap
+    params: { REID_MIN_OKS: 0.35, REID_MAX_FRAME_GAP: 150 }
+
+  # Combo: Re-ID + allow shorter fragments (late entrant may have short first segment)
+  - name: reid_and_duration
+    params: { REID_MIN_OKS: 0.25, REID_MAX_FRAME_GAP: 150, min_duration_ratio: 0.15 }
+
+  # Prune (if ghost, not fragmentation)
+  - name: higher_sync_0.12
+    params: { SYNC_SCORE_MIN: 0.12 }
+  - name: higher_mean_conf
+    params: { MEAN_CONFIDENCE_MIN: 0.50 }
+  - name: tighter_spatial
+    params: { SPATIAL_OUTLIER_STD_FACTOR: 1.5 }
+  - name: tighter_mirror
+    params: { EDGE_MARGIN_FRAC: 0.08, min_lower_body_conf: 0.35 }
+
+  # Combos
+  - name: combo_reid_sync
+    params: { REID_MIN_OKS: 0.25, REID_MAX_FRAME_GAP: 150, SYNC_SCORE_MIN: 0.12 }
+  - name: combo_reid_conf
+    params: { REID_MIN_OKS: 0.25, REID_MAX_FRAME_GAP: 150, MEAN_CONFIDENCE_MIN: 0.50 }
+
+  # Relax pre-pose pruning when dancers are being dropped (keep more tracks)
+  - name: relax_short_track
+    params: { SHORT_TRACK_MIN_FRAC: 0.12 }
+  - name: relax_audience_region
+    params: { AUDIENCE_REGION_X_MIN_FRAC: 0.90, AUDIENCE_REGION_Y_MIN_FRAC: 0.90 }
+  - name: relax_prepose_both
+    params: { SHORT_TRACK_MIN_FRAC: 0.12, AUDIENCE_REGION_X_MIN_FRAC: 0.90, AUDIENCE_REGION_Y_MIN_FRAC: 0.90 }

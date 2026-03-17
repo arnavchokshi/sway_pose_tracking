@@ -93,7 +93,7 @@ class PoseEstimator:
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.model_name = model_name
 
-        self.processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(model_name)
         self.model = VitPoseForPoseEstimation.from_pretrained(model_name)
         self.model.to(self.device)
         self.model.eval()
