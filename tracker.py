@@ -10,7 +10,7 @@ handles dense overlaps when IoU > 0.6.
 """
 
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Generator
+from typing import List, Dict, Tuple, Optional, Generator, Set
 
 import cv2
 import numpy as np
@@ -291,6 +291,7 @@ def coalescence_deduplicate(
             
     # Count consecutive overlaps between ID pairs
     overlap_counts: Dict[Tuple[int, int], int] = {}
+    dead_ids: Set[int] = set()  # V3.8: Accumulate across frames (ghost flew away = kill on reset)
     # tuple (tid1, tid2) where tid1 < tid2
     
     # Needs to be sorted so "consecutive" logic holds true
@@ -309,19 +310,24 @@ def coalescence_deduplicate(
                     current_overlaps.add(pair)
                     
         # Update running consecutive counts
-        to_delete = []
         for pair in list(overlap_counts.keys()):
             if pair not in current_overlaps:
+                # V3.8: Before reset — if they ever overlapped N+ frames, kill younger (ghost flew away)
+                count = overlap_counts[pair]
+                if count >= consecutive_frames:
+                    tid1, tid2 = pair
+                    if track_age[tid1] >= track_age[tid2]:
+                        dead_ids.add(tid2)
+                    else:
+                        dead_ids.add(tid1)
                 del overlap_counts[pair]
                 
         for pair in current_overlaps:
             overlap_counts[pair] = overlap_counts.get(pair, 0) + 1
 
-    # Find IDs to kill
-    dead_ids = set()
+    # Find IDs to kill (pairs still overlapping at end)
     for (tid1, tid2), count in overlap_counts.items():
         if count >= consecutive_frames:
-            # Kill the younger track (the one with fewer total frames)
             if track_age[tid1] >= track_age[tid2]:
                 dead_ids.add(tid2)
             else:
@@ -568,7 +574,7 @@ def merge_coexisting_fragments(
 
 
 def _get_tracker_config() -> str:
-    """Return tracker config path. Prefer local occlusion-tolerant config (V3.0: track_buffer=90)."""
+    """Return tracker config path. Loads ocsort.yaml then botsort.yaml; both use track_buffer=90 aligned with REID_MAX_FRAME_GAP."""
     cfg_dir = Path(__file__).resolve().parent
     for name in ("ocsort.yaml", "botsort.yaml"):
         p = cfg_dir / name
@@ -671,11 +677,14 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
             scale_x = w_fr / current_detect_size
             scale_y = h_fr / current_detect_size
 
+            # V3.8: Lower NMS IoU (0.5) to suppress duplicate detections for same dancer.
+            # IoU < 0.5 = more aggressive NMS; overlaps > 50% get suppressed (keeps higher-conf).
             result = model.track(
                 frame_low_rgb,
                 tracker=tracker_cfg,
                 classes=[0],
                 conf=YOLO_CONF,
+                iou=0.5,
                 persist=True,
                 verbose=False,
             )
@@ -715,8 +724,10 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
     # Post-tracking: stitch fragments from occlusion drop-outs
     raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
     
-    # Wave 1.5: Coexistence deduplication to remove duplicate counts
-    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.85, consecutive_frames=15)
+    # Wave 1.5: Coexistence deduplication — catch true ghost duplicates (same person, two IDs)
+    # V3.9: Relaxed from 0.40/2 — was killing real overlapping dancers (front person, red/blue on right)
+    # IoU 0.65, 8 consecutive = strong overlap for sustained period; avoids formations with brief overlap
+    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.65, consecutive_frames=8)
 
     # Wave 1.6: Merge complementary tracks (same person, alternating IDs, zero overlap)
     raw_tracks = merge_complementary_tracks(raw_tracks)

@@ -62,7 +62,7 @@ Maintain long‑lived, stable IDs through occlusions and crossings.
 
 ### What Happens
 
-1. **BoT‑SORT:** `track_buffer=90` (≈3 s at 30 FPS), tuned thresholds in `botsort.yaml`.
+1. **BoT‑SORT:** `track_buffer=90` (≈3 s at 30 FPS) in `ocsort.yaml` (preferred) or `botsort.yaml`. **Must be ≥ REID_MAX_FRAME_GAP** so Phase 5 can stitch occlusion fragments.
 2. **Wave 1 Stitching (BBox, V3.4):** When ID_A dies and ID_B appears within `STITCH_MAX_FRAME_GAP` frames (default 60):
    - Compute A’s last center and velocity.
    - Use a **relative radius** derived from A’s bbox height (e.g. 0.5× for stationary, 0.75× for predicted re‑appearance), with a small absolute fallback.
@@ -143,7 +143,7 @@ Handle occlusion‑induced ID breaks and crossovers **after** pose estimation us
 
 ### What Happens
 
-1. **Wave 2 OKS Re‑ID:** `apply_occlusion_reid()` scans dead vs newborn tracks. If OKS between dead track’s last pose and newborn’s first pose ≥ **0.35** within 90 frames, newborn is merged into the old ID.
+1. **Wave 2 OKS Re‑ID:** `apply_occlusion_reid()` scans dead vs newborn tracks. If OKS between dead track’s last pose and newborn’s first pose ≥ **0.35** within **REID_MAX_FRAME_GAP** (90) frames, newborn is merged into the old ID. **track_buffer alignment:** BoT-SORT `track_buffer` must be ≥ 90; else Phase 5 cannot stitch occlusion gaps.
 2. **Crossover Refinement (OKS):** `apply_crossover_refinement()`:
    - Detects overlapping pairs with IoU &gt; 0.6.
    - Compares how well each current pose matches each track’s **previous** pose using OKS.
@@ -385,7 +385,7 @@ render_and_export → data.json + <video>_poses.mp4 (dual-signal heatmap)
 | `pose_estimator.py` | `model_name` | vitpose-plus-base/large | ViTPose++ model |
 | `pose_estimator.py` | `BBOX_PADDING` | 0.15 | Base bbox padding before cropping (dynamic in `main.py`) |
 | `crossover.py` | `REID_MAX_FRAME_GAP` | 90 | Max frames for Wave 2 OKS stitch |
-| `crossover.py` | `REID_MIN_OKS` | 0.35 | Min OKS to merge tracks |
+| `crossover.py` | `REID_MIN_OKS` | 0.35 | Min OKS to merge tracks. Lower (e.g. 0.25–0.30) merges more occlusion fragments but risks merging distinct dancers in similar poses. Increase if you see ID merges; decrease if fragments remain split. |
 | `crossover.py` | `VISIBILITY_CONTAINMENT_THRESH` | 0.85 | Containment threshold for occlusion visibility scoring |
 | `crossover.py` | `VISIBILITY_MIN_SCORE` | 0.3 | Visibility cutoff used in `main.py` to skip ViTPose |
 | `crossover.py` | `COLLISION_ENTRY_IOU` / `COLLISION_ENTRY_CONSECUTIVE` | 0.6 / 3 | IoU and frames to enter collision (locked) state |
@@ -406,7 +406,20 @@ render_and_export → data.json + <video>_poses.mp4 (dual-signal heatmap)
 | `visualizer.py` | `SHAPE_GREEN_SPINE`, `SHAPE_RED_SPINE` | 10, 20 | Spine/Hips thresholds (deg) |
 | `visualizer.py` | `SHAPE_GREEN_LIMB`, `SHAPE_RED_LIMB` | 20, 35 | Elbow/Knee thresholds (deg) |
 | `visualizer.py` | `TIMING_OFF_BEAT_THRESHOLD` | 2 | Frames: >2 = Blue |
-| `botsort.yaml` / `ocsort.yaml` | `track_buffer` | 90 | Frames to retain lost tracks |
+| `ocsort.yaml` / `botsort.yaml` | `track_buffer` | 90 | **MUST be ≥ REID_MAX_FRAME_GAP (90).** Phase 5 Re-ID stitches dead→newborn within 90 frames; if BoT-SORT deletes lost IDs at 30, Re-ID starves. Both configs aligned. |
+| `botsort.yaml` | `with_reid` | True (V3.8) | Appearance-based Re-ID; prevents red↔blue ID swap during occlusion |
+| `botsort.yaml` | `appearance_thresh` | 0.5 (V3.8) | Min cosine similarity for Re-ID match |
+| `tracker.py` | NMS `iou` | 0.5 (V3.8) | Lower = more aggressive; suppress overlapping detections |
+| `track_pruning.py` | `EDGE_ENTRANT_MARGIN_FRAC` | 0.08 | Outer 8% of frame; edge entrants not pruned as late-entrant short-span |
+| `crossover.py` | `APPEARANCE_WEIGHT` | 0.4 | Weight for HSV appearance cost in crossover swap decisions |
+
+### V3.8 Fixes (Ghost Tracks, Edge Entry, Re-ID)
+
+- **NMS IoU 0.5:** Suppress duplicate detections for same dancer before tracking.
+- **track_buffer 90:** Aligned with REID_MAX_FRAME_GAP. BoT-SORT retains lost tracks 90 frames so Phase 5 can stitch fragments. (V3.8 briefly used 30; caused Re-ID starvation.)
+- **Coalescence dedup:** V3.9: IoU 0.65, 8 consecutive (was 0.40/2 — killed real overlapping dancers).
+- **Edge-entrant protection:** Tracks originating in outer 8% of frame not pruned as late-entrant short-span.
+- **Appearance Re-ID:** BoT-SORT `with_reid: True` + HSV embeddings in crossover for red vs blue disambiguation.
 
 ---
 

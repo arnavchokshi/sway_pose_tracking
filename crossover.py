@@ -30,6 +30,13 @@ from typing import Dict, List, Tuple, Any, Optional, Set
 
 import numpy as np
 
+# V3.8: Optional appearance cost for crossover (red vs blue during occlusion)
+try:
+    from reid_embedder import cosine_similarity
+    _REID_AVAILABLE = True
+except ImportError:
+    _REID_AVAILABLE = False
+
 # COCO 17 keypoint sigmas (per-keypoint std dev, scale-normalized)
 # Order: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles
 COCO_OKS_SIGMAS = np.array(
@@ -83,6 +90,9 @@ TEMPORAL_OKS_SWAP_MARGIN = 0.05  # Swapped path must exceed standard by this to 
 ACCEL_JUMP_THRESH_FRAC = 0.50   # Displacement > this * bbox_height = implausible
 ACCEL_OKS_SWAP_MARGIN = 0.08    # Correct swap when OKS(other) exceeds OKS(self) by this
 ACCEL_LOOKBACK_FRAMES = 2       # Use pose from t-2 if t-1 is missing
+
+# V3.8: Appearance weight in crossover — when red≠blue, appearance overrides OKS
+APPEARANCE_WEIGHT = 0.4         # Add sim*weight to score; red↔blue = low sim → reject swap
 
 
 def _box_areas(boxes: np.ndarray) -> np.ndarray:
@@ -332,6 +342,14 @@ def deduplicate_collocated_poses(
             box_b = tuple(boxes[j])
             iou = _compute_bbox_iou(box_a, box_b)
 
+            # V3.9: Depth overlap — when one box largely contains the other, these are two people
+            # at different depths (front/back), not duplicates. Skip dedup to avoid suppressing
+            # the front person (e.g. green dancer in front, fully visible).
+            cont_ab = _compute_containment(np.array(box_a), np.array(box_b))
+            cont_ba = _compute_containment(np.array(box_b), np.array(box_a))
+            if cont_ab > 0.7 or cont_ba > 0.7:
+                continue
+
             if median_dist > kpt_dist_frac * bbox_h:
                 continue
 
@@ -377,7 +395,16 @@ def deduplicate_collocated_poses(
                     suppressed = tid_b if conf_a >= conf_b else tid_a
                 to_suppress.add(suppressed)
             else:
-                suppressed = tid_b if conf_a >= conf_b else tid_a
+                if track_frame_count:
+                    count_a = track_frame_count.get(tid_a, 0)
+                    count_b = track_frame_count.get(tid_b, 0)
+                    if count_a != count_b:
+                        suppressed = tid_b if count_a >= count_b else tid_a
+                    else:
+                        # Tie (including both 0): fall back to confidence
+                        suppressed = tid_b if conf_a >= conf_b else tid_a
+                else:
+                    suppressed = tid_b if conf_a >= conf_b else tid_a
                 to_suppress.add(suppressed)
 
     for tid in to_suppress:
@@ -1066,6 +1093,7 @@ def apply_crossover_refinement(
     # Track state: last pose, last box, velocity, crossover pair state
     track_last_pose: Dict[int, np.ndarray] = {}
     track_last_box: Dict[int, Tuple[float, float, float, float]] = {}
+    track_last_embedding: Dict[int, np.ndarray] = {}  # V3.8: Appearance for Re-ID
     track_velocity: Dict[int, np.ndarray] = {}
     track_kpt_velocity: Dict[int, np.ndarray] = {}  # shape (17, 2)
     track_occlusion_frames: Dict[int, int] = {}  # V3.4: frames spent occluded
@@ -1260,6 +1288,8 @@ def apply_crossover_refinement(
         boxes = new_boxes
 
         # OKS matching for crossover pairs (skip swap when in collision — Phase 5.5)
+        # V3.8: Add appearance cost — reject swap when red≠blue (cosine sim low)
+        embeddings = fd.get("embeddings", {})
         swap_map = {}  # idx -> new_tid (if we need to swap)
         for (i, j, pair) in crossover_pairs:
             if not pair_in_crossover.get(pair, True):
@@ -1288,6 +1318,19 @@ def apply_crossover_refinement(
             oks_j_to_j = _compute_oks(kpts_j, last_pose_j, area)
             score_no_swap = oks_i_to_i + oks_j_to_j
             score_swap = oks_i_to_j + oks_j_to_i
+
+            # V3.8: Appearance cost — if embeddings exist, favor assignment that matches appearance
+            if _REID_AVAILABLE and embeddings:
+                emb_i = embeddings.get(tid_i)
+                emb_j = embeddings.get(tid_j)
+                last_emb_i = track_last_embedding.get(tid_i)
+                last_emb_j = track_last_embedding.get(tid_j)
+                if emb_i is not None and emb_j is not None and last_emb_i is not None and last_emb_j is not None:
+                    app_no_swap = (cosine_similarity(emb_i, last_emb_i) + cosine_similarity(emb_j, last_emb_j)) * APPEARANCE_WEIGHT
+                    app_swap = (cosine_similarity(emb_i, last_emb_j) + cosine_similarity(emb_j, last_emb_i)) * APPEARANCE_WEIGHT
+                    score_no_swap += app_no_swap
+                    score_swap += app_swap
+
             if score_swap > score_no_swap:
                 swap_map[i] = tid_j
                 swap_map[j] = tid_i
@@ -1320,6 +1363,8 @@ def apply_crossover_refinement(
             if kpts.shape[0] >= 17 and _compute_total_keypoint_confidence(kpts) >= occlusion_thresh:
                 track_last_pose[tid] = kpts.copy()
             track_last_box[tid] = boxes[idx]
+            if tid in embeddings:
+                track_last_embedding[tid] = embeddings[tid].copy()
             if f_idx > 0:
                 for pf in range(f_idx - 1, -1, -1):
                     pfd = all_frame_data[pf]
