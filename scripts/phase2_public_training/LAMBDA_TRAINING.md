@@ -8,7 +8,9 @@ This runbook is for **GitHub Option A only**: you clone **`arnavchokshi/sway_pos
 | **GitHub repo (SSH)** | `git@github.com:arnavchokshi/sway_pose_tracking.git` |
 | **Folder after `git clone`** | `~/sway_pose_tracking` (default clone directory name) |
 | **Project root on Lambda** | `~/sway_pose_tracking` (must contain `main.py` and `sway/`) |
-| **Your Mac SSH key (optional)** | `/Users/arnavchokshi/Downloads/pose-tracking.pem` — use `ssh -i …` and `scp -i …` |
+| **SSH key pair name** | `pose-tracking` |
+| **Private key on Mac (use with `ssh -i` / `scp -i`)** | `/Users/arnavchokshi/Downloads/pose-tracking.pem` |
+| **Public key (paste into Lambda)** | See §2 — one line starting with `ssh-rsa` |
 
 **Budget:** about **$15** is enough for **DanceTrack-only** training if you **terminate the instance as soon as `best.pt` is on your Mac**. At **~$1.99/hr** (typical **1× GH200**), that is **~7.5 hours** of wall time.
 
@@ -56,20 +58,14 @@ and confirm you see `scripts/phase2_public_training/LAMBDA_TRAINING.md` on `main
 1. Open **Lambda Cloud** → launch a new **GPU instance**.
 2. Image: **Ubuntu** (22.04 or 24.04).
 3. GPU: use what is available (often **1× GH200**, **ARM64**, **~96GB** VRAM). That hardware is **more than enough** for YOLO11x @ 960 in this repo.
-4. Add your **SSH public key** from your Mac:
+4. Add your **SSH public key** in Lambda (**SSH keys** in the dashboard, or when launching an instance).  
+   Use this **exact single line** (the **`pose-tracking`** key). Copy from the box below — no line breaks:
 
-   ```bash
-   cat ~/.ssh/id_ed25519.pub
+   ```
+   ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDCUPXx7ipTmzI6jXU5Ond6OU5J6sYnUXdYvfzO0ka1FsAeZ3JdMuL7XM5lPEi62/LAliw2oxHedCiWQ1nHhThk90GyNXp0Vl5h/54hfA24kAyU7NJMX0iqTHhjD66q8StQjg5uI6INnHpWZd5eUAtH4M0Bz+HW7vcuKMvyWeQeYkhOFlHorYbAe8Jh1lLa9imhKdUpckaYkhsfiGTIeFiuu02Iyk5CJAw06nI5bqGm1n/ddBEHvolJ/y8jvFwYW0Phw4jGQZ8MYAw/Bl7rydnZ6Xu5V6eOBxjuuB4w2CBvPJRplX1592rOeMMpOH7L5XQgdIDVy9CdL1K3mgsnJXaR pose-tracking
    ```
 
-   If that file does not exist, create a key:
-
-   ```bash
-   ssh-keygen -t ed25519 -C "your_email@example.com"
-   cat ~/.ssh/id_ed25519.pub
-   ```
-
-   Paste the **one-line** public key into Lambda’s **SSH keys** field when launching.
+   Label in Lambda can be **`pose-tracking`**. This line must match the **public** half of **`pose-tracking.pem`** on your Mac (do **not** upload the `.pem` file to Lambda — only this `ssh-rsa …` line).
 
 5. After launch, note from the Lambda dashboard:
    - **Instance IP** (example: `192.0.2.10`)
@@ -80,21 +76,23 @@ and confirm you see `scripts/phase2_public_training/LAMBDA_TRAINING.md` on `main
 - `<LAMBDA_IP>` → your instance’s IP (digits only, four dotted numbers).
 - If Lambda ever shows a different SSH user, replace **`ubuntu`** with that username.
 
-### SSH with `pose-tracking.pem` on your Mac (instead of `~/.ssh/id_ed25519`)
+### Connect from your Mac with `pose-tracking.pem`
 
-If you use the private key file **`/Users/arnavchokshi/Downloads/pose-tracking.pem`** to log in, **one-time** fix permissions (SSH refuses loose perms on keys):
+**One-time** (SSH refuses a key file that is world-readable):
 
 ```bash
 chmod 400 /Users/arnavchokshi/Downloads/pose-tracking.pem
 ```
 
-Then connect with **`-i`** (use this same pattern everywhere you see `ssh` / `scp` below):
+**Every time** you open a shell session to Lambda, use **`-i`** with that file:
 
 ```bash
 ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@<LAMBDA_IP>
 ```
 
-**Security:** keep the `.pem` **only** on your machine; **never** commit it to GitHub or paste it into chat. If it ever leaks, **rotate** the key in the Lambda (or cloud) dashboard.
+Use the **same** `-i /Users/arnavchokshi/Downloads/pose-tracking.pem` on **`scp`** in §5.
+
+**Security:** keep **`pose-tracking.pem`** private; **never** commit it to Git. The **`ssh-rsa …` line in step 4** is the *public* key (safe to paste into Lambda). If the **private** `.pem` leaks, create a new key pair and replace the public key in Lambda.
 
 ### GH200 / ARM64
 
@@ -104,13 +102,7 @@ ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@<LAMBDA_IP>
 
 ## 3. On the Lambda machine — install Git and clone this repo (Option A only)
 
-From your **Mac**, SSH in:
-
-```bash
-ssh ubuntu@<LAMBDA_IP>
-```
-
-If you use **`pose-tracking.pem`**, use:
+From your **Mac**, SSH in (**always** use your **`pose-tracking.pem`**):
 
 ```bash
 ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@<LAMBDA_IP>
@@ -195,14 +187,7 @@ bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh
 
 ## 5. On your Mac — copy `best.pt` off Lambda
 
-Open a **new Terminal tab on your Mac** (not inside SSH). Run:
-
-```bash
-scp ubuntu@<LAMBDA_IP>:~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/weights/best.pt \
-  ~/Desktop/yolo11x_dancetrack_only_best.pt
-```
-
-With **`pose-tracking.pem`**:
+Open a **new Terminal tab on your Mac** (not inside SSH). Run (**`-i`** matches your **`pose-tracking`** key):
 
 ```bash
 scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
