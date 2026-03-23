@@ -85,11 +85,13 @@ Weights when done:
 - **Per-epoch CSV:** `~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/results.csv` (losses, mAP — open or `tail -f` while training).
 - Second SSH session: `tail -f ~/sway_pose_tracking/training_full_*.log` (tab-complete the filename).
 
+Setup creates **`~/sway_pose_tracking/.venv`** so training does not use the system `python3` (avoids broken torch/numpy mixes on the Lambda image).
+
 **Optional — validation metrics on the instance** (DanceTrack val mAP vs COCO baseline; needs the same `datasets/dancetrack_yolo/` the training script just built):
 
 ```bash
 cd ~/sway_pose_tracking
-python3 scripts/phase2_public_training/validate_trained_model.py
+.venv/bin/python scripts/phase2_public_training/validate_trained_model.py
 # or explicit checkpoint:
 # python3 scripts/phase2_public_training/validate_trained_model.py \
 #   --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt
