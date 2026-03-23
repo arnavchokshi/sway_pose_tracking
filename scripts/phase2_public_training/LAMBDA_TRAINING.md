@@ -8,6 +8,7 @@ This runbook is for **GitHub Option A only**: you clone **`arnavchokshi/sway_pos
 | **GitHub repo (SSH)** | `git@github.com:arnavchokshi/sway_pose_tracking.git` |
 | **Folder after `git clone`** | `~/sway_pose_tracking` (default clone directory name) |
 | **Project root on Lambda** | `~/sway_pose_tracking` (must contain `main.py` and `sway/`) |
+| **Your Mac SSH key (optional)** | `/Users/arnavchokshi/Downloads/pose-tracking.pem` — use `ssh -i …` and `scp -i …` |
 
 **Budget:** about **$15** is enough for **DanceTrack-only** training if you **terminate the instance as soon as `best.pt` is on your Mac**. At **~$1.99/hr** (typical **1× GH200**), that is **~7.5 hours** of wall time.
 
@@ -79,6 +80,22 @@ and confirm you see `scripts/phase2_public_training/LAMBDA_TRAINING.md` on `main
 - `<LAMBDA_IP>` → your instance’s IP (digits only, four dotted numbers).
 - If Lambda ever shows a different SSH user, replace **`ubuntu`** with that username.
 
+### SSH with `pose-tracking.pem` on your Mac (instead of `~/.ssh/id_ed25519`)
+
+If you use the private key file **`/Users/arnavchokshi/Downloads/pose-tracking.pem`** to log in, **one-time** fix permissions (SSH refuses loose perms on keys):
+
+```bash
+chmod 400 /Users/arnavchokshi/Downloads/pose-tracking.pem
+```
+
+Then connect with **`-i`** (use this same pattern everywhere you see `ssh` / `scp` below):
+
+```bash
+ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@<LAMBDA_IP>
+```
+
+**Security:** keep the `.pem` **only** on your machine; **never** commit it to GitHub or paste it into chat. If it ever leaks, **rotate** the key in the Lambda (or cloud) dashboard.
+
 ### GH200 / ARM64
 
 - **`setup_lambda_training.sh`** installs **PyTorch CUDA** from the **`cu128`** wheel index on **`aarch64`**. Do not use generic `pip install torch` on GH200 without that index (you would get **CPU-only** builds).
@@ -91,6 +108,12 @@ From your **Mac**, SSH in:
 
 ```bash
 ssh ubuntu@<LAMBDA_IP>
+```
+
+If you use **`pose-tracking.pem`**, use:
+
+```bash
+ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@<LAMBDA_IP>
 ```
 
 On the **Lambda** shell, run **exactly**:
@@ -176,6 +199,14 @@ Open a **new Terminal tab on your Mac** (not inside SSH). Run:
 
 ```bash
 scp ubuntu@<LAMBDA_IP>:~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/weights/best.pt \
+  ~/Desktop/yolo11x_dancetrack_only_best.pt
+```
+
+With **`pose-tracking.pem`**:
+
+```bash
+scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
+  ubuntu@<LAMBDA_IP>:~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/weights/best.pt \
   ~/Desktop/yolo11x_dancetrack_only_best.pt
 ```
 
