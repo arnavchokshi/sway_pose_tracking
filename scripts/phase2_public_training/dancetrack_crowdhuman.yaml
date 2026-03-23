@@ -1,0 +1,23 @@
+# Merged dataset: DanceTrack + CrowdHuman — person detection only
+# Fine-tune YOLO11x on dance-domain + crowded scenes.
+#
+# Run converters first (from sway_pose_mvp/):
+#   python scripts/phase2_public_training/convert_dancetrack_to_yolo.py
+#   python scripts/phase2_public_training/convert_crowdhuman_to_yolo.py
+#
+# Ultralytics resolves a relative `path` against the process cwd. Run train/val
+# from sway_pose_mvp/ (train_yolo11x.py and validate_trained_model.py chdir there).
+
+path: .
+
+train:
+  - datasets/dancetrack_yolo/images/train
+  - datasets/crowdhuman_yolo/images/train
+
+val:
+  - datasets/dancetrack_yolo/images/val
+  - datasets/crowdhuman_yolo/images/val
+
+nc: 1
+names:
+  0: person

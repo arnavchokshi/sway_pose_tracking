@@ -1,0 +1,14 @@
+# DanceTrack only — use when CrowdHuman is not on disk yet.
+# Run from sway_pose_mvp/:  python scripts/phase2_public_training/train_yolo11x.py --phase dancetrack
+
+path: .
+
+train:
+  - datasets/dancetrack_yolo/images/train
+
+val:
+  - datasets/dancetrack_yolo/images/val
+
+nc: 1
+names:
+  0: person

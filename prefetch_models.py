@@ -12,6 +12,11 @@ This touches:
   - Hugging Face ViTPose base + large (HF cache, usually ~/.cache/huggingface)
   - BoxMOT OSNet Re-ID weights → models/osnet_x0_25_msmt17.pt (default tracker path)
 
+Fine-tuning YOLO11x on DanceTrack + CrowdHuman (optional): base weights `yolo11x.pt`
+are pulled automatically by Ultralytics the first time you run
+`scripts/phase2_public_training/train_yolo11x.py` — no separate prefetch step for
+that file. See `scripts/phase2_public_training/README.md` for the full workflow.
+
 After that, set SWAY_OFFLINE=1 when running without network (see README.md, Offline).
 """
 

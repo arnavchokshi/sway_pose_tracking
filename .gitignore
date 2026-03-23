@@ -3,6 +3,21 @@ input/*
 !input/README.md
 !input/.gitkeep
 
+# DanceTrack HF cache / temp extract (large; local only)
+dancetrack_hf/
+.dancetrack_extract_tmp/
+dancetrack_fetch.log
+
+crowdhuman_hf/
+.crowdhuman_extract_tmp/
+crowdhuman_fetch.log
+
+# Public training datasets (large; do not commit)
+datasets/dancetrack/
+datasets/dancetrack_yolo/
+datasets/crowdhuman/
+datasets/crowdhuman_yolo/
+
 # Output
 output/
 *.mp4
