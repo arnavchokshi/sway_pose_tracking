@@ -79,6 +79,12 @@ Weights when done:
 
 `~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/weights/best.pt`
 
+**Progress / metrics on the instance:**
+
+- **Full terminal log:** `~/sway_pose_tracking/training_full_<timestamp>.log` (everything: fetch, convert, every epoch).
+- **Per-epoch CSV:** `~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/results.csv` (losses, mAP — open or `tail -f` while training).
+- Second SSH session: `tail -f ~/sway_pose_tracking/training_full_*.log` (tab-complete the filename).
+
 **Optional — validation metrics on the instance** (DanceTrack val mAP vs COCO baseline; needs the same `datasets/dancetrack_yolo/` the training script just built):
 
 ```bash

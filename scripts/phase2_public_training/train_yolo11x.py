@@ -75,6 +75,11 @@ WORKERS = 8  # reduce to 4 if dataloader OOM
 # Slightly lower LR on CrowdHuman-only stage to reduce forgetting DanceTrack.
 LR0_DEFAULT = 0.0005
 LR0_CROWDHUMAN_PHASE = 0.00025
+# Early stop if val metrics plateau (saves time; best.pt is still best epoch so far).
+PATIENCE = 25
+SEED = 42
+# Extra checkpoint every N epochs (crash recovery); 0 disables.
+SAVE_PERIOD = 10
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -169,9 +174,16 @@ def train() -> None:
 
     from ultralytics import YOLO
 
+    run_dir = REPO_ROOT / PROJECT / run_name
+
     print(f"✓ Weights: {weights}")
     print(f"✓ Data: {data_yaml_rel}")
     print(f"✓ Run name: {run_name}")
+    print(f"✓ Run directory (metrics, plots, weights):\n  {run_dir}")
+    print("  • results.csv — loss & mAP per epoch (open in Numbers/Excel or tail -f)")
+    print("  • results.png, confusion_matrix*.png — after training")
+    print("  • weights/best.pt, weights/last.pt")
+    print(f"✓ Epochs: {EPOCHS} (early stop patience={PATIENCE} if val plateaus)\n")
 
     model = YOLO(weights)
 
@@ -195,14 +207,20 @@ def train() -> None:
         hsv_s=0.7,
         hsv_v=0.4,
         freeze=10,
+        patience=PATIENCE,
+        seed=SEED,
+        plots=True,
         save=True,
+        save_period=SAVE_PERIOD,
         exist_ok=True,
         verbose=True,
+        amp=True,
     )
 
-    best = REPO_ROOT / PROJECT / run_name / "weights" / "best.pt"
+    best = run_dir / "weights" / "best.pt"
     print("\n✓ Training complete.")
     print(f"  Best checkpoint: {best}")
+    print(f"  Per-epoch log: {run_dir / 'results.csv'}")
     print("\nTo use in pipeline:")
     print(f"  cp {best} models/yolo11x_dancetrack.pt")
     print("  export SWAY_YOLO_WEIGHTS=models/yolo11x_dancetrack.pt")
