@@ -1,11 +1,18 @@
+# Local flight / batch videos (folder stays in repo)
+input/*
+!input/README.md
+!input/.gitkeep
+
 # Output
 output/
 *.mp4
 *.mov
 *.json
 
-# Models
-models/
+# Model weights (folder layout tracked; blobs stay local)
+models/*
+!models/README.md
+!models/.gitkeep
 *.pt
 *.onnx
 *.engine

@@ -9,16 +9,17 @@ with angles and deviations.
 
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
-from pose_estimator import COCO_KEYPOINT_NAMES, COCO_SKELETON_EDGES
+from .pose_estimator import COCO_KEYPOINT_NAMES, COCO_SKELETON_EDGES
 
 # Colors (BGR for OpenCV)
 BOX_COLOR = (0, 255, 0)  # Green
@@ -279,6 +280,116 @@ def _poses_to_serializable(
     return out
 
 
+def build_pruned_overlay_for_review(
+    all_frame_data_pre: List[Dict[str, Any]],
+    phase7_prune_ids: Set[int],
+    raw_tracks: Dict[int, Any],
+    prune_log_entries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Per processed frame, list pruned tracks with bbox + rule for the human review UI overlay.
+
+    Post-pose pruned IDs: boxes come from all_frame_data_pre. Pre-pose pruned: boxes from
+    raw_tracks at matching frame_idx (tracks never entered all_frame_data_pre).
+    """
+    ids_in_pre: Set[int] = set()
+    for fd in all_frame_data_pre:
+        ids_in_pre.update(fd.get("track_ids") or [])
+
+    prune_reason: Dict[int, str] = {}
+    for e in prune_log_entries:
+        tid = e.get("track_id")
+        if tid is not None:
+            prune_reason[int(tid)] = str(e.get("rule", ""))
+
+    pre_pose_only: Set[int] = set(prune_reason.keys()) - ids_in_pre
+
+    # Fast lookup: pruned track -> list of (frame_idx, box)
+    pre_pose_by_tid: Dict[int, List[Tuple[int, tuple]]] = {}
+    for tid in pre_pose_only:
+        entries = raw_tracks.get(tid) or []
+        pre_pose_by_tid[tid] = [(int(e[0]), tuple(e[1])) for e in entries]
+
+    out: List[Dict[str, Any]] = []
+    for fd in all_frame_data_pre:
+        fidx = int(fd["frame_idx"])
+        tids = fd.get("track_ids") or []
+        boxes = fd.get("boxes") or []
+        tid_to_box = {int(t): b for t, b in zip(tids, boxes)}
+
+        pruned: List[Dict[str, Any]] = []
+        for tid in phase7_prune_ids:
+            tid = int(tid)
+            if tid in tid_to_box:
+                b = tid_to_box[tid]
+                pruned.append({
+                    "track_id": tid,
+                    "box": [float(x) for x in b],
+                    "rule": prune_reason.get(tid, "post_pose"),
+                })
+
+        for tid in pre_pose_only:
+            tid = int(tid)
+            for frame_idx, box in pre_pose_by_tid.get(tid, []):
+                if frame_idx == fidx:
+                    pruned.append({
+                        "track_id": tid,
+                        "box": [float(x) for x in box],
+                        "rule": prune_reason.get(tid, "pre_pose"),
+                    })
+                    break
+
+        out.append({"pruned": pruned})
+    return out
+
+
+def snapshot_tid_box_map(fd: Dict[str, Any]) -> Dict[int, Tuple[float, float, float, float]]:
+    """Map track_id → box for one frame (used to diff dedup / sanitize drops for review UI)."""
+    tids = fd.get("track_ids") or []
+    boxes = fd.get("boxes") or []
+    out: Dict[int, Tuple[float, float, float, float]] = {}
+    for i, tid in enumerate(tids):
+        if i < len(boxes):
+            b = boxes[i]
+            out[int(tid)] = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+    return out
+
+
+def build_dropped_pose_overlay(
+    snap_pre_dedup: List[Dict[int, Tuple[float, float, float, float]]],
+    snap_post_dedup_pre_sanitize: List[Dict[int, Tuple[float, float, float, float]]],
+    frames_after_sanitize: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Per processed frame: boxes that had a pose before collision dedup / sanitize but were removed.
+
+    - collision_dedup: lower-confidence duplicate of another ID on the same person (merged).
+    - bbox_sanitize: pose stripped because head keypoints were inconsistent with the bbox.
+    """
+    result: List[Dict[str, Any]] = []
+    for i, fd in enumerate(frames_after_sanitize):
+        pre = snap_pre_dedup[i]
+        mid = snap_post_dedup_pre_sanitize[i]
+        post_ids = set(int(t) for t in (fd.get("track_ids") or []))
+        dropped: List[Dict[str, Any]] = []
+        for tid, box in pre.items():
+            if tid not in mid:
+                dropped.append({
+                    "track_id": int(tid),
+                    "box": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+                    "rule": "collision_dedup",
+                })
+        for tid, box in mid.items():
+            if tid not in post_ids:
+                dropped.append({
+                    "track_id": int(tid),
+                    "box": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+                    "rule": "bbox_sanitize",
+                })
+        result.append({"dropped": dropped})
+    return result
+
+
 def _frame_to_json_tracks(
     fd: Dict,
     track_angles: Optional[Dict] = None,
@@ -405,50 +516,85 @@ def _interpolate_frame_data(
     }
 
 
+def _source_has_audio(source_video: Path) -> bool:
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return True
+    try:
+        r = subprocess.run(
+            [probe, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+             str(source_video)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "audio" in r.stdout
+    except Exception:
+        return True
+
+
+_mux_warned_ffmpeg = False
+
+
 def _mux_audio(source_video: Path, output_video: Path) -> None:
     """
-    Copy the audio stream from source_video into output_video using ffmpeg.
-    Replaces output_video in-place.  Silently skips if ffmpeg is missing or
-    the source has no audio track.
+    Re-encode OpenCV's video to H.264 + yuv420p and mux AAC from the source.
+
+    OpenCV writes MPEG-4 Part 2 (``mp4v``); many browsers show a **black** picture
+    while the clock runs. Re-encoding fixes HTML5 playback. Replaces
+    ``output_video`` in-place when ffmpeg succeeds.
     """
+    global _mux_warned_ffmpeg
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
+        if not _mux_warned_ffmpeg:
+            print("  WARNING: ffmpeg not found; exported MP4 may not play in web browsers (brew install ffmpeg).")
+            _mux_warned_ffmpeg = True
         return
 
-    # Check whether source actually has an audio stream
-    probe = shutil.which("ffprobe")
-    if probe:
-        try:
-            r = subprocess.run(
-                [probe, "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=codec_type", "-of", "csv=p=0",
-                 str(source_video)],
-                capture_output=True, text=True, timeout=10,
-            )
-            if "audio" not in r.stdout:
-                return
-        except Exception:
-            pass
-
+    has_audio = _source_has_audio(source_video)
     tmp = Path(tempfile.mktemp(suffix=".mp4", dir=str(output_video.parent)))
     try:
-        subprocess.run(
-            [ffmpeg, "-y",
-             "-i", str(output_video),
-             "-i", str(source_video),
-             "-c:v", "copy",
-             "-c:a", "aac",
-             "-map", "0:v:0",
-             "-map", "1:a:0?",
-             "-shortest",
-             str(tmp)],
-            capture_output=True, timeout=120,
-        )
-        if tmp.exists() and tmp.stat().st_size > 0:
+        # H.264 + yuv420p: works in Safari, Chrome, Firefox for <video>
+        vargs = [
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "22",
+            "-preset", "fast",
+            "-movflags", "+faststart",
+        ]
+        if has_audio:
+            cmd = [
+                ffmpeg, "-y",
+                "-i", str(output_video),
+                "-i", str(source_video),
+                *vargs,
+                "-c:a", "aac", "-b:a", "128k",
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-shortest",
+                str(tmp),
+            ]
+        else:
+            cmd = [
+                ffmpeg, "-y", "-i", str(output_video),
+                *vargs,
+                "-an",
+                str(tmp),
+            ]
+        r = subprocess.run(cmd, capture_output=True, timeout=None)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
             tmp.replace(output_video)
-    except Exception:
+        else:
+            err = (r.stderr or b"").decode("utf-8", errors="replace")[:400]
+            print(f"  WARNING: ffmpeg finalize failed (code {r.returncode}); browser may show black video. {err}")
+    except Exception as e:
+        print(f"  WARNING: ffmpeg finalize error: {e}")
+    finally:
         if tmp.exists():
-            tmp.unlink()
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _compute_track_summaries(
@@ -551,6 +697,10 @@ def render_and_export(
     processed_fps: float,
     native_fps: float,
     output_dir: Path,
+    *,
+    pruned_overlay: Optional[List[Dict[str, Any]]] = None,
+    prune_entries: Optional[List[Dict[str, Any]]] = None,
+    dropped_pose_overlay: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     Write JSON keypoint data and rendered MP4 video.
@@ -564,11 +714,17 @@ def render_and_export(
         processed_fps: FPS of pose data (15).
         native_fps: Original video FPS for output.
         output_dir: Output directory.
+        pruned_overlay: Optional per-frame list of pruned boxes for review UI (same length as frames).
+        prune_entries: Optional copy of prune diagnostics (track_id, rule, …) for review UI.
+        dropped_pose_overlay: Optional per-frame boxes removed by dedup/sanitize (review UI).
     """
     output_dir = Path(output_dir)
     base_name = video_path.stem
     json_path = output_dir / "data.json"
     video_out_path = output_dir / f"{base_name}_poses.mp4"
+    # Write to .part first, then os.replace so interrupted runs never leave a false-complete *_poses.mp4
+    # (batch --skip-existing only looks for the final name).
+    video_part_path = output_dir / f"{base_name}_poses.part.mp4"
 
     joint_names = [
         "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -576,7 +732,7 @@ def render_and_export(
     ]
 
     # Build JSON structure with joint angles and deviations per frame (at processed_fps)
-    metadata = {
+    metadata: Dict[str, Any] = {
         "video_path": str(video_path),
         "fps": processed_fps,
         "native_fps": native_fps,
@@ -584,18 +740,33 @@ def render_and_export(
         "keypoint_names": COCO_KEYPOINT_NAMES,
         "joint_angle_names": joint_names,
     }
+    if prune_entries is not None:
+        metadata["prune_entries"] = prune_entries
+    if pruned_overlay is not None or dropped_pose_overlay is not None:
+        metadata["review_overlay_legend"] = {
+            "green": "Baked into video — final kept dancers",
+            "red": "Pruned by track rules (prune_log)",
+            "amber": "collision_dedup — duplicate pose dropped (same person, other ID kept)",
+            "violet": "bbox_sanitize — pose dropped (head/limbs vs bbox)",
+        }
     frames_json = []
     for fd in all_frame_data:
         frames_json.append(_frame_to_json_tracks(fd))
 
     track_summaries = _compute_track_summaries(all_frame_data, joint_names)
 
+    payload: Dict[str, Any] = {
+        "metadata": metadata,
+        "track_summaries": track_summaries,
+        "frames": frames_json,
+    }
+    if pruned_overlay is not None:
+        payload["pruned_overlay"] = pruned_overlay
+    if dropped_pose_overlay is not None:
+        payload["dropped_pose_overlay"] = dropped_pose_overlay
+
     with open(json_path, "w") as f:
-        json.dump({
-            "metadata": metadata,
-            "track_summaries": track_summaries,
-            "frames": frames_json,
-        }, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"  Wrote {json_path}")
 
     # Write video at native FPS with interpolated overlays
@@ -609,8 +780,11 @@ def render_and_export(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     cap.release()
 
+    if video_part_path.exists():
+        video_part_path.unlink()
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(video_out_path), fourcc, native_fps, (w, h))
+    writer = cv2.VideoWriter(str(video_part_path), fourcc, native_fps, (w, h))
     num_processed = len(all_frame_data)
 
     cap = cv2.VideoCapture(str(video_path))
@@ -644,7 +818,9 @@ def render_and_export(
     writer.release()
 
     # Mux audio from source video into output (OpenCV drops audio)
-    _mux_audio(video_path, video_out_path)
+    _mux_audio(video_path, video_part_path)
+
+    os.replace(video_part_path, video_out_path)
 
     print(f"  Wrote {video_out_path} @ {native_fps:.1f} FPS")
 

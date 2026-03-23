@@ -330,6 +330,27 @@ AUDIENCE_REGION_WINDOW_FRAMES = 120  # Check first ~4s at 30fps
 # V3.6: Late-entrant short-span — ghosts that appear late and last briefly
 LATE_ENTRANT_START_FRAC = 0.35  # Track starts after 35% of video
 LATE_ENTRANT_MAX_SPAN_FRAC = 0.17  # Span (last-first) < 17% pruned. Track 61 (75 frames) kept as late entrant.
+# V3.8: Spatial-aware — outer 5-10% of frame = edge entry; don't prune (fast dancer entering from side)
+EDGE_ENTRANT_MARGIN_FRAC = 0.08  # Outer 8% of frame border
+
+
+def _is_edge_entrant(
+    first_box: Tuple[float, float, float, float],
+    frame_width: int,
+    frame_height: int,
+    edge_margin_frac: float = EDGE_ENTRANT_MARGIN_FRAC,
+) -> bool:
+    """True if bbox center is in outer edge margin (left/right/top/bottom border)."""
+    if frame_width <= 0 or frame_height <= 0:
+        return False
+    cx = (first_box[0] + first_box[2]) / 2
+    cy = (first_box[1] + first_box[3]) / 2
+    margin_x = frame_width * edge_margin_frac
+    margin_y = frame_height * edge_margin_frac
+    return (
+        cx <= margin_x or cx >= frame_width - margin_x
+        or cy <= margin_y or cy >= frame_height - margin_y
+    )
 
 
 def prune_audience_region(
@@ -371,11 +392,18 @@ def prune_late_entrant_short_span(
     total_frames: int,
     start_frac: float = LATE_ENTRANT_START_FRAC,
     max_span_frac: float = LATE_ENTRANT_MAX_SPAN_FRAC,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    edge_margin_frac: float = EDGE_ENTRANT_MARGIN_FRAC,
 ) -> Set[int]:
     """
     V3.6: Prune tracks that start late in the video AND have a short contiguous span.
     Catches ghosts, reflection fragments, and brief passersby that slip past duration filter
     (which uses possible_frames from first_frame, not total video).
+
+    V3.8: Spatial-aware initialization — tracks that originate in the outer 5-10% of the
+    frame (edge entry) are NOT pruned. Fast-moving dancers entering from the side would
+    otherwise be dropped by min_hits / short-span logic.
     """
     if total_frames <= 0:
         return set()
@@ -391,8 +419,17 @@ def prune_late_entrant_short_span(
         last_f = sorted_entries[-1][0]
         span = last_f - first_f + 1
         if first_f >= start_thresh and span < max_span:
+            # V3.8: Protect edge entrants — dancer entering from side of frame
+            if frame_width > 0 and frame_height > 0:
+                first_box = sorted_entries[0][1]
+                if _is_edge_entrant(first_box, frame_width, frame_height, edge_margin_frac):
+                    continue
             to_prune.add(tid)
     return to_prune
+
+
+# Edge-entrant short-track: floor for possible_frames denominator
+EDGE_ENTRANT_MIN_FLOOR_FRAMES = 30
 
 
 def prune_short_tracks(
@@ -400,22 +437,77 @@ def prune_short_tracks(
     surviving_ids: Set[int],
     total_frames: int,
     min_frac: float = SHORT_TRACK_MIN_FRAC,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    edge_margin_frac: float = EDGE_ENTRANT_MARGIN_FRAC,
 ) -> Set[int]:
     """
     Prune tracks present in less than min_frac of total video frames.
     Unlike the duration filter in prune_tracks (which uses possible lifespan),
     this uses total video length as the denominator so walkers and passersby
     who appear briefly get pruned regardless of when they entered.
+
+    V3.9: Edge-entrant exemption — tracks spawning at frame edge (outer 8%)
+    use possible_frames (total - first_frame) instead of total_frames, with
+    net displacement toward center and truncated-track safeguard (last 5%).
     """
     if total_frames <= 0:
         return set()
 
-    min_frames = int(total_frames * min_frac)
+    min_frames_global = int(total_frames * min_frac)
+    truncate_keep_thresh = int(total_frames * 0.95)  # Last 5%: truncated, keep
     to_prune: Set[int] = set()
+    margin_x = frame_width * edge_margin_frac if frame_width > 0 else 0
+
     for tid in surviving_ids:
         if tid not in raw_tracks:
             continue
-        if len(raw_tracks[tid]) < min_frames:
+        entries = raw_tracks[tid]
+        sorted_entries = sorted(entries, key=lambda e: e[0])
+        first_f = sorted_entries[0][0]
+        last_f = sorted_entries[-1][0]
+        n_frames = len(entries)
+
+        # Already passes global rule — no need for edge exemption
+        if n_frames >= min_frames_global:
+            continue
+
+        # Edge-entrant exemption (only when would otherwise be pruned)
+        if frame_width > 0 and frame_height > 0:
+            first_box = sorted_entries[0][1]
+            if _is_edge_entrant(first_box, frame_width, frame_height, edge_margin_frac):
+                # Truncated-track safeguard: track ends in last 5% of video
+                if last_f >= truncate_keep_thresh:
+                    continue  # Keep truncated late entrant
+                possible_frames = total_frames - first_f
+                if possible_frames <= 0:
+                    to_prune.add(tid)
+                    continue
+                min_frames = max(
+                    EDGE_ENTRANT_MIN_FLOOR_FRAMES,
+                    int(possible_frames * min_frac),
+                )
+                if n_frames >= min_frames:
+                    # Net displacement: moved toward center?
+                    n_check = min(15, n_frames)
+                    last_idx = n_check - 1
+                    box_first = sorted_entries[0][1]
+                    box_last = sorted_entries[last_idx][1]
+                    cx_first = (box_first[0] + box_first[2]) / 2
+                    cx_last = (box_last[0] + box_last[2]) / 2
+                    net_x = cx_last - cx_first
+                    # Left edge: inward = moved right (net_x > 0). Right edge: inward = moved left (net_x < 0)
+                    on_left = cx_first <= margin_x
+                    on_right = cx_first >= frame_width - margin_x
+                    inward_ok = (on_left and net_x > 0) or (on_right and net_x < 0)
+                    if inward_ok:
+                        continue  # Keep edge entrant
+                # Failed velocity or possible_frames: prune
+                to_prune.add(tid)
+                continue
+
+        # Standard rule: min_frac of total frames
+        if n_frames < min_frames_global:
             to_prune.add(tid)
 
     return to_prune
@@ -516,6 +608,12 @@ def prune_low_confidence_tracks(
     surviving_ids: Set[int],
     raw_poses_by_frame: List[Dict[int, Dict]],
     min_mean_conf: float = MEAN_CONFIDENCE_MIN,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    raw_tracks: Optional[Dict[int, List[Tuple[int, Tuple, float]]]] = None,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    total_frames: int = 0,
 ) -> Set[int]:
     """
     V3.5 Post-pose: Prune tracks where keypoint confidence is consistently low.
@@ -535,6 +633,17 @@ def prune_low_confidence_tracks(
 
     to_prune: Set[int] = set()
     for tid in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            tid,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_low_confidence_tracks",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
         frame_means: List[float] = []
         for poses in raw_poses_by_frame:
             if tid not in poses:
@@ -564,6 +673,11 @@ def prune_jittery_tracks(
     surviving_ids: Set[int],
     raw_poses_by_frame: List[Dict[int, Dict]],
     max_jitter: float = JITTER_RATIO_MAX,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    total_frames: int = 0,
 ) -> Set[int]:
     """
     V3.5 Post-pose: Prune tracks with excessive frame-to-frame keypoint jitter
@@ -576,6 +690,17 @@ def prune_jittery_tracks(
 
     to_prune: Set[int] = set()
     for tid in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            tid,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_jittery_tracks",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
         if tid not in raw_tracks or not raw_tracks[tid]:
             continue
         heights = [b[3] - b[1] for _, b, _ in raw_tracks[tid] if b[3] - b[1] > 0]
@@ -655,6 +780,9 @@ def prune_completeness_audit(
     mean_shoulder_thresh: float = 0.35,
     corner_max_lower_thresh: float = 0.45,
     corner_mean_shoulder_thresh: float = 0.25,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    total_frames: int = 0,
 ) -> Set[int]:
     """
     V3.2 Phase 6: Lifetime Peak Lower-Body Audit — prune seated corner observers (head/shoulders only).
@@ -669,6 +797,17 @@ def prune_completeness_audit(
     """
     to_prune: Set[int] = set()
     for track_id in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            track_id,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_completeness_audit",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
         if track_id not in raw_tracks:
             continue
         lower_peak_confs: List[float] = []
@@ -708,6 +847,109 @@ def prune_completeness_audit(
     return to_prune
 
 
+# V3.9: Head-only prune — audience heads in back (small bbox, low lower-body, peripheral)
+HEAD_ONLY_LOWER_CONF_THRESH = 0.1
+HEAD_ONLY_LOWER_CONF_FRAC = 0.9
+HEAD_ONLY_BBOX_FRAC_OF_GROUP = 0.4
+HEAD_ONLY_SPATIAL_OUTLIER_FACTOR = 2.0
+
+
+def prune_head_only_tracks(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    surviving_ids: Set[int],
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    frame_width: int = 1920,
+    frame_height: int = 1080,
+    lower_conf_thresh: float = HEAD_ONLY_LOWER_CONF_THRESH,
+    lower_conf_frac: float = HEAD_ONLY_LOWER_CONF_FRAC,
+    bbox_frac_of_group: float = HEAD_ONLY_BBOX_FRAC_OF_GROUP,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    total_frames: int = 0,
+) -> Set[int]:
+    """
+    V3.9: Prune head-only audience tracks (small bbox, low lower-body conf, spatially peripheral).
+    Catches people in the back whose heads pop into frame. Does NOT prune distant full-body
+    dancers (spatially central) — only peripheral (corner or far from group).
+    """
+    if len(surviving_ids) < 3 or frame_width <= 0 or frame_height <= 0:
+        return set()
+
+    # Group median bbox height
+    track_heights: Dict[int, float] = {}
+    track_centers: Dict[int, np.ndarray] = {}
+    for tid in surviving_ids:
+        if tid not in raw_tracks or not raw_tracks[tid]:
+            continue
+        heights = [b[3] - b[1] for _, b, _ in raw_tracks[tid] if b[3] - b[1] > 0]
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for _, b, _ in raw_tracks[tid]]
+        if heights and centers:
+            track_heights[tid] = float(np.median(heights))
+            track_centers[tid] = np.median(centers, axis=0)
+
+    if len(track_heights) < 3:
+        return set()
+
+    group_median_h = float(np.median(list(track_heights.values())))
+    all_centers = np.array(list(track_centers.values()))
+    group_centroid = np.median(all_centers, axis=0)
+    group_std = np.std(all_centers, axis=0)
+    min_spread = np.array([frame_width * SPATIAL_MIN_SPREAD_FRAC, frame_height * SPATIAL_MIN_SPREAD_FRAC])
+    group_std = np.maximum(group_std, min_spread)
+
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            tid,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_head_only_tracks",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
+        if tid not in raw_tracks or tid not in track_heights or tid not in track_centers:
+            continue
+        med_h = track_heights[tid]
+        if med_h >= bbox_frac_of_group * group_median_h:
+            continue  # (b) Not small enough
+        if med_h <= 0:
+            continue
+
+        # (a) Lower-body conf < thresh for >= frac of frames
+        frame_count = 0
+        low_lower_count = 0
+        for frame_idx, poses in enumerate(raw_poses_by_frame):
+            if frame_idx >= len(raw_poses_by_frame) or tid not in poses:
+                continue
+            data = poses[tid]
+            scores = data.get("scores")
+            if scores is None and "keypoints" in data and data["keypoints"].shape[1] > 2:
+                scores = data["keypoints"][:, 2]
+            if scores is None or len(scores) <= 16:
+                continue
+            scores = np.asarray(scores)
+            avg_lower = np.mean([float(scores[i]) for i in LOWER_BODY_INDICES if i < len(scores)])
+            frame_count += 1
+            if avg_lower < lower_conf_thresh:
+                low_lower_count += 1
+        if frame_count == 0 or (low_lower_count / frame_count) < lower_conf_frac:
+            continue  # (a) Failed
+
+        # (c) Spatially peripheral: in corner OR far from group
+        in_corner = _track_in_corner(raw_tracks, tid, frame_width, frame_height)
+        center = track_centers[tid]
+        normalized_dist = np.abs(center - group_centroid) / group_std
+        is_outlier = np.max(normalized_dist) > HEAD_ONLY_SPATIAL_OUTLIER_FACTOR
+        if not in_corner and not is_outlier:
+            continue  # Central — likely distant full-body dancer, not audience head
+
+        to_prune.add(tid)
+    return to_prune
+
+
 def prune_smart_mirrors(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     surviving_ids: Set[int],
@@ -716,6 +958,10 @@ def prune_smart_mirrors(
     edge_margin_frac: float = EDGE_MARGIN_FRAC,
     edge_presence_frac: float = EDGE_PRESENCE_FRAC,
     min_lower_body_conf: float = 0.3,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    frame_height: int = 1080,
+    total_frames: int = 0,
 ) -> Set[int]:
     """
     V3.0 Phase 6: Smart Mirror Pruning — prune ONLY IF all three hold:
@@ -778,6 +1024,17 @@ def prune_smart_mirrors(
 
     to_prune: Set[int] = set()
     for track_id, (vxs, lb_confs) in track_data.items():
+        if _phase7_should_skip_confirmed(
+            track_id,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_smart_mirrors",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
         mean_vx = np.mean([v for _, _, v in vxs])
         if abs(group_mean_vx) < 1.0:
             continue
@@ -835,6 +1092,121 @@ def prune_mirror_tracks(
     return to_prune
 
 
+def compute_confirmed_human_set(
+    all_frame_data_pre: List[Dict[str, Any]],
+    total_frames: int,
+    min_torso_conf: float = 0.5,
+    min_frame_frac: float = 0.40,
+    min_span_frac: float = 0.10,
+) -> Set[int]:
+    """
+    Tracks with strong torso keypoints on enough frames and sufficient span — exempt from aggressive Phase 7 prunes.
+    """
+    TORSO_KPT_INDICES = (5, 6, 11, 12)
+    frame_counts: Dict[int, int] = {}
+    confident_counts: Dict[int, int] = {}
+    first_frame: Dict[int, int] = {}
+    last_frame: Dict[int, int] = {}
+
+    for fd in all_frame_data_pre:
+        fidx = int(fd.get("frame_idx", 0))
+        for tid, pose_data in (fd.get("poses") or {}).items():
+            tid = int(tid)
+            scores = pose_data.get("scores")
+            if scores is None:
+                continue
+            scores = np.asarray(scores)
+            frame_counts[tid] = frame_counts.get(tid, 0) + 1
+            first_frame.setdefault(tid, fidx)
+            last_frame[tid] = fidx
+            torso = [float(scores[i]) for i in TORSO_KPT_INDICES if i < len(scores)]
+            if torso and (sum(torso) / len(torso)) >= min_torso_conf:
+                confident_counts[tid] = confident_counts.get(tid, 0) + 1
+
+    confirmed: Set[int] = set()
+    tf = max(total_frames, 1)
+    for tid, total in frame_counts.items():
+        span = (last_frame.get(tid, 0) - first_frame.get(tid, 0)) / tf
+        conf_frac = confident_counts.get(tid, 0) / max(total, 1)
+        if conf_frac >= min_frame_frac and span >= min_span_frac:
+            confirmed.add(tid)
+    return confirmed
+
+
+def _phase7_should_skip_confirmed(
+    tid: int,
+    confirmed_humans: Optional[Set[int]],
+    phase7_prune_log: Optional[list],
+    raw_tracks: Optional[Dict[int, List[Tuple[int, Tuple, float]]]],
+    rule_name: str,
+    frame_width: int,
+    frame_height: int,
+    total_frames: int,
+) -> bool:
+    if not confirmed_humans or tid not in confirmed_humans:
+        return False
+    if phase7_prune_log is not None and raw_tracks is not None:
+        phase7_prune_log.append(
+            get_pruned_track_info(
+                raw_tracks,
+                tid,
+                rule_name,
+                frame_width,
+                frame_height,
+                total_frames,
+                decision="exempted",
+                exempt_reason="confirmed_human",
+            )
+        )
+    return True
+
+
+# Tier C: auto-reject uniformly empty skeleton (complements mean-confidence prune)
+ULTRA_LOW_SKELETON_MEAN = 0.15
+ULTRA_LOW_SKELETON_FRAME_FRAC = 0.80
+
+
+def prune_ultra_low_skeleton_tracks(
+    surviving_ids: Set[int],
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    mean_thresh: float = ULTRA_LOW_SKELETON_MEAN,
+    min_low_frac: float = ULTRA_LOW_SKELETON_FRAME_FRAC,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    raw_tracks: Optional[Dict[int, List[Tuple[int, Tuple, float]]]] = None,
+    frame_width: int = 0,
+    frame_height: int = 0,
+    total_frames: int = 0,
+) -> Set[int]:
+    """Prune when mean keypoint confidence is below threshold on most frames (Tier C)."""
+    to_prune: Set[int] = set()
+    for tid in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            tid, confirmed_humans, phase7_prune_log, raw_tracks,
+            "prune_ultra_low_skeleton", frame_width, frame_height, total_frames,
+        ):
+            continue
+        frame_means: List[float] = []
+        for poses in raw_poses_by_frame:
+            if tid not in poses:
+                continue
+            data = poses[tid]
+            scores = data.get("scores")
+            if scores is None and "keypoints" in data:
+                kp = data["keypoints"]
+                if hasattr(kp, "shape") and kp.shape[1] > 2:
+                    scores = kp[:, 2]
+            if scores is None:
+                continue
+            frame_means.append(float(np.mean([float(s) for s in scores])))
+        if not frame_means:
+            continue
+        low_n = sum(1 for m in frame_means if m < mean_thresh)
+        if low_n / len(frame_means) >= min_low_frac:
+            to_prune.add(tid)
+    return to_prune
+
+
 # V3.4: Sync score pruning — minimum correlation to keep a track
 SYNC_SCORE_MIN = 0.10
 
@@ -845,6 +1217,10 @@ def prune_low_sync_tracks(
     min_sync_score: float = SYNC_SCORE_MIN,
     raw_tracks: Optional[Dict[int, List[Tuple[int, Tuple, float]]]] = None,
     total_frames: int = 0,
+    confirmed_humans: Optional[Set[int]] = None,
+    phase7_prune_log: Optional[list] = None,
+    frame_width: int = 0,
+    frame_height: int = 0,
 ) -> Set[int]:
     """
     V3.4 Post-pose pruning: remove tracks with near-zero angular correlation to the group truth.
@@ -852,8 +1228,8 @@ def prune_low_sync_tracks(
     Uses max-across-joints so a soloist syncing on even 1 joint is protected.
     V3.7: Exempt late-entrant short tracks — they have few frames so correlation is unreliable.
     """
-    from kinematics import compute_joint_angles_vectorized, JOINT_NAMES
-    from scoring import _build_keypoints_array, _compute_group_truth, CONFIDENCE_THRESHOLD
+    from .kinematics import compute_joint_angles_vectorized, JOINT_NAMES
+    from .scoring import _build_keypoints_array, _compute_group_truth, CONFIDENCE_THRESHOLD
 
     if len(surviving_ids) < 3 or len(all_frame_data) < 30:
         return set()
@@ -868,6 +1244,17 @@ def prune_low_sync_tracks(
 
     to_prune: Set[int] = set()
     for tid in surviving_ids:
+        if _phase7_should_skip_confirmed(
+            tid,
+            confirmed_humans,
+            phase7_prune_log,
+            raw_tracks,
+            "prune_low_sync_tracks",
+            frame_width,
+            frame_height,
+            total_frames,
+        ):
+            continue
         if tid not in tid_to_idx:
             continue
         # Late-entrant safeguard: tracks starting after 25% of video with <100 frames often
@@ -909,11 +1296,23 @@ def get_pruned_track_info(
     rule_name: str,
     frame_width: int = 0,
     frame_height: int = 0,
+    total_frames: int = 0,
+    decision: str = "pruned",
+    threshold: Optional[float] = None,
+    actual_value: Optional[float] = None,
+    exempt_reason: Optional[str] = None,
 ) -> dict:
     """Return structured info for one pruned track (for JSON logging)."""
     entries = raw_tracks.get(tid, [])
     if not entries:
-        return {"track_id": tid, "rule": rule_name, "n_frames": 0}
+        out = {"track_id": tid, "rule": rule_name, "n_frames": 0, "decision": decision}
+        if threshold is not None:
+            out["threshold"] = threshold
+        if actual_value is not None:
+            out["actual_value"] = actual_value
+        if exempt_reason:
+            out["reason"] = exempt_reason
+        return out
     centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in entries]
     med_cx = float(np.median([c[0] for c in centers]))
     med_cy = float(np.median([c[1] for c in centers]))
@@ -923,16 +1322,27 @@ def get_pruned_track_info(
     med_w = float(np.median(widths)) if widths else 0.0
     first_f = min(e[0] for e in entries)
     last_f = max(e[0] for e in entries)
+    span = max(0, last_f - first_f)
     info = {
         "track_id": tid,
         "rule": rule_name,
         "n_frames": len(entries),
         "frame_range": [first_f, last_f],
+        "frame_span": [first_f, last_f],
         "median_center": [round(med_cx, 1), round(med_cy, 1)],
         "median_h": round(med_h, 1),
         "median_w": round(med_w, 1),
         "aspect_ratio": round(med_w / med_h, 2) if med_h > 0 else None,
+        "decision": decision,
     }
+    if total_frames > 0:
+        info["frames_in_video_pct"] = round(span / total_frames, 4)
+    if threshold is not None:
+        info["threshold"] = threshold
+    if actual_value is not None:
+        info["actual_value"] = actual_value
+    if exempt_reason:
+        info["reason"] = exempt_reason
     if frame_width > 0 and frame_height > 0:
         info["pos_pct"] = [round(100 * med_cx / frame_width, 1), round(100 * med_cy / frame_height, 1)]
     return info
@@ -945,6 +1355,7 @@ def log_pruned_tracks(
     frame_width: int = 0,
     frame_height: int = 0,
     prune_log: Optional[list] = None,
+    total_frames: int = 0,
 ) -> None:
     """Print per-track diagnostics for every pruned track so root-cause is visible in logs."""
     if not pruned_ids:
@@ -953,7 +1364,17 @@ def log_pruned_tracks(
         entries = raw_tracks.get(tid, [])
         n_frames = len(entries)
         if prune_log is not None:
-            prune_log.append(get_pruned_track_info(raw_tracks, tid, rule_name, frame_width, frame_height))
+            prune_log.append(
+                get_pruned_track_info(
+                    raw_tracks,
+                    tid,
+                    rule_name,
+                    frame_width,
+                    frame_height,
+                    total_frames=total_frames,
+                    decision="pruned",
+                )
+            )
         if not entries:
             print(f"    [PRUNED by {rule_name}] track {tid}: no entries")
             continue

@@ -1,0 +1,1361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sway — Human review</title>
+  <style>
+    :root {
+      --bg: #0c0d10;
+      --surface: #16181e;
+      --border: #2a2e38;
+      --text: #e8eaef;
+      --muted: #8b929e;
+      --accent: #3d9cf5;
+      --good: #3ecf8e;
+      --warn: #e8b339;
+      --bad: #e85d5d;
+      --radius: 10px;
+      --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html {
+      height: 100%;
+    }
+    body {
+      margin: 0; font-family: var(--font); background: var(--bg); color: var(--text);
+      height: 100%;
+      max-height: 100%;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.25rem;
+      background: linear-gradient(180deg, #12141a 0%, var(--bg) 100%);
+    }
+    header h1 { margin: 0; font-size: 1.05rem; font-weight: 600; letter-spacing: -0.02em; }
+    header .sub { color: var(--muted); font-size: 0.82rem; }
+    .bar {
+      flex: 1; min-width: 140px; height: 6px; background: var(--surface);
+      border-radius: 99px; overflow: hidden; border: 1px solid var(--border);
+    }
+    .bar > i { display: block; height: 100%; background: var(--accent); width: 0%; transition: width 0.2s; }
+    .layout {
+      display: flex; flex: 1; min-height: 0; position: relative;
+      overflow: hidden;
+    }
+    aside {
+      width: 280px; min-width: 220px; flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; background: var(--surface);
+      transition: width 0.22s ease, min-width 0.22s ease, opacity 0.18s ease;
+      overflow: hidden;
+    }
+    body.sidebar-collapsed aside {
+      width: 0 !important;
+      min-width: 0 !important;
+      border-right-width: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+    #btn-sidebar-toggle {
+      flex-shrink: 0;
+      min-width: 2.25rem;
+      padding: 0.35rem 0.55rem;
+      font-size: 0.9rem;
+    }
+    .aside-head {
+      padding: 0.65rem 0.85rem; border-bottom: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 0.5rem;
+    }
+    .aside-head select, .aside-head button {
+      font: inherit; font-size: 0.85rem;
+    }
+    select, button, input, textarea {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 0.35rem 0.5rem;
+    }
+    button.primary { background: var(--accent); border-color: #2a7bc4; color: #fff; cursor: pointer; }
+    button.ghost { background: transparent; cursor: pointer; }
+    button.ghost.danger { border-color: rgba(232, 93, 93, 0.5); color: var(--bad); }
+    button.ghost.danger:hover { border-color: var(--bad); background: rgba(232, 93, 93, 0.08); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #sample-list {
+      flex: 1; overflow: auto; padding: 0.35rem; margin: 0; list-style: none;
+    }
+    #sample-list li button {
+      width: 100%; text-align: left; padding: 0.5rem 0.55rem; margin-bottom: 4px;
+      border-radius: var(--radius); border: 1px solid transparent;
+      display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+      cursor: pointer; font-size: 0.82rem;
+    }
+    #sample-list li button:hover { border-color: var(--border); }
+    #sample-list li button.active { border-color: var(--accent); background: rgba(61, 156, 245, 0.12); }
+    .aside-tip {
+      font-size: 0.68rem; color: var(--muted); line-height: 1.4;
+      margin: 0; padding: 0.35rem 0 0; border-top: 1px solid var(--border);
+    }
+    .aside-tip strong { color: #b8c0cc; font-weight: 600; }
+    .tag { font-size: 0.68rem; padding: 0.12rem 0.35rem; border-radius: 4px; text-transform: uppercase; }
+    .tag.done { background: rgba(62, 207, 142, 0.2); color: var(--good); }
+    .tag.todo { background: rgba(232, 179, 57, 0.15); color: var(--warn); }
+    main {
+      flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+      overflow: hidden;
+    }
+    .review-split {
+      display: flex; flex: 1; min-height: 0; width: 100%;
+      align-items: stretch;
+      overflow: hidden;
+    }
+    /* ~2/3 video, ~1/3 form (main area only; sidebar is separate) */
+    .video-col {
+      flex: 2 1 0;
+      min-width: 0;
+      min-height: 0;
+      display: flex; flex-direction: column;
+      padding: 0.65rem 0.75rem 0.65rem 0.9rem;
+      border-right: 1px solid var(--border);
+      background: #0e1014;
+      overflow-x: hidden;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+      align-self: stretch;
+    }
+    .form-col {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+    }
+    .video-row { flex: 0 0 auto; }
+    .video-wrap {
+      position: relative;
+      display: block;
+      width: 100%;
+      line-height: 0;
+    }
+    .video-wrap video {
+      width: 100%;
+      max-height: min(calc(100vh - 11rem), 560px);
+      background: #000;
+      border-radius: var(--radius); border: 1px solid var(--border);
+      display: block;
+    }
+    .video-wrap canvas#rvid-overlay {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      border-radius: var(--radius);
+      object-fit: fill;
+    }
+    .video-tools {
+      margin-top: 0.5rem; display: flex; flex-direction: column; align-items: flex-start;
+      gap: 0.35rem; font-size: 0.82rem; color: var(--muted);
+    }
+    .video-tools-line { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+    .video-hint { font-size: 0.68rem; color: var(--muted); line-height: 1.35; max-width: 42rem; opacity: 0.9; }
+    .form-panel { padding: 0.55rem 0.7rem 1rem; max-width: none; }
+    fieldset {
+      border: 1px solid var(--border); border-radius: 8px; margin: 0 0 0.55rem;
+      padding: 0.45rem 0.55rem 0.5rem; background: var(--surface);
+    }
+    legend {
+      padding: 0 0.25rem; font-size: 0.65rem; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.07em;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: flex-start; margin-bottom: 0.4rem; }
+    .row:last-child { margin-bottom: 0; }
+    label.lbl { font-size: 0.72rem; color: #9aa3b0; display: block; margin-bottom: 0.12rem; }
+    textarea { width: 100%; min-height: 52px; resize: vertical; font: inherit; line-height: 1.4; font-size: 0.82rem; }
+    textarea.compact { min-height: 44px; }
+    input.inline-sm { width: 5rem; }
+    .field-hint { font-size: 0.65rem; color: var(--muted); margin: 0 0 0.3rem; line-height: 1.35; opacity: 0.92; }
+    .quality-btns { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    .quality-btns button {
+      cursor: pointer; font-size: 0.74rem; padding: 0.28rem 0.45rem;
+    }
+    .quality-btns button[data-q] { opacity: 0.75; }
+    .quality-btns button[data-q].on { opacity: 1; outline: 2px solid var(--accent); }
+    .quality-btns button[data-q="excellent"].on { border-color: var(--good); }
+    .quality-btns button[data-q="good"].on { border-color: #5ad9a8; }
+    .quality-btns button[data-q="ok"].on { border-color: var(--warn); }
+    .quality-btns button[data-q="poor"].on { border-color: #e8885d; }
+    .quality-btns button[data-q="unusable"].on { border-color: var(--bad); }
+    .fm-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.2rem 0.85rem; }
+    @media (min-width: 400px) {
+      .fm-grid { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+    }
+    .fm-grid label { font-size: 0.72rem; display: flex; align-items: flex-start; gap: 0.3rem; cursor: pointer; color: #b8c0cc; line-height: 1.25; }
+    .fm-grid input { margin-top: 0.2rem; }
+    .seg-row { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; margin-bottom: 0.28rem; font-size: 0.76rem; }
+    .seg-row input[type="number"] { width: 5rem; }
+    .kbd { font-size: 0.72rem; color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+    .hint { font-size: 0.65rem; color: var(--muted); margin-top: 0.35rem; line-height: 1.4; }
+    .form-panel .form-foot { font-size: 0.65rem; color: var(--muted); margin: 0.35rem 0 0; line-height: 1.35; }
+    a { color: var(--accent); }
+    .empty { padding: 2rem; color: var(--muted); text-align: center; line-height: 1.6; max-width: 36rem; margin: 0 auto; }
+    .empty code { font-size: 0.85em; color: var(--text); background: var(--surface); padding: 0.1rem 0.35rem; border-radius: 4px; }
+    /* Below this width, stack video over form so the review panel isn’t squeezed off-screen. */
+    @media (max-width: 1320px) {
+      /* Stack video over form; scroll the whole split (video block + form) vertically. */
+      .review-split {
+        flex-direction: column;
+        overflow-x: hidden;
+        overflow-y: auto;
+        min-height: 0;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+      }
+      .video-col {
+        flex: 0 0 auto;
+        max-width: none;
+        width: 100%;
+        position: relative;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        overflow-x: hidden;
+        overflow-y: visible;
+      }
+      .form-col {
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+      .video-wrap video { max-height: min(48vh, 420px); }
+    }
+    .prune-scroll {
+      max-height: 11rem;
+      overflow: auto;
+      font-size: 0.72rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.35rem 0.45rem;
+      background: var(--bg);
+    }
+    .prune-scroll table { width: 100%; border-collapse: collapse; }
+    .prune-scroll th, .prune-scroll td {
+      text-align: left;
+      padding: 0.22rem 0.35rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .prune-scroll th { color: var(--muted); font-weight: 600; font-size: 0.68rem; }
+    .prune-scroll tr:last-child td { border-bottom: none; }
+    .video-col #prune-fieldset {
+      margin-top: 0.65rem;
+      margin-bottom: 0;
+      width: 100%;
+      max-width: 100%;
+    }
+    .video-col #prune-fieldset .prune-scroll {
+      max-height: 14rem;
+    }
+    tr.prune-row {
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    tr.prune-row:hover td {
+      background: rgba(61, 156, 245, 0.08);
+    }
+    tr.prune-row.prune-row-active td {
+      background: rgba(61, 156, 245, 0.16);
+      outline: 1px solid rgba(61, 156, 245, 0.35);
+      outline-offset: -1px;
+    }
+    @media (max-width: 900px) {
+      .layout { flex-direction: column; }
+      aside {
+        width: 100%; max-height: 40vh; min-width: 0;
+        border-right: none; border-bottom: 1px solid var(--border);
+        opacity: 1;
+        pointer-events: auto;
+        transition: max-height 0.22s ease, opacity 0.18s ease, border-width 0.2s;
+      }
+      body.sidebar-collapsed aside {
+        width: 100%;
+        max-height: 0 !important;
+        min-height: 0;
+        border-bottom-width: 0;
+        opacity: 0;
+        pointer-events: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="file-protocol-warning" style="display:none;background:#2a1f0f;border-bottom:1px solid var(--warn);padding:0.6rem 1rem;font-size:0.78rem;color:#f0e6d8;line-height:1.45;">
+    <strong>Opened as a local file (file://)</strong> — the sidebar/video may stay empty in some browsers.
+    From <code>sway_pose_mvp</code> run:
+    <code style="background:var(--surface);padding:0.15rem 0.35rem;border-radius:4px;">python review_app/serve_review.py output/flight_batch</code>
+    then open <code>http://127.0.0.1:8899/review/index.html</code>
+  </div>
+  <header>
+    <button type="button" class="ghost" id="btn-sidebar-toggle" aria-expanded="true" aria-controls="sidebar-samples" aria-label="Toggle sample list" title="Hide sample list">◀</button>
+    <h1>Sway pipeline — flight review</h1>
+    <span class="sub" id="hdr-meta"></span>
+    <div class="bar" title="Progress"><i id="progress-fill"></i></div>
+    <span class="sub" id="progress-label">0 / 0</span>
+    <button type="button" class="ghost" id="btn-prev">← Prev</button>
+    <button type="button" class="ghost" id="btn-next">Next →</button>
+  </header>
+  <div class="layout">
+    <aside id="sidebar-samples">
+      <div class="aside-head">
+        <label class="lbl">Filter</label>
+        <select id="filter">
+          <option value="all">All samples</option>
+          <option value="todo">Not reviewed</option>
+          <option value="done">Reviewed</option>
+        </select>
+        <div style="display:flex;gap:0.35rem;flex-wrap:wrap;">
+          <button type="button" class="primary" id="btn-export">Download JSONL</button>
+          <button type="button" class="ghost" id="btn-import">Import JSONL</button>
+        </div>
+        <input type="file" id="import-file" accept=".jsonl,.json,text/*" hidden />
+        <p class="aside-tip"><strong>Offline</strong> — Keep the whole output folder (MP4 + <code>data.json</code>). Reviews autosave in this browser only. Before you land: <strong>Download JSONL</strong> (or AirDrop the folder + JSONL). Use <code>serve_review.py</code> if video won’t play from disk.</p>
+      </div>
+      <ul id="sample-list"></ul>
+    </aside>
+    <main id="main-area">
+      <div class="empty" id="empty-state">Loading…</div>
+    </main>
+  </div>
+
+  <script type="application/json" id="sway-manifest-inline">{"schema_version":"1.0","output_root_name":"(open output/.../review/index.html — not template.html)","output_root":"","batch_manifest":null,"samples":[]}</script>
+  <script>
+    window.__MANIFEST__ = (function () {
+      var el = document.getElementById("sway-manifest-inline");
+      try {
+        return JSON.parse(el ? el.textContent.trim() : "{}");
+      } catch (e) {
+        return { schema_version: "1.0", samples: [], output_root_name: "manifest-error", batch_manifest: null, output_root: "" };
+      }
+    })();
+  </script>
+  <script>
+(function () {
+  if (typeof location !== "undefined" && location.protocol === "file:") {
+    var fw = document.getElementById("file-protocol-warning");
+    if (fw) fw.style.display = "block";
+  }
+
+  const LS_PREFIX = "sway_pose_human_review_v1:";
+  const SCHEMA = "2.2";
+
+  const manifest = window.__MANIFEST__;
+  if (!manifest.samples) manifest.samples = [];
+
+  const storeKey = LS_PREFIX + (manifest.output_root_name || "default");
+  const sidebarCollapsedKey = LS_PREFIX + "sidebar_collapsed";
+
+  function applySidebarCollapsed(collapsed) {
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+    const aside = document.getElementById("sidebar-samples");
+    if (aside) aside.setAttribute("aria-hidden", collapsed ? "true" : "false");
+    const btn = document.getElementById("btn-sidebar-toggle");
+    if (btn) {
+      btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      btn.textContent = collapsed ? "▶" : "◀";
+      btn.title = collapsed ? "Show sample list" : "Hide sample list";
+    }
+  }
+
+  function loadStore() {
+    try {
+      const raw = localStorage.getItem(storeKey);
+      if (!raw) return {};
+      return JSON.parse(raw);
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveStore(obj) {
+    localStorage.setItem(storeKey, JSON.stringify(obj));
+  }
+
+  let reviews = loadStore();
+  let idx = 0;
+  let filter = "all";
+  let lastRenderedSampleId = null;
+  let lastVideoTime = 0;
+
+  function defaultReview() {
+    return {
+      schema_version: SCHEMA,
+      overall_quality: "",
+      binary_pass: null,
+      reviewer_confidence: "",
+      failure_modes: [],
+      primary_failure_mode: "",
+      problem_segments: [],
+      affected_tracks_note: "",
+      ground_truth: {
+        expected_dancer_count: "",
+        scene_and_camera_notes: "",
+        identity_or_costume_notes: "",
+        timing_or_choreography_notes: "",
+        additional_ground_truth: "",
+        ground_truth_confidence: "",
+        observed_vs_expected: "",
+      },
+      model_feedback: {
+        what_went_wrong: "",
+        what_went_well: "",
+        additional_comments: "",
+        suspected_subsystems: [],
+        suspected_subsystem: "",
+        failure_scope: "",
+      },
+      notes_for_model: "",
+      manual_status: "",
+      updated_at: null,
+    };
+  }
+
+  function migrateModelFeedback(mf) {
+    if (!mf || typeof mf !== "object") return;
+    var VALID = ["detection", "tracking", "pose", "pruning", "scoring"];
+    if (!Array.isArray(mf.suspected_subsystems)) mf.suspected_subsystems = [];
+    if (mf.suspected_subsystems.length === 0) {
+      var s = mf.suspected_subsystem;
+      if (typeof s === "string" && s.trim()) {
+        var t = s.trim();
+        if (VALID.indexOf(t) >= 0) mf.suspected_subsystems = [t];
+        else {
+          t.split(",").forEach(function (p) {
+            p = p.trim();
+            if (VALID.indexOf(p) >= 0 && mf.suspected_subsystems.indexOf(p) < 0) mf.suspected_subsystems.push(p);
+          });
+        }
+      }
+    }
+    mf.suspected_subsystems = mf.suspected_subsystems.filter(function (x, i, a) {
+      return VALID.indexOf(x) >= 0 && a.indexOf(x) === i;
+    });
+    if (!String(mf.what_went_wrong || "").trim()) {
+      var parts = [];
+      if (String(mf.failure_scope || "").trim())
+        parts.push("Problem scope: " + String(mf.failure_scope).trim());
+      if (String(mf.what_went_well || "").trim())
+        parts.push("What went well: " + mf.what_went_well.trim());
+      if (String(mf.additional_comments || "").trim())
+        parts.push(mf.additional_comments.trim());
+      if (parts.length) {
+        mf.what_went_wrong = parts.join("\n\n");
+        mf.what_went_well = "";
+        mf.additional_comments = "";
+        mf.failure_scope = "";
+      }
+    }
+  }
+
+  function migrateGroundTruth(gt) {
+    if (!gt || typeof gt !== "object") return;
+    if (String(gt.additional_ground_truth || "").trim()) return;
+    var parts = [];
+    function push(label, v) {
+      v = String(v || "").trim();
+      if (v) parts.push(label ? (label + ": " + v) : v);
+    }
+    push("Observed vs expected", gt.observed_vs_expected);
+    push("Scene & camera", gt.scene_and_camera_notes);
+    push("Appearance / staging", gt.identity_or_costume_notes);
+    push("Choreography / music", gt.timing_or_choreography_notes);
+    if (parts.length) {
+      gt.additional_ground_truth = parts.join("\n\n");
+      gt.observed_vs_expected = "";
+      gt.scene_and_camera_notes = "";
+      gt.identity_or_costume_notes = "";
+      gt.timing_or_choreography_notes = "";
+    }
+  }
+
+  function ensureReviewShape(r) {
+    if (!r.ground_truth || typeof r.ground_truth !== "object") {
+      r.ground_truth = defaultReview().ground_truth;
+    }
+    if (!r.model_feedback || typeof r.model_feedback !== "object") {
+      r.model_feedback = defaultReview().model_feedback;
+    }
+    var gt = r.ground_truth;
+    ["expected_dancer_count", "scene_and_camera_notes", "identity_or_costume_notes", "timing_or_choreography_notes", "additional_ground_truth", "ground_truth_confidence", "observed_vs_expected"].forEach(function (k) {
+      if (gt[k] === undefined) gt[k] = "";
+    });
+    migrateGroundTruth(gt);
+    var mf = r.model_feedback;
+    ["what_went_wrong", "what_went_well", "additional_comments", "suspected_subsystem", "failure_scope"].forEach(function (k) {
+      if (mf[k] === undefined) mf[k] = "";
+    });
+    if (!Array.isArray(mf.suspected_subsystems)) mf.suspected_subsystems = [];
+    migrateModelFeedback(mf);
+    if (r.ground_truth_expectation && String(r.ground_truth_expectation).trim() && !String(gt.additional_ground_truth).trim()) {
+      gt.additional_ground_truth = r.ground_truth_expectation;
+    }
+    if (!Array.isArray(r.failure_modes)) r.failure_modes = [];
+    if (r.primary_failure_mode && r.failure_modes.indexOf(r.primary_failure_mode) < 0) r.primary_failure_mode = "";
+    if (r.manual_status === undefined) r.manual_status = "";
+    if (r.manual_status !== "" && r.manual_status !== "done" && r.manual_status !== "todo") r.manual_status = "";
+    return r;
+  }
+
+  function getReview(sampleId) {
+    if (!reviews[sampleId]) reviews[sampleId] = defaultReview();
+    return ensureReviewShape(reviews[sampleId]);
+  }
+
+  function anyText(o) {
+    if (!o || typeof o !== "object") return false;
+    return Object.keys(o).some(function (k) { return o[k] && String(o[k]).trim(); });
+  }
+
+  function hasMeaningfulSegments(r) {
+    const segs = r.problem_segments || [];
+    return segs.some(function (seg) {
+      if (seg.note && String(seg.note).trim()) return true;
+      if (seg.start_sec != null && !isNaN(seg.start_sec)) return true;
+      if (seg.end_sec != null && !isNaN(seg.end_sec)) return true;
+      return false;
+    });
+  }
+
+  function isReviewed(r) {
+    return !!(r.overall_quality ||
+      (r.failure_modes && r.failure_modes.length) ||
+      (r.notes_for_model && r.notes_for_model.trim()) ||
+      anyText(r.ground_truth) ||
+      anyText(r.model_feedback) ||
+      (r.affected_tracks_note && r.affected_tracks_note.trim()) ||
+      hasMeaningfulSegments(r) ||
+      r.binary_pass === true || r.binary_pass === false);
+  }
+
+  /** Sidebar badge + filters: manual override, else inferred from form. */
+  function effectiveReviewed(r) {
+    const m = r.manual_status || "";
+    if (m === "done") return true;
+    if (m === "todo") return false;
+    return isReviewed(r);
+  }
+
+  function visibleSamples() {
+    return manifest.samples.filter(s => {
+      const r = getReview(s.id);
+      if (filter === "todo") return !effectiveReviewed(r);
+      if (filter === "done") return effectiveReviewed(r);
+      return true;
+    });
+  }
+
+  function currentList() {
+    const vis = visibleSamples();
+    if (!vis.length) return { vis, pos: -1 };
+    const cur = manifest.samples[idx];
+    let pos = vis.findIndex(s => s.id === cur.id);
+    if (pos < 0) pos = 0;
+    return { vis, pos };
+  }
+
+  function setIdxForId(id) {
+    const i = manifest.samples.findIndex(s => s.id === id);
+    if (i >= 0) idx = i;
+  }
+
+  function renderList() {
+    const ul = document.getElementById("sample-list");
+    ul.innerHTML = "";
+    const { vis } = currentList();
+    const cur = manifest.samples[idx];
+    vis.forEach(s => {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      const r = getReview(s.id);
+      const done = effectiveReviewed(r);
+      btn.type = "button";
+      btn.className = s.id === cur.id ? "active" : "";
+      btn.innerHTML = "<span>" + escapeHtml(s.label) + "</span><span class=\"tag " + (done ? "done" : "todo") + "\">" + (done ? "done" : "todo") + "</span>";
+      btn.addEventListener("click", () => {
+        setIdxForId(s.id);
+        renderAll();
+      });
+      li.appendChild(btn);
+      ul.appendChild(li);
+    });
+
+    const total = manifest.samples.length;
+    const reviewed = manifest.samples.filter(s => effectiveReviewed(getReview(s.id))).length;
+    document.getElementById("progress-label").textContent = reviewed + " / " + total + " reviewed";
+    document.getElementById("progress-fill").style.width = total ? (reviewed / total * 100) + "%" : "0%";
+    document.getElementById("hdr-meta").textContent = manifest.output_root_name + " · " + total + " videos";
+  }
+
+  function escapeHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  var prunedReviewCleanup = null;
+  function teardownPrunedReview() {
+    if (typeof prunedReviewCleanup === "function") {
+      try { prunedReviewCleanup(); } catch (e) { /* ignore */ }
+      prunedReviewCleanup = null;
+    }
+  }
+
+  function setupPrunedReview(s) {
+    const vid = document.getElementById("rvid");
+    const canvas = document.getElementById("rvid-overlay");
+    const chk = document.getElementById("chk-show-pruned");
+    const chkDropped = document.getElementById("chk-show-dropped");
+    const wrap = document.getElementById("prune-table-wrap");
+    if (!vid || !canvas || !chk || !chkDropped || !wrap) return;
+
+    let overlayData = null;
+    let selectedPruneTid = null;
+
+    try {
+      chk.checked = localStorage.getItem("sway-review-show-pruned") !== "0";
+    } catch (e) {
+      chk.checked = true;
+    }
+    try {
+      chkDropped.checked = localStorage.getItem("sway-review-show-dropped") !== "0";
+    } catch (e) {
+      chkDropped.checked = true;
+    }
+
+    function buildPruneTable(entries) {
+      if (!entries || !entries.length) {
+        return "<p class=\"field-hint\" style=\"margin:0;\">No pruned tracks for this run.</p>";
+      }
+      const rows = entries.map(function (e) {
+        const fr = e.frame_range && e.frame_range.length >= 2
+          ? e.frame_range[0] + "–" + e.frame_range[1]
+          : "—";
+        const f0 = e.frame_range && e.frame_range.length >= 2 ? e.frame_range[0] : "";
+        const f1 = e.frame_range && e.frame_range.length >= 2 ? e.frame_range[1] : "";
+        return "<tr class=\"prune-row\" data-tid=\"" + escapeHtml(String(e.track_id)) + "\" data-f0=\"" + escapeHtml(String(f0)) + "\" data-f1=\"" + escapeHtml(String(f1)) + "\" tabindex=\"0\" role=\"button\" title=\"Seek to this track\">" +
+          "<td>" + escapeHtml(String(e.track_id)) + "</td><td>" + escapeHtml(String(e.rule || "")) + "</td><td>" + escapeHtml(fr) + "</td><td>" + (e.n_frames != null ? escapeHtml(String(e.n_frames)) : "—") + "</td></tr>";
+      }).join("");
+      return "<table><thead><tr><th>ID</th><th>Reason</th><th>Frame range</th><th>Frames</th></tr></thead><tbody>" + rows + "</tbody></table>";
+    }
+
+    function applyPruneEntries(entries) {
+      wrap.innerHTML = buildPruneTable(entries);
+    }
+
+    wrap.innerHTML = "<p class=\"field-hint\" style=\"margin:0;\">Loading…</p>";
+    if (!s.data_json) {
+      wrap.innerHTML = "<p class=\"field-hint\">No data.json in manifest.</p>";
+      return;
+    }
+
+    const pData = fetch(s.data_json).then(function (r) { return r.json(); });
+    const pPrune = s.prune_log
+      ? fetch(s.prune_log).then(function (r) { return r.json(); }).catch(function () { return null; })
+      : Promise.resolve(null);
+
+    Promise.all([pData, pPrune])
+      .then(function (pair) {
+        overlayData = pair[0];
+        const meta = overlayData.metadata || {};
+        let entries = meta.prune_entries || [];
+        if (!entries.length && pair[1] && pair[1].prune_entries) {
+          entries = pair[1].prune_entries;
+        }
+        if (entries.length) {
+          applyPruneEntries(entries);
+        } else {
+          wrap.innerHTML = "<p class=\"field-hint\">No prune list (re-run the pipeline to embed reasons, or add prune_log.json beside the video folder).</p>";
+        }
+        if (!overlayData.pruned_overlay || !overlayData.pruned_overlay.length) {
+          wrap.insertAdjacentHTML("beforeend", "<p class=\"field-hint\" style=\"margin:0.35rem 0 0;\"><strong>Red overlay:</strong> re-run the pipeline so <code>data.json</code> includes per-frame pruned boxes. The table above still works from <code>prune_log.json</code>.</p>");
+        }
+        if (!overlayData.dropped_pose_overlay || !overlayData.dropped_pose_overlay.length) {
+          wrap.insertAdjacentHTML("beforeend", "<p class=\"field-hint\" style=\"margin:0.35rem 0 0;\"><strong>Amber/violet:</strong> re-run the pipeline to embed <code>dropped_pose_overlay</code> (collision dedup &amp; bbox sanitize).</p>");
+        }
+        draw();
+      })
+      .catch(function () {
+        wrap.innerHTML = "<p class=\"field-hint\">Could not load data.json. Use the local server (<code>serve_review.py</code>), not file://.</p>";
+      });
+
+    function frameIndexForTime() {
+      if (!overlayData || !overlayData.frames || !overlayData.frames.length) return null;
+      const meta = overlayData.metadata || {};
+      const nativeFps = meta.native_fps || meta.fps || 30;
+      const procFps = meta.fps || nativeFps;
+      const n = overlayData.frames.length;
+      const origIdx = Math.max(0, Math.floor(vid.currentTime * nativeFps));
+      const alpha = origIdx * procFps / nativeFps;
+      const idxLo = Math.max(0, Math.min(Math.floor(alpha), n - 1));
+      const idxHi = Math.min(idxLo + 1, n - 1);
+      const tFrac = idxHi > idxLo ? alpha - idxLo : 0;
+      return { idxLo: idxLo, idxHi: idxHi, tFrac: tFrac };
+    }
+
+    function mergedPruned(idxLo, idxHi, tFrac) {
+      const ov = overlayData && overlayData.pruned_overlay;
+      if (!ov) return [];
+      const lo = (ov[idxLo] && ov[idxLo].pruned) || [];
+      const hi = (ov[idxHi] && ov[idxHi].pruned) || [];
+      const idSeen = {};
+      let i;
+      for (i = 0; i < lo.length; i++) idSeen[lo[i].track_id] = true;
+      for (i = 0; i < hi.length; i++) idSeen[hi[i].track_id] = true;
+      const out = [];
+      for (const idStr in idSeen) {
+        if (!Object.prototype.hasOwnProperty.call(idSeen, idStr)) continue;
+        const id = parseInt(idStr, 10);
+        let pl = null;
+        let ph = null;
+        for (i = 0; i < lo.length; i++) { if (lo[i].track_id === id) { pl = lo[i]; break; } }
+        for (i = 0; i < hi.length; i++) { if (hi[i].track_id === id) { ph = hi[i]; break; } }
+        let box;
+        let rule;
+        if (pl && ph) {
+          box = [0, 1, 2, 3].map(function (j) { return pl.box[j] + tFrac * (ph.box[j] - pl.box[j]); });
+          rule = ph.rule || pl.rule;
+        } else if (pl) {
+          box = pl.box;
+          rule = pl.rule;
+        } else if (ph) {
+          box = ph.box;
+          rule = ph.rule;
+        } else {
+          continue;
+        }
+        out.push({ track_id: id, box: box, rule: rule });
+      }
+      return out;
+    }
+
+    function mergedDropped(idxLo, idxHi, tFrac) {
+      const ov = overlayData && overlayData.dropped_pose_overlay;
+      if (!ov) return [];
+      const lo = (ov[idxLo] && ov[idxLo].dropped) || [];
+      const hi = (ov[idxHi] && ov[idxHi].dropped) || [];
+      const idSeen = {};
+      let i;
+      for (i = 0; i < lo.length; i++) idSeen[lo[i].track_id] = true;
+      for (i = 0; i < hi.length; i++) idSeen[hi[i].track_id] = true;
+      const out = [];
+      for (const idStr in idSeen) {
+        if (!Object.prototype.hasOwnProperty.call(idSeen, idStr)) continue;
+        const id = parseInt(idStr, 10);
+        let pl = null;
+        let ph = null;
+        for (i = 0; i < lo.length; i++) { if (lo[i].track_id === id) { pl = lo[i]; break; } }
+        for (i = 0; i < hi.length; i++) { if (hi[i].track_id === id) { ph = hi[i]; break; } }
+        let box;
+        let rule;
+        if (pl && ph) {
+          box = [0, 1, 2, 3].map(function (j) { return pl.box[j] + tFrac * (ph.box[j] - pl.box[j]); });
+          rule = ph.rule || pl.rule;
+        } else if (pl) {
+          box = pl.box;
+          rule = pl.rule;
+        } else if (ph) {
+          box = ph.box;
+          rule = ph.rule;
+        } else {
+          continue;
+        }
+        out.push({ track_id: id, box: box, rule: rule });
+      }
+      return out;
+    }
+
+    function drawDroppedBox(ctx, p, vw, lw) {
+      const b = p.box;
+      const w = b[2] - b[0];
+      const h = b[3] - b[1];
+      const isDedup = p.rule === "collision_dedup";
+      ctx.strokeStyle = isDedup ? "rgba(232, 179, 57, 0.96)" : "rgba(179, 136, 255, 0.96)";
+      ctx.lineWidth = lw;
+      ctx.strokeRect(b[0], b[1], w, h);
+      ctx.font = Math.max(11, Math.round(vw / 72)) + "px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = isDedup ? "rgba(255, 235, 200, 0.95)" : "rgba(230, 220, 255, 0.95)";
+      const tag = isDedup ? "dedup" : "san";
+      ctx.fillText("ID:" + p.track_id + "·" + tag, b[0], Math.max(Math.round(lw * 5), b[1] - 4));
+    }
+
+    function drawPrunedBox(ctx, p, vw, lw, isSelected) {
+      const b = p.box;
+      const w = b[2] - b[0];
+      const h = b[3] - b[1];
+      ctx.strokeStyle = isSelected ? "rgba(255, 220, 120, 0.98)" : "rgba(232, 93, 93, 0.98)";
+      ctx.lineWidth = isSelected ? lw * 2.2 : lw;
+      ctx.strokeRect(b[0], b[1], w, h);
+      ctx.font = Math.max(12, Math.round(vw / 64)) + "px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = isSelected ? "rgba(255, 245, 200, 0.98)" : "rgba(255, 220, 220, 0.95)";
+      ctx.fillText("ID:" + p.track_id, b[0], Math.max(Math.round(lw * 5), b[1] - 4));
+    }
+
+    function draw() {
+      const ctx = canvas.getContext("2d");
+      const vw = vid.videoWidth || 1920;
+      const vh = vid.videoHeight || 1080;
+      if (canvas.width !== vw) canvas.width = vw;
+      if (canvas.height !== vh) canvas.height = vh;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!overlayData) return;
+      const fi = frameIndexForTime();
+      if (!fi) return;
+      const lw = Math.max(2, Math.round(vw / 640));
+      const showDropped = chkDropped.checked && overlayData.dropped_pose_overlay;
+      const showPruned = chk.checked && overlayData.pruned_overlay;
+      if (!showDropped && !showPruned) return;
+
+      if (showDropped) {
+        const dr = mergedDropped(fi.idxLo, fi.idxHi, fi.tFrac);
+        for (let k = 0; k < dr.length; k++) drawDroppedBox(ctx, dr[k], vw, lw);
+      }
+      if (showPruned) {
+        const pr = mergedPruned(fi.idxLo, fi.idxHi, fi.tFrac);
+        let k;
+        for (k = 0; k < pr.length; k++) {
+          const p = pr[k];
+          if (!(selectedPruneTid != null && p.track_id === selectedPruneTid)) {
+            drawPrunedBox(ctx, p, vw, lw, false);
+          }
+        }
+        for (k = 0; k < pr.length; k++) {
+          const p = pr[k];
+          if (selectedPruneTid != null && p.track_id === selectedPruneTid) {
+            drawPrunedBox(ctx, p, vw, lw, true);
+          }
+        }
+      }
+    }
+
+    function onFrame() {
+      draw();
+    }
+
+    chk.addEventListener("change", function () {
+      try { localStorage.setItem("sway-review-show-pruned", chk.checked ? "1" : "0"); } catch (e) { /* ignore */ }
+      if (!chk.checked) {
+        selectedPruneTid = null;
+        wrap.querySelectorAll("tr.prune-row-active").forEach(function (row) {
+          row.classList.remove("prune-row-active");
+        });
+      }
+      draw();
+    });
+
+    chkDropped.addEventListener("change", function () {
+      try { localStorage.setItem("sway-review-show-dropped", chkDropped.checked ? "1" : "0"); } catch (e) { /* ignore */ }
+      draw();
+    });
+
+    function onPruneTableClick(ev) {
+      const tr = ev.target.closest("tr.prune-row");
+      if (!tr || !wrap.contains(tr)) return;
+      const f0s = tr.getAttribute("data-f0");
+      const f0 = f0s === "" || f0s == null ? NaN : parseInt(f0s, 10);
+      if (isNaN(f0)) return;
+      const meta = overlayData && overlayData.metadata ? overlayData.metadata : {};
+      const nativeFps = meta.native_fps || meta.fps || 30;
+      const tid = parseInt(tr.getAttribute("data-tid"), 10);
+      selectedPruneTid = isNaN(tid) ? null : tid;
+      wrap.querySelectorAll("tr.prune-row-active").forEach(function (row) {
+        row.classList.remove("prune-row-active");
+      });
+      tr.classList.add("prune-row-active");
+      chk.checked = true;
+      try { localStorage.setItem("sway-review-show-pruned", "1"); } catch (e) { /* ignore */ }
+      vid.currentTime = f0 / nativeFps;
+      draw();
+    }
+
+    function onPruneTableKeydown(ev) {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const tr = ev.target.closest && ev.target.closest("tr.prune-row");
+      if (!tr || !wrap.contains(tr)) return;
+      ev.preventDefault();
+      tr.click();
+    }
+
+    wrap.addEventListener("click", onPruneTableClick);
+    wrap.addEventListener("keydown", onPruneTableKeydown);
+
+    vid.addEventListener("timeupdate", onFrame);
+    vid.addEventListener("seeked", onFrame);
+    vid.addEventListener("loadeddata", onFrame);
+    window.addEventListener("resize", onFrame);
+    let ro = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(onFrame);
+      ro.observe(vid);
+    }
+
+    prunedReviewCleanup = function () {
+      wrap.removeEventListener("click", onPruneTableClick);
+      wrap.removeEventListener("keydown", onPruneTableKeydown);
+      vid.removeEventListener("timeupdate", onFrame);
+      vid.removeEventListener("seeked", onFrame);
+      vid.removeEventListener("loadeddata", onFrame);
+      window.removeEventListener("resize", onFrame);
+      if (ro) ro.disconnect();
+    };
+
+    draw();
+  }
+
+  function renderForm() {
+    teardownPrunedReview();
+    const main = document.getElementById("main-area");
+    const s = manifest.samples[idx];
+    if (!s) {
+      main.innerHTML = "<div class=\"empty\">No videos in this manifest.<br/><br/>Open <strong>review/index.html</strong> inside your batch output folder (generated by <code>batch_run_for_review.py</code> or <code>generate_review_index.py</code>).<br/>Do not open <code>template.html</code> directly — it has no video list until generated.</div>";
+      return;
+    }
+    const prevId = lastRenderedSampleId;
+    const prevEl = document.getElementById("rvid");
+    if (prevEl && prevId === s.id) {
+      lastVideoTime = prevEl.currentTime || 0;
+    } else {
+      lastVideoTime = 0;
+    }
+    lastRenderedSampleId = s.id;
+    const r = getReview(s.id);
+    const gt = r.ground_truth;
+    const mf = r.model_feedback;
+    const vsrc = s.rendered_video;
+
+    const qButtons = ["excellent", "good", "ok", "poor", "unusable"].map(q => {
+      const on = r.overall_quality === q ? " on" : "";
+      return "<button type=\"button\" data-q=\"" + q + "\" class=\"" + on + "\">" + q + "</button>";
+    }).join("");
+
+    const ms = r.manual_status || "";
+    const autoActive = ms === "";
+    const doneActive = ms === "done";
+    const todoActive = ms === "todo";
+
+    let segHtml = (r.problem_segments || []).map((seg, i) => (
+      "<div class=\"seg-row\" data-seg-i=\"" + i + "\">" +
+      "<span>s</span><input type=\"number\" step=\"0.1\" class=\"seg-start\" value=\"" + (seg.start_sec ?? "") + "\" />" +
+      "<span>e</span><input type=\"number\" step=\"0.1\" class=\"seg-end\" value=\"" + (seg.end_sec ?? "") + "\" />" +
+      "<input type=\"text\" class=\"seg-note\" placeholder=\"what &amp; stage (pose/tracking/prune…) + track IDs\" style=\"flex:1;min-width:80px;\" value=\"" + escapeHtml(seg.note || "") + "\" />" +
+      "<button type=\"button\" class=\"ghost seg-remove\" aria-label=\"remove\">✕</button></div>"
+    )).join("");
+
+    main.innerHTML =
+      "<div class=\"review-split\">" +
+      "<div class=\"video-col\">" +
+      "<div class=\"video-row\">" +
+      "<div class=\"video-wrap\">" +
+      "<video id=\"rvid\" controls playsinline src=\"" + escapeHtml(vsrc) + "\"></video>" +
+      "<canvas id=\"rvid-overlay\" aria-hidden=\"true\"></canvas>" +
+      "</div>" +
+      "<div class=\"video-tools\">" +
+      "<div class=\"video-tools-line\">" +
+      "<span id=\"vname\"><strong>" + escapeHtml(s.label) + "</strong></span>" +
+      (s.data_json ? " · <a href=\"" + escapeHtml(s.data_json) + "\" target=\"_blank\" rel=\"noopener\">data.json</a>" : "") +
+      (s.prune_log ? " · <a href=\"" + escapeHtml(s.prune_log) + "\" target=\"_blank\" rel=\"noopener\">prune_log.json</a>" : "") +
+      " · <button type=\"button\" class=\"ghost danger\" id=\"btn-remove-sample\" title=\"Delete source video from input folder and remove this run from the batch\">Remove from batch…</button>" +
+      "<span class=\"kbd\">N / P · Space</span>" +
+      "</div>" +
+      "<span class=\"video-hint\">Green boxes are kept dancers (baked into the video). Use the table below to overlay pruned boxes in red.</span>" +
+      "</div>" +
+      "</div>" +
+      "<fieldset id=\"prune-fieldset\"><legend>Review overlays</legend>" +
+      "<p class=\"field-hint\" style=\"margin:0 0 0.35rem;\">Green = kept dancers (baked in). Red = track pruning. Amber = duplicate pose dropped (collision dedup). Violet = pose dropped (bbox sanitize). No colored box = no stable pose that frame (e.g. detection gap). Click a pruned row to seek.</p>" +
+      "<div class=\"row\" style=\"flex-direction:column;align-items:flex-start;gap:0.35rem;margin-bottom:0.4rem;\">" +
+      "<label style=\"display:flex;align-items:center;gap:0.5rem;\"><input type=\"checkbox\" id=\"chk-show-dropped\" checked /> Dedup / sanitize (amber & violet)</label>" +
+      "<label style=\"display:flex;align-items:center;gap:0.5rem;\"><input type=\"checkbox\" id=\"chk-show-pruned\" checked /> Pruned tracks (red)</label>" +
+      "</div>" +
+      "<div id=\"prune-table-wrap\" class=\"prune-scroll\">—</div>" +
+      "</fieldset>" +
+      "</div>" +
+      "<div class=\"form-col\">" +
+      "<div class=\"form-panel\" data-sample=\"" + escapeHtml(s.id) + "\">" +
+      "<fieldset><legend>Status</legend>" +
+      "<div class=\"row\" style=\"gap:0.35rem;flex-wrap:wrap;align-items:center;margin-bottom:0;\">" +
+      "<button type=\"button\" class=\"" + (autoActive ? "primary" : "ghost") + "\" id=\"btn-status-auto\">Auto</button>" +
+      "<button type=\"button\" class=\"" + (doneActive ? "primary" : "ghost") + "\" id=\"btn-status-done\">Done</button>" +
+      "<button type=\"button\" class=\"" + (todoActive ? "primary" : "ghost") + "\" id=\"btn-status-todo\">Todo</button>" +
+      "</div></fieldset>" +
+      "<fieldset><legend>Rating</legend>" +
+      "<div class=\"row\" style=\"align-items:center;gap:0.75rem;\">" +
+      "<div style=\"flex:1;min-width:min(100%,220px);\"><div class=\"quality-btns\" id=\"quality-btns\">" + qButtons + "</div></div>" +
+      "<div style=\"flex:0 0 auto;white-space:nowrap;font-size:0.76rem;\">" +
+      "<label><input type=\"radio\" name=\"binpass\" value=\"\" " + (r.binary_pass === null ? "checked" : "") + " /> n/a</label> " +
+      "<label><input type=\"radio\" name=\"binpass\" value=\"yes\" " + (r.binary_pass === true ? "checked" : "") + " /> yes</label> " +
+      "<label><input type=\"radio\" name=\"binpass\" value=\"no\" " + (r.binary_pass === false ? "checked" : "") + " /> no</label>" +
+      "</div></div></fieldset>" +
+
+      "<fieldset><legend>Time &amp; issues</legend>" +
+      "<p class=\"field-hint\" style=\"margin:0 0 0.35rem;\">One row per problem window (seconds). Use the note for symptoms — stage if you know (detection / tracking / pose / prune / scoring), track IDs, false overlay colors. <strong>@ playhead</strong> sets start from the current time.</p>" +
+      "<div id=\"segments\">" + segHtml + "</div>" +
+      "<div class=\"row\" style=\"margin:0.25rem 0 0;gap:0.35rem;\">" +
+      "<button type=\"button\" class=\"ghost\" id=\"btn-add-seg\">+ range</button>" +
+      "<button type=\"button\" class=\"ghost\" id=\"btn-use-time\">@ playhead</button>" +
+      "</div></fieldset>" +
+
+      "<fieldset><legend>Truth</legend>" +
+      "<p class=\"field-hint\" style=\"margin:0 0 0.3rem;\">Minimal ground truth to judge count errors vs ID errors.</p>" +
+      "<input type=\"text\" id=\"gt-count\" placeholder=\"# dancers in the main shot (approx.)\" style=\"width:100%;max-width:100%;margin-bottom:0.35rem;\" value=\"" + escapeHtml(gt.expected_dancer_count || "") + "\" />" +
+      "<textarea id=\"gt-extra\" class=\"compact\" placeholder=\"Entrances/exits, partial occlusion, who is background vs dancer — anything that changes how many boxes you expect.\">" + escapeHtml(gt.additional_ground_truth || "") + "</textarea></fieldset>" +
+
+      "<fieldset><legend>For model iteration</legend>" +
+      "<p class=\"field-hint\" style=\"margin:0 0 0.35rem;\">Goes straight into the exported JSONL — prioritize if you only write a little.</p>" +
+      "<label class=\"lbl\" for=\"mf-well\">What worked (do not regress)</label>" +
+      "<textarea id=\"mf-well\" class=\"compact\" placeholder=\"What the pipeline got right on this clip.\">" + escapeHtml(mf.what_went_well || "") + "</textarea>" +
+      "<label class=\"lbl\" for=\"affected-tracks\">Wrong track / prune / dedup (optional)</label>" +
+      "<textarea id=\"affected-tracks\" class=\"compact\" placeholder=\"Global ID or overlay notes if they don’t fit a single time row above.\">" + escapeHtml(r.affected_tracks_note || "") + "</textarea>" +
+      "<label class=\"lbl\" for=\"notes-model\">Hypothesis &amp; next step</label>" +
+      "<textarea id=\"notes-model\" placeholder=\"What you think failed, which stage, what data or rule change would help — one tight paragraph is enough.\">" + escapeHtml(r.notes_for_model || "") + "</textarea>" +
+      "</fieldset>" +
+
+      "<div class=\"actions\">" +
+      "<button type=\"button\" class=\"ghost\" id=\"btn-save-copy\">Copy this sample JSON</button>" +
+      "</div>" +
+      "<p class=\"form-foot\"><strong>Offline:</strong> reviews live in this browser only. Use sidebar <strong>Download JSONL</strong> before you clear data or switch devices. Keep the JSONL with the output folder for whoever iterates the model. <strong>Remove from batch</strong> only works via <code>serve_review.py</code> (http://), not <code>file://</code>.</p>" +
+      "</div></div></div>";
+
+    bindFormEvents(s.id);
+    setupPrunedReview(s);
+    const vidEl = document.getElementById("rvid");
+    if (vidEl && lastVideoTime > 0) {
+      vidEl.addEventListener("loadedmetadata", function seek() {
+        vidEl.currentTime = lastVideoTime;
+        vidEl.removeEventListener("loadedmetadata", seek);
+      });
+    }
+  }
+
+  function persist(sid) {
+    const r = getReview(sid);
+    r.updated_at = new Date().toISOString();
+    saveStore(reviews);
+    renderList();
+  }
+
+  function bindFormEvents(sid) {
+    const r = getReview(sid);
+
+    document.querySelectorAll("#quality-btns button[data-q]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const q = btn.getAttribute("data-q");
+        r.overall_quality = r.overall_quality === q ? "" : q;
+        renderAll();
+        persist(sid);
+      });
+    });
+
+    function setManualStatus(v) {
+      r.manual_status = v;
+      persist(sid);
+      renderAll();
+    }
+    const btnAuto = document.getElementById("btn-status-auto");
+    const btnDone = document.getElementById("btn-status-done");
+    const btnTodo = document.getElementById("btn-status-todo");
+    if (btnAuto) btnAuto.addEventListener("click", () => setManualStatus(""));
+    if (btnDone) btnDone.addEventListener("click", () => setManualStatus("done"));
+    if (btnTodo) btnTodo.addEventListener("click", () => setManualStatus("todo"));
+
+    document.querySelectorAll("input[name=\"binpass\"]").forEach(el => {
+      el.addEventListener("change", () => {
+        const v = el.value;
+        r.binary_pass = v === "" ? null : v === "yes";
+        persist(sid);
+      });
+    });
+
+    function readSegments() {
+      const rows = document.querySelectorAll("#segments .seg-row");
+      const out = [];
+      rows.forEach(row => {
+        const start = parseFloat(row.querySelector(".seg-start").value);
+        const end = parseFloat(row.querySelector(".seg-end").value);
+        const note = row.querySelector(".seg-note").value.trim();
+        if (!isNaN(start) || !isNaN(end) || note) {
+          out.push({
+            start_sec: isNaN(start) ? null : start,
+            end_sec: isNaN(end) ? null : end,
+            note: note,
+          });
+        }
+      });
+      r.problem_segments = out;
+    }
+
+    document.getElementById("btn-add-seg").addEventListener("click", () => {
+      readSegments();
+      r.problem_segments.push({ start_sec: null, end_sec: null, note: "" });
+      renderAll();
+      persist(sid);
+    });
+
+    document.getElementById("btn-use-time").addEventListener("click", () => {
+      const vid = document.getElementById("rvid");
+      readSegments();
+      const t = vid && !isNaN(vid.currentTime) ? Math.round(vid.currentTime * 10) / 10 : 0;
+      r.problem_segments.push({ start_sec: t, end_sec: null, note: "" });
+      renderAll();
+      persist(sid);
+    });
+
+    document.getElementById("segments").addEventListener("click", e => {
+      if (e.target.classList.contains("seg-remove")) {
+        readSegments();
+        const row = e.target.closest(".seg-row");
+        const i = Array.from(row.parentNode.children).indexOf(row);
+        r.problem_segments.splice(i, 1);
+        renderAll();
+        persist(sid);
+      }
+    });
+
+    ["input", "change"].forEach(ev => {
+      document.getElementById("segments").addEventListener(ev, e => {
+        if (e.target.classList.contains("seg-start") || e.target.classList.contains("seg-end") || e.target.classList.contains("seg-note")) {
+          readSegments();
+          persist(sid);
+        }
+      });
+    });
+
+    let tmo;
+    function readTextFields() {
+      var c = document.getElementById("gt-count");
+      if (c) r.ground_truth.expected_dancer_count = c.value;
+      var gx = document.getElementById("gt-extra");
+      if (gx) r.ground_truth.additional_ground_truth = gx.value;
+      var wf = document.getElementById("mf-well");
+      if (wf) r.model_feedback.what_went_well = wf.value;
+      var at = document.getElementById("affected-tracks");
+      if (at) r.affected_tracks_note = at.value;
+      var nm = document.getElementById("notes-model");
+      if (nm) r.notes_for_model = nm.value;
+    }
+    function debounceSave() {
+      clearTimeout(tmo);
+      tmo = setTimeout(function () {
+        readTextFields();
+        persist(sid);
+      }, 250);
+    }
+    ["gt-count", "gt-extra", "mf-well", "affected-tracks", "notes-model"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener("input", debounceSave);
+    });
+
+    document.getElementById("btn-save-copy").addEventListener("click", async () => {
+      const line = buildExportLine(sid);
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(line, null, 2));
+      } catch (e) {
+        prompt("Copy this JSON:", JSON.stringify(line, null, 2));
+      }
+    });
+
+    const btnRemove = document.getElementById("btn-remove-sample");
+    if (btnRemove) {
+      btnRemove.addEventListener("click", async () => {
+        const proto = window.location.protocol;
+        if (proto !== "http:" && proto !== "https:") {
+          alert("Remove from batch needs the local server. From sway_pose_mvp run:\n\npython review_app/serve_review.py <output_batch>\n\nthen open the http:// URL (not file://).");
+          return;
+        }
+        const sCur = manifest.samples.find(x => x.id === sid);
+        let msg = "This permanently deletes the source video from your input folder (so future batch runs skip it) and removes this clip’s output folder from the batch.\n\nExport JSONL first if you need your labels.\n\nContinue?";
+        if (!sCur || !sCur.input_path) {
+          msg = "No input_path in batch_manifest for this clip — the output folder will still be removed and the run dropped from this list.\n\nExport JSONL first if you need your labels.\n\nContinue?";
+        }
+        if (!confirm(msg)) return;
+        try {
+          const res = await fetch("/__sway__/delete-sample", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sample_id: sid }),
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            alert("Remove failed (" + res.status + "): " + (text ? text.slice(0, 400) : "unknown error"));
+            return;
+          }
+          delete reviews[sid];
+          saveStore(reviews);
+          window.location.reload();
+        } catch (e) {
+          alert("Request failed: " + (e && e.message ? e.message : e));
+        }
+      });
+    }
+  }
+
+  function buildExportLine(sampleId) {
+    const s = manifest.samples.find(x => x.id === sampleId);
+    const r = getReview(sampleId);
+    const gt = r.ground_truth;
+    const mf = r.model_feedback;
+    return {
+      schema_version: SCHEMA,
+      sample_id: sampleId,
+      output_root_name: manifest.output_root_name,
+      artifacts: {
+        rendered_video: s.rendered_video,
+        data_json: s.data_json || null,
+        prune_log: s.prune_log || null,
+      },
+      batch_context: manifest.batch_manifest || null,
+      review: {
+        overall_quality: r.overall_quality || null,
+        binary_pass: r.binary_pass,
+        reviewer_confidence: r.reviewer_confidence || null,
+        failure_modes: r.failure_modes || [],
+        primary_failure_mode: r.primary_failure_mode || null,
+        problem_segments_sec: r.problem_segments || [],
+        affected_tracks_note: r.affected_tracks_note || "",
+        ground_truth: {
+          expected_dancer_count: gt.expected_dancer_count || "",
+          ground_truth_confidence: gt.ground_truth_confidence || "",
+          observed_vs_expected: gt.observed_vs_expected || "",
+          scene_and_camera_notes: gt.scene_and_camera_notes || "",
+          identity_or_costume_notes: gt.identity_or_costume_notes || "",
+          timing_or_choreography_notes: gt.timing_or_choreography_notes || "",
+          additional_ground_truth: gt.additional_ground_truth || "",
+        },
+        ground_truth_expectation: gt.additional_ground_truth || "",
+        model_feedback: {
+          suspected_subsystems: mf.suspected_subsystems || [],
+          suspected_subsystem: (mf.suspected_subsystems && mf.suspected_subsystems.length)
+            ? mf.suspected_subsystems.join(",")
+            : (mf.suspected_subsystem || ""),
+          failure_scope: mf.failure_scope || "",
+          what_went_wrong: mf.what_went_wrong || "",
+          what_went_well: mf.what_went_well || "",
+          additional_comments: mf.additional_comments || "",
+        },
+        notes_for_model: r.notes_for_model || "",
+        manual_status: r.manual_status || "",
+        updated_at: r.updated_at,
+      },
+    };
+  }
+
+  function exportJsonl() {
+    const lines = manifest.samples.map(s => JSON.stringify(buildExportLine(s.id))).join("\n");
+    const blob = new Blob([lines + "\n"], { type: "application/x-ndjson" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "human_review_" + (manifest.output_root_name || "export") + ".jsonl";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function importJsonl(text) {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    let n = 0;
+    lines.forEach(line => {
+      try {
+        const o = JSON.parse(line);
+        const sid = o.sample_id;
+        if (!sid || !o.review) return;
+        const r = defaultReview();
+        const rv = o.review;
+        r.overall_quality = rv.overall_quality || "";
+        r.binary_pass = rv.binary_pass !== undefined ? rv.binary_pass : null;
+        r.reviewer_confidence = rv.reviewer_confidence || "";
+        r.failure_modes = rv.failure_modes || [];
+        r.primary_failure_mode = rv.primary_failure_mode || "";
+        r.problem_segments = rv.problem_segments_sec || rv.problem_segments || [];
+        r.affected_tracks_note = rv.affected_tracks_note || "";
+        r.notes_for_model = rv.notes_for_model || "";
+        r.manual_status = rv.manual_status !== undefined && rv.manual_status !== null ? String(rv.manual_status) : "";
+        r.updated_at = rv.updated_at || new Date().toISOString();
+        if (rv.ground_truth && typeof rv.ground_truth === "object") {
+          Object.assign(r.ground_truth, rv.ground_truth);
+        }
+        if (rv.ground_truth_expectation && !r.ground_truth.additional_ground_truth) {
+          r.ground_truth.additional_ground_truth = rv.ground_truth_expectation;
+        }
+        if (rv.model_feedback && typeof rv.model_feedback === "object") {
+          Object.assign(r.model_feedback, rv.model_feedback);
+        }
+        reviews[sid] = ensureReviewShape(r);
+        n++;
+      } catch (e) { /* skip */ }
+    });
+    saveStore(reviews);
+    alert("Imported " + n + " row(s).");
+    renderAll();
+  }
+
+  function renderAll() {
+    renderList();
+    renderForm();
+  }
+
+  function goDelta(delta) {
+    const { vis, pos } = currentList();
+    if (!vis.length) return;
+    const curId = manifest.samples[idx].id;
+    let newPos = vis.findIndex(s => s.id === curId);
+    if (newPos < 0) newPos = 0;
+    newPos = Math.max(0, Math.min(vis.length - 1, newPos + delta));
+    setIdxForId(vis[newPos].id);
+    renderAll();
+  }
+
+  document.getElementById("btn-prev").addEventListener("click", () => goDelta(-1));
+  document.getElementById("btn-next").addEventListener("click", () => goDelta(1));
+  document.getElementById("filter").addEventListener("change", e => {
+    filter = e.target.value;
+    renderAll();
+  });
+  document.getElementById("btn-export").addEventListener("click", exportJsonl);
+  document.getElementById("btn-import").addEventListener("click", () => document.getElementById("import-file").click());
+  document.getElementById("import-file").addEventListener("change", e => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => importJsonl(String(r.result || ""));
+    r.readAsText(f);
+    e.target.value = "";
+  });
+
+  document.addEventListener("keydown", e => {
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (e.key === "n" || e.key === "N") { e.preventDefault(); goDelta(1); }
+    if (e.key === "p" || e.key === "P") { e.preventDefault(); goDelta(-1); }
+    if (e.key === " " || e.code === "Space") {
+      const v = document.getElementById("rvid");
+      if (v) { e.preventDefault(); if (v.paused) v.play(); else v.pause(); }
+    }
+  });
+
+  (function initSidebarToggle() {
+    const btn = document.getElementById("btn-sidebar-toggle");
+    if (!btn) return;
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(sidebarCollapsedKey) === "1"; } catch (e) { /* ignore */ }
+    applySidebarCollapsed(collapsed);
+    btn.addEventListener("click", function () {
+      const next = !document.body.classList.contains("sidebar-collapsed");
+      applySidebarCollapsed(next);
+      try { localStorage.setItem(sidebarCollapsedKey, next ? "1" : "0"); } catch (e) { /* ignore */ }
+    });
+  })();
+
+  renderAll();
+})();
+  </script>
+</body>
+</html>

@@ -383,6 +383,11 @@ def main():
         action="store_true",
         help="Do not run pipeline; require --json",
     )
+    parser.add_argument(
+        "--trackeval",
+        action="store_true",
+        help="Also run TrackEval if ground truth YAML defines trackeval.gt_mot_file",
+    )
     args = parser.parse_args()
 
     gt_path = args.ground_truth
@@ -437,6 +442,24 @@ def main():
 
     for m in messages:
         print(m)
+    print()
+    if args.trackeval:
+        try:
+            root = Path(__file__).resolve().parent
+            if str(root) not in sys.path:
+                sys.path.insert(0, str(root))
+            from sway.trackeval_runner import trackeval_from_ground_truth_yaml
+
+            te = trackeval_from_ground_truth_yaml(gt, data)
+            if te:
+                print("TrackEval metrics:")
+                for k in sorted(te.keys()):
+                    if k != "sequence":
+                        print(f"  {k}: {te[k]:.4f}" if isinstance(te[k], float) else f"  {k}: {te[k]}")
+            else:
+                print("TrackEval: skipped (no trackeval.gt_mot_file in ground truth YAML)")
+        except Exception as ex:
+            print(f"TrackEval failed: {ex}", file=sys.stderr)
     print()
     print("-" * 60)
     if all_pass:

@@ -1,5 +1,5 @@
 """
-Detection & Tracking Module — YOLO11l + BoT-SORT (V3.4)
+Detection & Tracking Module — YOLO11l + BoxMOT Deep OC-SORT by default (V3.4)
 
 V3.0: Streaming 300-frame chunks, native FPS, YOLO11l conf=0.25.
 V3.3: YOLO runs on every frame for better dancer detection.
@@ -9,11 +9,14 @@ Double-Layer Tracking: Base tracker + OKS crossover refinement (see crossover.py
 handles dense overlaps when IoU > 0.6.
 """
 
+import os
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Generator, Set
 
 import cv2
 import numpy as np
+import torch
+from torchvision.ops import box_iou
 from ultralytics import YOLO
 
 # V3.0: Streaming chunk size (10 seconds at 30 FPS)
@@ -39,6 +42,137 @@ STITCH_MAX_PIXEL_RADIUS = 120.0
 STITCH_PREDICTED_RADIUS_FRAC = 0.75
 # Short-gap threshold: gaps this short use generous matching (no velocity check)
 SHORT_GAP_FRAMES = 20
+
+
+def _use_boxmot() -> bool:
+    """BoxMOT Deep OC-SORT is the default tracker path. Set SWAY_USE_BOXMOT=0 to use Ultralytics BoT-SORT."""
+    v = os.environ.get("SWAY_USE_BOXMOT", "").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _use_global_link() -> bool:
+    return os.environ.get("SWAY_GLOBAL_LINK", "").lower() in ("1", "true", "yes")
+
+
+def diou_nms_indices(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float = 0.6,
+) -> np.ndarray:
+    """DIoU-NMS: suppress overlaps penalized by center distance (torchvision box_iou + distance term)."""
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=np.int64)
+    device = torch.device("cpu")
+    b = torch.tensor(boxes, dtype=torch.float32, device=device)
+    s = torch.tensor(scores, dtype=torch.float32, device=device)
+    x1, y1, x2, y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    order = torch.argsort(s, descending=True)
+    keep: List[int] = []
+    while order.numel() > 0:
+        i = int(order[0].item())
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        iou = box_iou(b[i : i + 1], b[rest])[0]
+        enc_x1 = torch.minimum(x1[i], x1[rest])
+        enc_y1 = torch.minimum(y1[i], y1[rest])
+        enc_x2 = torch.maximum(x2[i], x2[rest])
+        enc_y2 = torch.maximum(y2[i], y2[rest])
+        enc_diag_sq = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + 1e-7
+        center_dist_sq = (cx[i] - cx[rest]) ** 2 + (cy[i] - cy[rest]) ** 2
+        diou = iou - center_dist_sq / enc_diag_sq
+        order = rest[diou < iou_threshold]
+    return np.array(keep, dtype=np.int64)
+
+
+def _resolve_boxmot_reid_weights() -> Path:
+    env = os.environ.get("SWAY_BOXMOT_REID_WEIGHTS", "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            return p
+    repo = Path(__file__).resolve().parent.parent
+    cand = repo / "models" / "osnet_x0_25_msmt17.pt"
+    if cand.is_file():
+        return cand
+    try:
+        from boxmot.utils import WEIGHTS
+
+        return WEIGHTS / "osnet_x0_25_msmt17.pt"
+    except Exception:
+        return repo / "models" / "osnet_x0_25_msmt17.pt"
+
+
+def _apply_dormant_and_global(
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    total_frames: int,
+) -> Dict[int, List[Tuple[int, Tuple, float]]]:
+    from sway.dormant_tracks import apply_dormant_merges
+    from sway.global_track_link import heuristic_global_stitch
+
+    raw_tracks = apply_dormant_merges(raw_tracks, total_frames)
+    if _use_global_link():
+        raw_tracks = heuristic_global_stitch(raw_tracks, total_frames)
+    return raw_tracks
+
+
+def _env_offline() -> bool:
+    for key in ("SWAY_OFFLINE", "YOLO_OFFLINE", "ULTRALYTICS_OFFLINE"):
+        if str(os.environ.get(key, "")).lower() in ("1", "true", "yes"):
+            return True
+    return False
+
+
+def resolve_yolo_model_path() -> str:
+    """
+    Path for ultralytics.YOLO(). Prefer on-disk weights so the pipeline can run
+    air-gapped after prefetch or manual copy.
+    """
+    env = os.environ.get("SWAY_YOLO_WEIGHTS")
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            return str(p.resolve())
+        if _env_offline():
+            raise FileNotFoundError(f"SWAY_YOLO_WEIGHTS is set but file not found: {env}")
+
+    # Package lives in sway/; repo root is sway_pose_mvp/
+    repo = Path(__file__).resolve().parent.parent
+    models_dir = repo / "models"
+    for base in (models_dir, repo):
+        for name in ("yolo11l.mlpackage", "yolo11m.mlpackage"):
+            p = base / name
+            if p.exists():
+                return str(p.resolve())
+    cwd = Path.cwd()
+    for c in (
+        cwd / "yolo11l.mlpackage",
+        cwd / "yolo11m.mlpackage",
+        models_dir / "yolo11l.mlpackage",
+        models_dir / "yolo11m.mlpackage",
+    ):
+        if c.exists():
+            return str(c.resolve())
+
+    candidates = [
+        models_dir / "yolo11m.pt",
+        cwd / "yolo11m.pt",
+        repo / "yolo11m.pt",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c.resolve())
+
+    if _env_offline():
+        raise FileNotFoundError(
+            "Offline mode: no YOLO weights found. While online, run:\n"
+            "  python prefetch_models.py\n"
+            "Or place yolo11m.pt in models/ or set SWAY_YOLO_WEIGHTS."
+        )
+    return "yolo11m.pt"
 
 
 def _box_center(box: Tuple) -> Tuple[float, float]:
@@ -574,12 +708,16 @@ def merge_coexisting_fragments(
 
 
 def _get_tracker_config() -> str:
-    """Return tracker config path. Loads ocsort.yaml then botsort.yaml; both use track_buffer=90 aligned with REID_MAX_FRAME_GAP."""
-    cfg_dir = Path(__file__).resolve().parent
-    for name in ("ocsort.yaml", "botsort.yaml"):
-        p = cfg_dir / name
-        if p.exists():
-            return str(p)
+    """Return tracker config path (single source: config/botsort.yaml)."""
+    env = os.environ.get("SWAY_TRACKER_YAML", "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            return str(p.resolve())
+    repo = Path(__file__).resolve().parent.parent
+    p = repo / "config" / "botsort.yaml"
+    if p.is_file():
+        return str(p)
     return "botsort.yaml"
 
 
@@ -614,14 +752,129 @@ def _iter_video_chunks(
         cap.release()
 
 
+def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
+    Dict[int, List[Tuple[int, Tuple, float]]],
+    int,
+    float,
+    Optional[List[Tuple[int, np.ndarray]]],
+    float,
+    int,
+    int,
+]:
+    """YOLO predict + DIoU-NMS + BoxMOT Deep OC-SORT (default; SWAY_USE_BOXMOT=0 for BoT-SORT)."""
+    from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
+
+    apply_boxmot_kf_unfreeze_guard()
+    from boxmot import DeepOcSort
+
+    model_path = resolve_yolo_model_path()
+    print(f"Loading detection model: {model_path} (BoxMOT Deep OC-SORT path)")
+    model = YOLO(model_path)
+    reid_w = _resolve_boxmot_reid_weights()
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tracker = DeepOcSort(
+        reid_weights=reid_w,
+        device=dev,
+        half=bool(dev.type == "cuda"),
+        det_thresh=float(YOLO_CONF),
+        max_age=150,
+        min_hits=2,
+        iou_threshold=0.3,
+        embedding_off=True,
+    )
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
+    total_frames = 0
+    native_fps = 30.0
+    frame_width = 1920
+    frame_height = 1080
+    max_dancers_last_chunk = 0
+    current_detect_size = DETECT_SIZE
+
+    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, CHUNK_SIZE):
+        native_fps = nfps
+        frame_width = w_f
+        frame_height = h_f
+        if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
+            current_detect_size = 960
+        elif max_dancers_last_chunk > 4:
+            current_detect_size = 960
+        else:
+            current_detect_size = DETECT_SIZE
+        max_dancers_this_chunk = 0
+
+        for frame_idx, frame in chunk_frames:
+            if frame_idx % YOLO_DETECTION_STRIDE != 0:
+                continue
+            h_fr, w_fr = frame.shape[:2]
+            frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
+            frame_low_rgb = frame_low[:, :, ::-1]
+            scale_x = w_fr / current_detect_size
+            scale_y = h_fr / current_detect_size
+
+            res = model.predict(
+                frame_low_rgb,
+                classes=[0],
+                conf=YOLO_CONF,
+                verbose=False,
+            )
+            r0 = res[0] if isinstance(res, list) else res
+            if r0.boxes is None or len(r0.boxes) == 0:
+                dets = np.empty((0, 6), dtype=np.float32)
+            else:
+                xyxy = r0.boxes.xyxy.cpu().numpy()
+                conf = r0.boxes.conf.cpu().numpy()
+                xyxy[:, 0] *= scale_x
+                xyxy[:, 1] *= scale_y
+                xyxy[:, 2] *= scale_x
+                xyxy[:, 3] *= scale_y
+                keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
+                xyxy = xyxy[keep]
+                conf = conf[keep]
+                # BoxMOT v16+ expects (x1,y1,x2,y2,conf,cls); class 0 = person
+                cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
+                dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
+
+            out = tracker.update(dets, frame)
+            valid_dancers_this_frame = 0
+            if out is not None and len(out) > 0:
+                for row in np.atleast_2d(out):
+                    x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                    tid = int(row[4])
+                    cf = float(row[5]) if len(row) > 5 else float(YOLO_CONF)
+                    if tid < 0:
+                        continue
+                    valid_dancers_this_frame += 1
+                    box_hr = (x1, y1, x2, y2)
+                    if tid not in raw_tracks:
+                        raw_tracks[tid] = []
+                    raw_tracks[tid].append((frame_idx, box_hr, cf))
+            max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
+            if frame_idx == 0 or frame_idx == 30:
+                print(f"  Frame {frame_idx}: {valid_dancers_this_frame} persons (BoxMOT, YOLO {current_detect_size})")
+
+        max_dancers_last_chunk = max_dancers_this_chunk
+        total_frames += len(chunk_frames)
+        del chunk_frames
+
+    output_fps = native_fps
+    raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
+    raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
+    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.65, consecutive_frames=8)
+    raw_tracks = merge_complementary_tracks(raw_tracks)
+    raw_tracks = merge_coexisting_fragments(raw_tracks)
+    _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
+    return raw_tracks, total_frames, float(output_fps), None, float(native_fps), frame_width, frame_height
+
+
 def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, float]]], int, float, Optional[List[Tuple[int, np.ndarray]]], float, int, int]:
     """
-    V3.0: Run YOLO11l detection with BoT-SORT in streaming 300-frame chunks at native FPS.
+    V3.0: Run YOLO11l detection + tracking in streaming 300-frame chunks at native FPS.
 
+    - Default tracker: BoxMOT Deep OC-SORT (SWAY_USE_BOXMOT unset). Set SWAY_USE_BOXMOT=0 for Ultralytics BoT-SORT.
     - Reads video in 300-frame chunks to avoid full RAM load
     - Processes every frame (native FPS, no decimation)
-    - YOLO11l at 640x640, conf=0.25
-    - BoT-SORT track_buffer=90 (3s at 30 FPS)
+    - YOLO11l at 640x640, conf=0.22
+    - BoT-SORT path: track_buffer=90 (3s at 30 FPS)
     - Wave 1 box stitch within 90 frames
 
     Returns:
@@ -634,12 +887,10 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
         - frame_width: Video width
         - frame_height: Video height
     """
-    model_path = "yolo11m.pt"
-    if Path("yolo11l.mlpackage").exists():
-        model_path = "yolo11l.mlpackage"
-    elif Path("yolo11m.mlpackage").exists():
-        model_path = "yolo11m.mlpackage"
-    
+    if _use_boxmot():
+        return _run_tracking_boxmot_diou(video_path)
+
+    model_path = resolve_yolo_model_path()
     print(f"Loading detection model: {model_path}")
     model = YOLO(model_path)
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
@@ -659,8 +910,10 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
         frame_width = w_f
         frame_height = h_f
 
-        # Adjust detection size based on previous chunk crowd density
-        if max_dancers_last_chunk > 4:
+        # Adjust detection size: group videos (env) or previous-chunk crowd density
+        if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
+            current_detect_size = 960
+        elif max_dancers_last_chunk > 4:
             current_detect_size = 960
             # print(f"  [Dynamic Scaling] Crowd detected. Up-scaling YOLO resolution to {current_detect_size}x{current_detect_size}")
         else:
@@ -721,6 +974,7 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
 
     output_fps = native_fps
 
+    raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
     # Post-tracking: stitch fragments from occlusion drop-outs
     raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
     

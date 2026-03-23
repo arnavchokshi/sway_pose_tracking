@@ -5,6 +5,7 @@ V3.0: ViTPose-Large for high-fidelity pose estimation (15° wrist/elbow accuracy
 Extracts 17 COCO keypoints per detected person. Batched [N, 3, 256, 192], fp16 on MPS.
 """
 
+import os
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -21,6 +22,15 @@ COCO_KEYPOINT_NAMES = [
 ]
 
 # Skeleton edges for visualization: (joint_a, joint_b) pairs
+def _local_files_only() -> bool:
+    """True when HF models must not hit the network (plane / air-gapped)."""
+    for key in ("SWAY_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE"):
+        v = os.environ.get(key, "")
+        if str(v).lower() in ("1", "true", "yes"):
+            return True
+    return False
+
+
 COCO_SKELETON_EDGES = [
     (5, 7), (7, 9),   # left arm
     (6, 8), (8, 10),   # right arm
@@ -89,12 +99,18 @@ class PoseEstimator:
         Args:
             device: torch device (mps/cpu/cuda).
             model_name: Hugging Face model id. V3.0: vitpose-plus-large (0.4B, high fidelity).
+            With SWAY_OFFLINE / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE=1, loads from local HF cache only (see README.md).
         """
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.model_name = model_name
 
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = VitPoseForPoseEstimation.from_pretrained(model_name)
+        local_only = _local_files_only()
+        self.processor = AutoProcessor.from_pretrained(
+            model_name, local_files_only=local_only
+        )
+        self.model = VitPoseForPoseEstimation.from_pretrained(
+            model_name, local_files_only=local_only
+        )
         self.model.to(self.device)
         self.model.eval()
         # fp16 on MPS/CUDA (M2 optimization): ~2x speed, ~half memory

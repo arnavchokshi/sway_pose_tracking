@@ -16,6 +16,8 @@ Production-ready, M2-optimized pipeline:
 import sys
 import warnings
 
+import _repo_path  # noqa: F401 — adds repo root to sys.path for `sway` package
+
 
 class _FilterStderr:
     """Filter repetitive AttributeError from protobuf/onnx that doesn't affect execution."""
@@ -52,8 +54,8 @@ import cv2
 import numpy as np
 import torch
 
-from tracker import run_tracking, iter_video_frames
-from track_pruning import (
+from sway.tracker import run_tracking, iter_video_frames
+from sway.track_pruning import (
     prune_tracks,
     prune_geometric_mirrors,
     prune_spatial_outliers,
@@ -67,12 +69,15 @@ from track_pruning import (
     prune_low_confidence_tracks,
     prune_jittery_tracks,
     prune_completeness_audit,
+    prune_head_only_tracks,
+    prune_ultra_low_skeleton_tracks,
     prune_by_stage_polygon,
+    compute_confirmed_human_set,
     log_pruned_tracks,
     raw_tracks_to_per_frame,
 )
-from pose_estimator import PoseEstimator
-from crossover import (
+from sway.pose_estimator import PoseEstimator
+from sway.crossover import (
     apply_crossover_refinement,
     apply_acceleration_audit,
     apply_occlusion_reid,
@@ -80,11 +85,15 @@ from crossover import (
     deduplicate_collocated_poses,
     sanitize_pose_bbox_consistency,
 )
-from smoother import PoseSmoother
-from scoring import process_all_frames_scoring_vectorized
-from visualizer import (
+from sway.reid_embedder import extract_embeddings
+from sway.smoother import PoseSmoother
+from sway.scoring import process_all_frames_scoring_vectorized
+from sway.visualizer import (
+    build_dropped_pose_overlay,
+    build_pruned_overlay_for_review,
     render_and_export,
     render_phase_clip,
+    snapshot_tid_box_map,
     stitch_montage,
     draw_boxes_only,
     draw_frame_with_boxes,
@@ -185,9 +194,9 @@ def main():
     parser.add_argument(
         "--pose-model",
         type=str,
-        choices=["base", "large"],
+        choices=["base", "large", "huge"],
         default="base",
-        help="ViTPose model: base (faster) or large (more accurate)",
+        help="ViTPose+: base / large / huge (ViT-H class; needs VRAM). Override with SWAY_VITPOSE_MODEL.",
     )
     parser.add_argument(
         "--pose-stride",
@@ -237,7 +246,7 @@ def main():
     total_start = time.time()
 
     # ── Phase 1 & 2: Detection + Tracking ────────────────────────────────
-    print("\n[1/9] Running detection & tracking (YOLO + BoT-SORT, streaming)...")
+    print("\n[1/9] Running detection & tracking (YOLO + BoxMOT default; SWAY_USE_BOXMOT=0 for BoT-SORT)...")
     t0 = time.time()
     raw_tracks, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height = run_tracking(
         str(video_path)
@@ -280,13 +289,13 @@ def main():
     duration_kinetic_pruned = set(raw_tracks.keys()) - surviving_ids
     if duration_kinetic_pruned:
         print(f"  Pruned {len(duration_kinetic_pruned)} tracks (duration/kinetic filter)")
-        log_pruned_tracks(raw_tracks, duration_kinetic_pruned, "duration/kinetic", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, duration_kinetic_pruned, "duration/kinetic", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     stage_pruned_ids = prune_by_stage_polygon(raw_tracks, surviving_ids, frame_width, frame_height)
     surviving_ids = surviving_ids - stage_pruned_ids
     if stage_pruned_ids:
         print(f"  Pruned {len(stage_pruned_ids)} tracks outside stage polygon")
-        log_pruned_tracks(raw_tracks, stage_pruned_ids, "stage_polygon", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, stage_pruned_ids, "stage_polygon", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     _spatial_kw = {}
     if "SPATIAL_OUTLIER_STD_FACTOR" in params:
@@ -297,18 +306,20 @@ def main():
     surviving_ids = surviving_ids - spatial_pruned_ids
     if spatial_pruned_ids:
         print(f"  Pruned {len(spatial_pruned_ids)} spatial outliers (far from group)")
-        log_pruned_tracks(raw_tracks, spatial_pruned_ids, "spatial_outlier", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, spatial_pruned_ids, "spatial_outlier", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     _short_kw = {}
     if "SHORT_TRACK_MIN_FRAC" in params:
         _short_kw["min_frac"] = params["SHORT_TRACK_MIN_FRAC"]
     short_pruned_ids = prune_short_tracks(
-        raw_tracks, surviving_ids, total_frames, **_short_kw
+        raw_tracks, surviving_ids, total_frames,
+        frame_width=frame_width, frame_height=frame_height,
+        **_short_kw
     )
     surviving_ids = surviving_ids - short_pruned_ids
     if short_pruned_ids:
         print(f"  Pruned {len(short_pruned_ids)} short tracks (<20% of video)")
-        log_pruned_tracks(raw_tracks, short_pruned_ids, "short_track", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, short_pruned_ids, "short_track", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     _audience_kw = {}
     if "AUDIENCE_REGION_X_MIN_FRAC" in params:
@@ -321,27 +332,28 @@ def main():
     surviving_ids = surviving_ids - audience_pruned_ids
     if audience_pruned_ids:
         print(f"  Pruned {len(audience_pruned_ids)} tracks in audience region (bottom-right)")
-        log_pruned_tracks(raw_tracks, audience_pruned_ids, "audience_region", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, audience_pruned_ids, "audience_region", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     late_span_pruned_ids = prune_late_entrant_short_span(
-        raw_tracks, surviving_ids, total_frames
+        raw_tracks, surviving_ids, total_frames,
+        frame_width=frame_width, frame_height=frame_height,
     )
     surviving_ids = surviving_ids - late_span_pruned_ids
     if late_span_pruned_ids:
         print(f"  Pruned {len(late_span_pruned_ids)} late-entrant short-span tracks")
-        log_pruned_tracks(raw_tracks, late_span_pruned_ids, "late_entrant_short_span", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, late_span_pruned_ids, "late_entrant_short_span", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     bbox_pruned_ids = prune_bbox_size_outliers(raw_tracks, surviving_ids, frame_height=frame_height)
     surviving_ids = surviving_ids - bbox_pruned_ids
     if bbox_pruned_ids:
         print(f"  Pruned {len(bbox_pruned_ids)} bbox size outliers")
-        log_pruned_tracks(raw_tracks, bbox_pruned_ids, "bbox_size", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, bbox_pruned_ids, "bbox_size", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     aspect_pruned_ids = prune_bad_aspect_ratio(raw_tracks, surviving_ids)
     surviving_ids = surviving_ids - aspect_pruned_ids
     if aspect_pruned_ids:
         print(f"  Pruned {len(aspect_pruned_ids)} non-person aspect ratios (wider than tall)")
-        log_pruned_tracks(raw_tracks, aspect_pruned_ids, "aspect_ratio", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, aspect_pruned_ids, "aspect_ratio", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     geometric_mirror_ids = prune_geometric_mirrors(
         raw_tracks, surviving_ids, frame_width, frame_height
@@ -349,7 +361,7 @@ def main():
     surviving_ids = surviving_ids - geometric_mirror_ids
     if geometric_mirror_ids:
         print(f"  Pruned {len(geometric_mirror_ids)} geometric mirrors (edge + inverted velocity)")
-        log_pruned_tracks(raw_tracks, geometric_mirror_ids, "geometric_mirror", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(raw_tracks, geometric_mirror_ids, "geometric_mirror", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
     tracking_results = raw_tracks_to_per_frame(raw_tracks, total_frames, surviving_ids)
     print(f"  Kept {len(surviving_ids)} of {initial_count} tracks after pre-pose pruning")
@@ -357,13 +369,22 @@ def main():
     log_resource_usage("2-pruning")
 
     # ── Phase 4: Pose estimation with visibility scoring ─────────────────
-    model_id = "usyd-community/vitpose-plus-large" if args.pose_model == "large" else "usyd-community/vitpose-plus-base"
+    env_pose = os.environ.get("SWAY_VITPOSE_MODEL", "").strip()
+    if env_pose:
+        model_id = env_pose
+    elif args.pose_model == "huge":
+        model_id = "usyd-community/vitpose-plus-huge"
+    elif args.pose_model == "large":
+        model_id = "usyd-community/vitpose-plus-large"
+    else:
+        model_id = "usyd-community/vitpose-plus-base"
     stride_note = f" stride={args.pose_stride}" if args.pose_stride > 1 else ""
     print(f"\n[3/9] Running pose estimation (ViTPose-{args.pose_model.title()}{stride_note}, visibility-gated)...")
     t0 = time.time()
     pose_estimator = PoseEstimator(device=device, model_name=model_id)
 
     raw_poses_by_frame = [{} for _ in range(total_frames)]
+    embeddings_by_frame = [{} for _ in range(total_frames)]  # V3.8: Appearance for Re-ID
     frames_stored = [None] * total_frames
     last_pct = -1
     occluded_skips = 0
@@ -399,6 +420,12 @@ def main():
             boxes = tracking["boxes"]
             track_ids = tracking["track_ids"]
             frames_stored[frame_idx] = (frame_idx, None, boxes, track_ids)
+
+            # V3.8: Extract appearance embeddings for Re-ID (red vs blue during occlusion)
+            if len(boxes) > 0:
+                embeddings_by_frame[frame_idx] = extract_embeddings(
+                    frame, boxes, track_ids, method="hsv_strip"
+                )
 
             run_pose = (frame_idx % args.pose_stride == 0) and len(boxes) > 0
             if run_pose:
@@ -502,12 +529,14 @@ def main():
     all_frame_data_pre = []
     for i, (fidx, _frame, boxes, track_ids) in enumerate(frames_stored):
         raw_poses = raw_poses_by_frame[i]
+        emb = embeddings_by_frame[i] if i < len(embeddings_by_frame) else {}
         all_frame_data_pre.append({
             "frame_idx": fidx,
             "frame": None,
             "boxes": list(boxes),
             "track_ids": list(track_ids),
             "poses": dict(raw_poses),
+            "embeddings": emb,  # V3.8: Per-track appearance for crossover Re-ID
         })
 
     # ── Phase 5: Occlusion re-ID (before dedup so both fragments exist for IoU) ─
@@ -523,34 +552,39 @@ def main():
     apply_occlusion_reid(all_frame_data_pre, **_reid_kw)
     apply_crossover_refinement(all_frame_data_pre, frame_width=frame_width, frame_height=frame_height)
     apply_acceleration_audit(all_frame_data_pre)
-    apply_acceleration_audit(all_frame_data_pre)
 
     # ── Phase 6: Keypoint collision dedup (after Re-ID merges fragments) ────
     print("\n[5/9] Keypoint collision dedup...")
+    # V3.8: Removed late_entrant_candidates protection — ghosts (e.g. 61) were exempt from
+    # post-pose prunes and dedup. Now all tracks subject to same prune/dedup rules.
     late_entrant_candidates = set()
-    for tid in surviving_ids:
-        if tid in raw_tracks and raw_tracks[tid]:
-            entries = raw_tracks[tid]
-            first_f = min(e[0] for e in entries)
-            n_frames = len(entries)
-            if first_f >= total_frames * 0.25 and n_frames < 100:
-                late_entrant_candidates.add(tid)
-    # Build track frame count for dedup: when two protected tracks overlap, keep the longer one
+    # Build track frame count for dedup: when two tracks overlap, keep the longer one
     track_frame_count: dict[int, int] = {}
     for fd in all_frame_data_pre:
         for tid in fd.get("track_ids", []):
             track_frame_count[tid] = track_frame_count.get(tid, 0) + 1
     dedup_count = 0
     sanitize_count = 0
+    phase6_log: list = []
+    snap_pre_dedup = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
     for fd in all_frame_data_pre:
         before = len(fd["poses"])
-        deduplicate_collocated_poses(fd, protected_tids=late_entrant_candidates, track_frame_count=track_frame_count)
+        deduplicate_collocated_poses(
+            fd,
+            protected_tids=late_entrant_candidates,
+            track_frame_count=track_frame_count,
+            phase6_log=phase6_log,
+        )
         dedup_count += before - len(fd["poses"])
-        sanitize_count += sanitize_pose_bbox_consistency(fd)
+    snap_post_dedup_pre_sanitize = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
+    for fd in all_frame_data_pre:
+        sanitize_count += sanitize_pose_bbox_consistency(fd, phase6_log=phase6_log)
     if dedup_count:
         print(f"  Removed {dedup_count} duplicate pose overlays")
     if sanitize_count:
         print(f"  Sanitized {sanitize_count} poses with keypoints outside bbox")
+    if phase6_log:
+        prune_log_entries.extend(phase6_log)
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("5-crossover")
 
@@ -558,18 +592,32 @@ def main():
     print("\n[6/9] Post-pose pruning (sync score + smart mirror + completeness)...")
     t0 = time.time()
 
+    confirmed_humans = compute_confirmed_human_set(all_frame_data_pre, total_frames)
+    # Phase-7 kwargs only: no raw_tracks / frame_width / frame_height — those are positional for several pruners.
+    _p7_extras = {
+        "confirmed_humans": confirmed_humans,
+        "phase7_prune_log": prune_log_entries,
+        "total_frames": total_frames,
+    }
+
+    # V3.8: No late-entrant exemption — all tracks subject to post-pose prunes
     def _exclude_late_entrants(prune_set):
-        return prune_set - late_entrant_candidates
+        return prune_set
 
     _sync_kw = {}
     if "SYNC_SCORE_MIN" in params:
         _sync_kw["min_sync_score"] = params["SYNC_SCORE_MIN"]
     _sync_kw["raw_tracks"] = raw_tracks
     _sync_kw["total_frames"] = total_frames
+    _sync_kw["frame_width"] = frame_width
+    _sync_kw["frame_height"] = frame_height
+    _sync_kw.update(_p7_extras)
     sync_prune_ids = _exclude_late_entrants(prune_low_sync_tracks(all_frame_data_pre, surviving_ids, **_sync_kw))
     if sync_prune_ids:
         print(f"  Pruned {len(sync_prune_ids)} tracks with low sync score (non-dancers)")
-        log_pruned_tracks(raw_tracks, sync_prune_ids, "low_sync", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(
+            raw_tracks, sync_prune_ids, "low_sync", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
 
     _mirror_kw = {}
     if "EDGE_MARGIN_FRAC" in params:
@@ -578,6 +626,8 @@ def main():
         _mirror_kw["edge_presence_frac"] = params["EDGE_PRESENCE_FRAC"]
     if "min_lower_body_conf" in params:
         _mirror_kw["min_lower_body_conf"] = params["min_lower_body_conf"]
+    _mirror_kw["frame_height"] = frame_height
+    _mirror_kw.update(_p7_extras)
     mirror_prune_ids = _exclude_late_entrants(prune_smart_mirrors(
         raw_tracks,
         surviving_ids,
@@ -587,33 +637,89 @@ def main():
     ))
     if mirror_prune_ids:
         print(f"  Pruned {len(mirror_prune_ids)} mirror tracks")
-        log_pruned_tracks(raw_tracks, mirror_prune_ids, "smart_mirror", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(
+            raw_tracks, mirror_prune_ids, "smart_mirror", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
 
-    completeness_prune_ids = _exclude_late_entrants(prune_completeness_audit(
-        raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height
-    ))
+    completeness_prune_ids = _exclude_late_entrants(
+        prune_completeness_audit(
+            raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height, **_p7_extras
+        )
+    )
     if completeness_prune_ids:
         print(f"  Pruned {len(completeness_prune_ids)} tracks (seated/partial-body observers)")
-        log_pruned_tracks(raw_tracks, completeness_prune_ids, "completeness", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(
+            raw_tracks, completeness_prune_ids, "completeness", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
+
+    head_only_prune_ids = _exclude_late_entrants(
+        prune_head_only_tracks(
+            raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height, **_p7_extras
+        )
+    )
+    if head_only_prune_ids:
+        print(f"  Pruned {len(head_only_prune_ids)} head-only tracks (audience)")
+        log_pruned_tracks(
+            raw_tracks, head_only_prune_ids, "head_only", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
 
     _conf_kw = {}
     if "MEAN_CONFIDENCE_MIN" in params:
         _conf_kw["min_mean_conf"] = params["MEAN_CONFIDENCE_MIN"]
-    low_conf_prune_ids = _exclude_late_entrants(prune_low_confidence_tracks(
-        surviving_ids, [fd["poses"] for fd in all_frame_data_pre], **_conf_kw
-    ))
+    _conf_kw["raw_tracks"] = raw_tracks
+    _conf_kw["frame_width"] = frame_width
+    _conf_kw["frame_height"] = frame_height
+    _conf_kw.update(_p7_extras)
+    low_conf_prune_ids = _exclude_late_entrants(
+        prune_low_confidence_tracks(surviving_ids, [fd["poses"] for fd in all_frame_data_pre], **_conf_kw)
+    )
     if low_conf_prune_ids:
         print(f"  Pruned {len(low_conf_prune_ids)} tracks with low mean keypoint confidence (non-person)")
-        log_pruned_tracks(raw_tracks, low_conf_prune_ids, "low_confidence", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(
+            raw_tracks, low_conf_prune_ids, "low_confidence", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
 
-    jitter_prune_ids = _exclude_late_entrants(prune_jittery_tracks(
-        raw_tracks, surviving_ids, [fd["poses"] for fd in all_frame_data_pre]
-    ))
+    jitter_prune_ids = _exclude_late_entrants(
+        prune_jittery_tracks(
+            raw_tracks,
+            surviving_ids,
+            [fd["poses"] for fd in all_frame_data_pre],
+            frame_width=frame_width,
+            frame_height=frame_height,
+            **_p7_extras,
+        )
+    )
     if jitter_prune_ids:
         print(f"  Pruned {len(jitter_prune_ids)} tracks with excessive keypoint jitter (non-person)")
-        log_pruned_tracks(raw_tracks, jitter_prune_ids, "jitter", frame_width, frame_height, prune_log_entries)
+        log_pruned_tracks(
+            raw_tracks, jitter_prune_ids, "jitter", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
 
-    phase7_prune_ids = sync_prune_ids | mirror_prune_ids | completeness_prune_ids | low_conf_prune_ids | jitter_prune_ids
+    tier_c_ids = _exclude_late_entrants(
+        prune_ultra_low_skeleton_tracks(
+            surviving_ids,
+            [fd["poses"] for fd in all_frame_data_pre],
+            raw_tracks=raw_tracks,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            **_p7_extras,
+        )
+    )
+    if tier_c_ids:
+        print(f"  Pruned {len(tier_c_ids)} tracks (Tier C ultra-low skeleton confidence)")
+        log_pruned_tracks(
+            raw_tracks, tier_c_ids, "tier_c_ultra_low_skeleton", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+        )
+
+    phase7_prune_ids = (
+        sync_prune_ids
+        | mirror_prune_ids
+        | completeness_prune_ids
+        | head_only_prune_ids
+        | low_conf_prune_ids
+        | jitter_prune_ids
+        | tier_c_ids
+    )
     surviving_after_prune = set()
     for fd in all_frame_data_pre:
         surviving_after_prune.update(t for t in fd["track_ids"] if t not in phase7_prune_ids)
@@ -700,12 +806,26 @@ def main():
     # ── Phase 10: Export & visualization ──────────────────────────────────
     print("\n[9/9] Rendering and exporting...")
     t0 = time.time()
+    pruned_overlay = build_pruned_overlay_for_review(
+        all_frame_data_pre,
+        phase7_prune_ids,
+        raw_tracks,
+        prune_log_entries,
+    )
+    dropped_pose_overlay = build_dropped_pose_overlay(
+        snap_pre_dedup,
+        snap_post_dedup_pre_sanitize,
+        all_frame_data_pre,
+    )
     render_and_export(
         video_path=video_path,
         all_frame_data=all_frame_data,
         processed_fps=output_fps,
         native_fps=native_fps,
         output_dir=output_dir,
+        pruned_overlay=pruned_overlay,
+        prune_entries=prune_log_entries,
+        dropped_pose_overlay=dropped_pose_overlay,
     )
     print(f"  └─ {time.time() - t0:.1f}s")
     log_resource_usage("9-export")

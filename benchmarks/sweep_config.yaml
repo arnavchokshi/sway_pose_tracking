@@ -1,5 +1,12 @@
 # Sweep config for IMG_0256 ground truth
 # Priority: ID consistency — one person = one ID, no drops, no ghosts, merge occlusion fragments
+#
+# Optional TrackEval (add to the same ground-truth YAML):
+#   trackeval:
+#     gt_mot_file: benchmarks/my_seq_mot_gt.txt
+#     sequence_name: my_seq
+#     im_width: 1920
+#     im_height: 1080
 
 ground_truth: benchmarks/IMG_0256_ground_truth.yaml
 video_path: /Users/arnavchokshi/Desktop/IMG_0256.mov

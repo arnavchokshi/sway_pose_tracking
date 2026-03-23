@@ -32,7 +32,7 @@ import numpy as np
 
 # V3.8: Optional appearance cost for crossover (red vs blue during occlusion)
 try:
-    from reid_embedder import cosine_similarity
+    from .reid_embedder import cosine_similarity
     _REID_AVAILABLE = True
 except ImportError:
     _REID_AVAILABLE = False
@@ -243,6 +243,7 @@ KPT_BBOX_MAX_OFFSET_FRAC = 0.6  # Max distance from bbox center as fraction of b
 def sanitize_pose_bbox_consistency(
     frame_data: Dict[str, Any],
     max_offset_frac: float = KPT_BBOX_MAX_OFFSET_FRAC,
+    phase6_log: Optional[list] = None,
 ) -> int:
     """
     Remove poses where head keypoints are largely outside their bbox (e.g. tracker ID switch),
@@ -286,7 +287,17 @@ def sanitize_pose_bbox_consistency(
         if invalid_head:
             continue
             
+    fj = int(frame_data.get("frame_idx", -1))
     for tid in to_remove:
+        if phase6_log is not None:
+            phase6_log.append(
+                {
+                    "rule": "sanitize_pose_bbox_consistency",
+                    "track_id": int(tid),
+                    "frame_idx": fj,
+                    "decision": "removed_pose",
+                }
+            )
         if tid in poses:
             del poses[tid]
     if to_remove:
@@ -307,6 +318,7 @@ def deduplicate_collocated_poses(
     center_dist_frac: float = COLLISION_CENTER_DIST_FRAC,
     protected_tids: Optional[Set[int]] = None,
     track_frame_count: Optional[Dict[int, int]] = None,
+    phase6_log: Optional[list] = None,
 ) -> None:
     """
     V3.4: Remove duplicate pose overlays on the same physical person.
@@ -407,7 +419,17 @@ def deduplicate_collocated_poses(
                     suppressed = tid_b if conf_a >= conf_b else tid_a
                 to_suppress.add(suppressed)
 
+    fj = int(frame_data.get("frame_idx", -1))
     for tid in to_suppress:
+        if phase6_log is not None:
+            phase6_log.append(
+                {
+                    "rule": "deduplicate_collocated_poses",
+                    "track_id": int(tid),
+                    "frame_idx": fj,
+                    "decision": "suppressed_duplicate",
+                }
+            )
         if tid in poses:
             del poses[tid]
 
@@ -578,9 +600,12 @@ def apply_occlusion_reid(
             diag = np.sqrt((box_b[2] - box_b[0]) ** 2 + (box_b[3] - box_b[1]) ** 2)
             bbox_near = dist < diag * 0.5 if diag > 1 else dist < 50
             # Merge if OKS passes, OR IoU/centroid fallback when OKS fails
+            OKS_VETO_PASS15 = 0.25
             merge_oks = oks >= min_oks
             merge_proximity = bbox_near and oks >= min_oks * 0.5
-            merge_iou_centroid = (iou >= 0.15 and dist < diag * 1.0)
+            merge_iou_centroid = (
+                iou >= 0.15 and dist < diag * 1.0 and oks >= OKS_VETO_PASS15
+            )
             # Skip late entrants unless OKS is high (tracker fragment, not new person)
             if REID_LATE_ENTRANT_START_FRAME <= start_b <= REID_LATE_ENTRANT_END_FRAME:
                 if oks < REID_LATE_ENTRANT_OVERRIDE_OKS:
@@ -628,6 +653,8 @@ def apply_occlusion_reid(
                 if REID_LATE_ENTRANT_START_FRAME <= start_b <= REID_LATE_ENTRANT_END_FRAME:
                     continue
                 iou_sum, iou_n = 0.0, 0
+                oks_sum, oks_n = 0.0, 0
+                OKS_VETO_PASS16 = 0.15
                 for f_idx, fd in enumerate(all_frame_data):
                     frame_idx = fd.get("frame_idx", f_idx)
                     if frame_idx < overlap_start or frame_idx > overlap_end:
@@ -640,12 +667,36 @@ def apply_occlusion_reid(
                         continue
                     iou_sum += _compute_bbox_iou(tuple(boxes[idx_a]), tuple(boxes[idx_b]))
                     iou_n += 1
+                    poses = fd.get("poses", {})
+                    pa = poses.get(tid_a, {}).get("keypoints")
+                    pb = poses.get(tid_b, {}).get("keypoints")
+                    if pa is not None and pb is not None:
+                        pa = np.asarray(pa)
+                        pb = np.asarray(pb)
+                        if pa.shape[0] >= 17 and pb.shape[0] >= 17:
+                            ba, bb = tuple(boxes[idx_a]), tuple(boxes[idx_b])
+                            area = max(
+                                (ba[2] - ba[0]) * (ba[3] - ba[1]),
+                                (bb[2] - bb[0]) * (bb[3] - bb[1]),
+                                1.0,
+                            )
+                            oks_sum += float(_compute_oks(pa, pb, area))
+                            oks_n += 1
                 if iou_n >= 5:
                     mean_iou = iou_sum / iou_n
+                    mean_oks = (oks_sum / oks_n) if oks_n > 0 else 0.0
+                    oks_ok = (oks_n >= 3 and mean_oks >= OKS_VETO_PASS16) or (oks_n < 3)
                     if debug:
                         import sys
-                        print(f"    [Re-ID Pass1.6] {tid_a}-{tid_b} overlap={overlap_start}-{overlap_end} n={iou_n} mean_iou={mean_iou:.3f} need>={REID_PASS16_MIN_IOU}", file=sys.stderr)
-                    if mean_iou > best_iou and mean_iou >= REID_PASS16_MIN_IOU:
+                        print(
+                            f"    [Re-ID Pass1.6] {tid_a}-{tid_b} overlap={overlap_start}-{overlap_end} n={iou_n} mean_iou={mean_iou:.3f} mean_oks={mean_oks:.3f} oks_n={oks_n}",
+                            file=sys.stderr,
+                        )
+                    if (
+                        oks_ok
+                        and mean_iou > best_iou
+                        and mean_iou >= REID_PASS16_MIN_IOU
+                    ):
                         best_iou = mean_iou
                         best_pair = (tid_a, tid_b)
         if best_pair:

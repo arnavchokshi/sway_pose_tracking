@@ -14,7 +14,7 @@ import numpy as np
 from scipy.stats import circmean
 from scipy.signal import correlate
 
-from kinematics import (
+from .kinematics import (
     JOINT_NAMES,
     compute_joint_angles_vectorized,
 )
@@ -276,13 +276,13 @@ def process_all_frames_scoring_vectorized(
 # --- Legacy compatibility ---
 
 def calculate_joint_angles(*args, **kwargs):
-    from kinematics import calculate_joint_angles as k_calc
+    from .kinematics import calculate_joint_angles as k_calc
     return k_calc(*args, **kwargs)
 
 
 def compute_frame_consensus(all_tracks_angles: Dict) -> Dict:
     """Legacy consensus (median)."""
-    from kinematics import JOINT_NAMES
+    from .kinematics import JOINT_NAMES
     consensus = {}
     for jname in JOINT_NAMES:
         values = [a.get(jname) for a in all_tracks_angles.values()

@@ -213,6 +213,7 @@ def main():
                     "expected_total_unique_tracks": gt.get("expected_total_unique_tracks"),
                     "expected_late_entrants": gt.get("expected_late_entrants"),
                     "failure_reasons": [],
+                    "trackeval": None,
                 }
                 with open(log_path, "a") as lf:
                     lf.write(json.dumps(log_entry) + "\n")
@@ -228,11 +229,13 @@ def main():
                     "effective_params": _effective_params(params),
                     "pass": False,
                     "error": "no_data_json",
+                    "trackeval": None,
                     "expected_tracks_at_start": gt.get("expected_tracks_at_start"),
                     "expected_tracks_at_end": gt.get("expected_tracks_at_end"),
                     "expected_total_unique_tracks": gt.get("expected_total_unique_tracks"),
                     "expected_late_entrants": gt.get("expected_late_entrants"),
                     "failure_reasons": [],
+                    "trackeval": None,
                 }
                 with open(log_path, "a") as lf:
                     lf.write(json.dumps(log_entry) + "\n")
@@ -244,6 +247,15 @@ def main():
             metrics = compute_benchmark_metrics(data, gt)
             all_pass, messages = run_checks(metrics, gt)
             failure_reasons = get_failure_reasons(metrics, gt)
+
+            trackeval_metrics = None
+            if gt.get("trackeval"):
+                try:
+                    from sway.trackeval_runner import trackeval_from_ground_truth_yaml
+
+                    trackeval_metrics = trackeval_from_ground_truth_yaml(gt, data)
+                except Exception as ex:
+                    trackeval_metrics = {"error": str(ex)}
 
             # Suggested params for next iteration — prioritize Re-ID for ID consistency
             suggested_next_params = []
@@ -270,6 +282,7 @@ def main():
                 "params_override": params,
                 "effective_params": _effective_params(params),
                 "pass": all_pass,
+                "trackeval": trackeval_metrics,
                 "tracks_at_start": metrics["tracks_at_start"],
                 "tracks_at_end": metrics["tracks_at_end"],
                 "total_unique_tracks": metrics["total_unique_tracks"],

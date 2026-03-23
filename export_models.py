@@ -1,7 +1,12 @@
 import argparse
+from pathlib import Path
+from typing import Optional
+
 from ultralytics import YOLO
 
-def export_yolo(model_name="yolo11l.pt"):
+def export_yolo(model_name: Optional[str] = None):
+    if model_name is None:
+        model_name = str(Path(__file__).resolve().parent / "models" / "yolo11l.pt")
     print(f"Exporting {model_name} to CoreML with NMS...")
     model = YOLO(model_name)
     # nms=True bakes Non-Maximum Suppression into the CoreML model, saving CPU time

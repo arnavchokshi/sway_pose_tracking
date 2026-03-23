@@ -1,0 +1,22 @@
+# Sway Pose — single canonical BoT-SORT config (Ultralytics tracker YAML)
+# Previously `ocsort.yaml` shadowed this file; only this path is loaded now.
+#
+# with_reid: Ultralytics built-in Re-ID is OFF here — dance/costume ambiguity; BoxMOT Deep OC-SORT
+# Used when SWAY_USE_BOXMOT=0 (Ultralytics BoT-SORT). Default pipeline uses BoxMOT + OSNet Re-ID.
+#
+# track_buffer MUST be >= crossover.REID_MAX_FRAME_GAP (90).
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.45
+min_hits: 3
+track_buffer: 90
+match_thresh: 0.6
+fuse_score: True
+
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto
