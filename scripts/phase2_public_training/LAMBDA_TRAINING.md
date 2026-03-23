@@ -79,6 +79,16 @@ Weights when done:
 
 `~/sway_pose_tracking/runs/detect/yolo11x_dancetrack_only/weights/best.pt`
 
+**Optional — validation metrics on the instance** (DanceTrack val mAP vs COCO baseline; needs the same `datasets/dancetrack_yolo/` the training script just built):
+
+```bash
+cd ~/sway_pose_tracking
+python3 scripts/phase2_public_training/validate_trained_model.py
+# or explicit checkpoint:
+# python3 scripts/phase2_public_training/validate_trained_model.py \
+#   --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt
+```
+
 ### 4. Mac — download weights
 
 New Terminal tab on your Mac:
@@ -96,6 +106,13 @@ mkdir -p /Users/arnavchokshi/Desktop/sway_test/sway_pose_mvp/models
 mv ~/Desktop/yolo11x_dancetrack_only_best.pt \
   /Users/arnavchokshi/Desktop/sway_test/sway_pose_mvp/models/yolo11x_dancetrack.pt
 export SWAY_YOLO_WEIGHTS=/Users/arnavchokshi/Desktop/sway_test/sway_pose_mvp/models/yolo11x_dancetrack.pt
+```
+
+**Optional — same validation on your Mac** (needs `datasets/dancetrack_yolo/` present locally, or only CrowdHuman / merged if you converted those):
+
+```bash
+cd /Users/arnavchokshi/Desktop/sway_test/sway_pose_mvp
+python3 scripts/phase2_public_training/validate_trained_model.py
 ```
 
 ### 6. Lambda dashboard — stop charges
