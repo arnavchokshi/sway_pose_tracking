@@ -5,7 +5,8 @@ This is **not** the Poseidon architecture (multi-frame ViT backbone); it is a
 confidence-weighted spatial smooth over neighboring frames for the same track,
 inspired by the same ±window idea. Use when single-frame ViTPose is jittery.
 
-Enable: ``--temporal-pose-refine`` or ``SWAY_TEMPORAL_POSE_REFINE=1``.
+Default on (CLI). Disable with ``--no-temporal-pose-refine`` or ``SWAY_TEMPORAL_POSE_REFINE=0``.
+Explicit ``SWAY_TEMPORAL_POSE_REFINE=1`` forces on even if CLI disables.
 Radius: ``--temporal-pose-radius`` or ``SWAY_TEMPORAL_POSE_RADIUS`` (default 2).
 """
 
@@ -17,13 +18,19 @@ from typing import Dict, List
 import numpy as np
 
 
-def _truthy_env(name: str) -> bool:
-    v = os.environ.get(name, "")
-    return str(v).lower() in ("1", "true", "yes", "on")
-
-
 def want_temporal_pose_refine(cli_flag: bool) -> bool:
-    return _truthy_env("SWAY_TEMPORAL_POSE_REFINE") or cli_flag
+    """
+    Tri-state env overrides CLI default:
+      SWAY_TEMPORAL_POSE_REFINE=0|false|no|off  -> off
+      SWAY_TEMPORAL_POSE_REFINE=1|true|yes|on   -> on
+      unset                                     -> cli_flag (default True in main.py)
+    """
+    raw = os.environ.get("SWAY_TEMPORAL_POSE_REFINE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return bool(cli_flag)
 
 
 def temporal_pose_radius(cli_value: int) -> int:

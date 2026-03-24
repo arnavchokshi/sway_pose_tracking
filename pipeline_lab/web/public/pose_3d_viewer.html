@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sway 3D Pose Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #fff; font-family: system-ui, sans-serif; }
+    #container { display: flex; height: 100vh; }
+    #scene-view { flex: 1; position: relative; min-width: 0; }
+    #individual-view { width: 340px; border-left: 1px solid #333; position: relative; flex-shrink: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .controls { position: absolute; bottom: 16px; left: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button { background: #222; color: #fff; border: 1px solid #444;
+             padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    button:hover { background: #333; }
+    button.active { border-color: #6366f1; color: #818cf8; }
+    #timeline { position: absolute; bottom: 56px; left: 16px; right: 16px; }
+    #timeline input { width: 100%; accent-color: #6366f1; }
+    #dancer-list { padding: 12px; overflow-y: auto; height: calc(100% - 320px); }
+    .dancer-btn { display: block; width: 100%; text-align: left; background: #1a1a1a;
+                  border: 1px solid #333; padding: 8px 12px; margin-bottom: 6px;
+                  border-radius: 6px; cursor: pointer; color: #ccc; font-size: 13px; }
+    .dancer-btn.active { border-color: #6366f1; color: #818cf8; background: #1e1e3a; }
+    #view-label { position: absolute; top: 12px; left: 12px; font-size: 12px;
+                  color: #666; text-transform: uppercase; letter-spacing: 1px; }
+    #err { padding: 2rem; color: #fca5a5; max-width: 40rem; line-height: 1.5; }
+    a { color: #818cf8; }
+  </style>
+</head>
+<body>
+<div id="err" style="display:none"></div>
+<div id="container" style="display:none">
+  <div id="scene-view">
+    <div id="view-label">All dancers</div>
+    <canvas id="canvas-all"></canvas>
+    <div id="timeline">
+      <input type="range" id="scrubber" min="0" value="0" step="1" />
+    </div>
+    <div class="controls">
+      <button type="button" id="btn-play">Play</button>
+      <button type="button" id="btn-reset-cam">Reset camera</button>
+      <span id="frame-label" style="padding: 6px 0; font-size: 12px; color: #666;">Frame 0</span>
+    </div>
+  </div>
+  <div id="individual-view">
+    <div style="padding: 12px; border-bottom: 1px solid #333; font-size: 12px;
+                color: #666; text-transform: uppercase; letter-spacing: 1px;">
+      Individual
+    </div>
+    <canvas id="canvas-individual" width="340" height="280"></canvas>
+    <div id="dancer-list"></div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+const params = new URLSearchParams(location.search);
+const runId = params.get('runId') || params.get('run_id');
+const apiBase = (params.get('api') || '').replace(/\/$/, '');
+
+function showError(msg) {
+  const e = document.getElementById('err');
+  e.style.display = 'block';
+  e.textContent = msg;
+}
+
+if (!runId) {
+  showError('Add ?runId=<uuid> to the URL (Pipeline Lab run id).');
+  throw new Error('missing runId');
+}
+
+const fetchUrl = `${apiBase}/api/runs/${encodeURIComponent(runId)}/pose_3d`;
+let POSE_DATA;
+try {
+  const r = await fetch(fetchUrl);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || r.statusText);
+  }
+  POSE_DATA = await r.json();
+} catch (e) {
+  showError(`Could not load 3D pose data (${fetchUrl}): ${e.message || e}`);
+  throw e;
+}
+
+document.getElementById('container').style.display = 'flex';
+document.getElementById('err').style.display = 'none';
+
+const { fps, total_frames, bones, tracks } = POSE_DATA;
+const trackIds = Object.keys(tracks || {}).map((k) => parseInt(k, 10)).filter((n) => !Number.isNaN(n));
+
+const DANCER_COLORS = [
+  0x6366f1, 0xf43f5e, 0x10b981, 0xf59e0b,
+  0x3b82f6, 0xec4899, 0x14b8a6, 0xa855f7,
+];
+
+const canvasAll = document.getElementById('canvas-all');
+const rendererAll = new THREE.WebGLRenderer({ canvas: canvasAll, antialias: true });
+rendererAll.setPixelRatio(Math.min(devicePixelRatio, 2));
+rendererAll.setClearColor(0x111111);
+
+const sceneAll = new THREE.Scene();
+sceneAll.add(new THREE.AmbientLight(0xffffff, 0.8));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+dirLight.position.set(5, 10, 5);
+sceneAll.add(dirLight);
+sceneAll.add(new THREE.GridHelper(10, 20, 0x333333, 0x222222));
+
+const cameraAll = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
+cameraAll.position.set(0, 2, 5);
+const controlsAll = new OrbitControls(cameraAll, canvasAll);
+controlsAll.target.set(0, 1, 0);
+controlsAll.update();
+
+const canvasInd = document.getElementById('canvas-individual');
+const rendererInd = new THREE.WebGLRenderer({ canvas: canvasInd, antialias: true });
+rendererInd.setPixelRatio(Math.min(devicePixelRatio, 2));
+rendererInd.setClearColor(0x0d0d1a);
+
+const sceneInd = new THREE.Scene();
+sceneInd.add(new THREE.AmbientLight(0xffffff, 0.9));
+const cameraInd = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
+cameraInd.position.set(0, 1, 3);
+const controlsInd = new OrbitControls(cameraInd, canvasInd);
+controlsInd.target.set(0, 1, 0);
+controlsInd.update();
+
+function createDancerSkeleton(color) {
+  const group = new THREE.Group();
+  const jointMat = new THREE.MeshStandardMaterial({ color });
+  const boneMat = new THREE.LineBasicMaterial({ color });
+
+  const joints = Array.from({ length: 17 }, () => {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), jointMat);
+    group.add(mesh);
+    return mesh;
+  });
+
+  const boneLines = bones.map(([a, b]) => {
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(), new THREE.Vector3(),
+    ]);
+    const line = new THREE.Line(geo, boneMat);
+    group.add(line);
+    return { line, a, b };
+  });
+
+  return { group, joints, boneLines };
+}
+
+const allSceneSkeletons = {};
+trackIds.forEach((tid, i) => {
+  const color = DANCER_COLORS[i % DANCER_COLORS.length];
+  const skel = createDancerSkeleton(color);
+  sceneAll.add(skel.group);
+  allSceneSkeletons[tid] = skel;
+});
+
+const indSkel = createDancerSkeleton(0x818cf8);
+sceneInd.add(indSkel.group);
+let selectedTid = trackIds[0] ?? null;
+
+function getKptsAtFrame(tid, frameIdx) {
+  const track = tracks[String(tid)];
+  if (!track || !track.frames || !track.keypoints_3d) return null;
+  const idx = track.frames.indexOf(frameIdx);
+  if (idx !== -1) return track.keypoints_3d[idx];
+  if (track.frames.length === 0) return null;
+  let nearest = track.frames[0];
+  let best = Math.abs(nearest - frameIdx);
+  for (const f of track.frames) {
+    const d = Math.abs(f - frameIdx);
+    if (d < best) { best = d; nearest = f; }
+  }
+  if (best > fps * 2) return null;
+  const ni = track.frames.indexOf(nearest);
+  return track.keypoints_3d[ni];
+}
+
+function updateSkeleton(skel, kpts3d) {
+  if (!kpts3d || kpts3d.length < 17) {
+    skel.group.visible = false;
+    return;
+  }
+  skel.group.visible = true;
+
+  const hipMid = [
+    (kpts3d[11][0] + kpts3d[12][0]) / 2,
+    (kpts3d[11][1] + kpts3d[12][1]) / 2,
+    (kpts3d[11][2] + kpts3d[12][2]) / 2,
+  ];
+  const ankleY = Math.max(kpts3d[15][1], kpts3d[16][1]);
+  const noseY = kpts3d[0][1];
+  const rawHeight = Math.abs(ankleY - noseY) || 1.0;
+  const scale = 1.8 / rawHeight;
+
+  skel.joints.forEach((joint, i) => {
+    const kp = kpts3d[i];
+    joint.position.set(
+      (kp[0] - hipMid[0]) * scale,
+      -(kp[1] - hipMid[1]) * scale,
+      kp[2] * scale * 0.5,
+    );
+  });
+
+  skel.boneLines.forEach(({ line, a, b }) => {
+    const posA = skel.joints[a].position;
+    const posB = skel.joints[b].position;
+    const positions = line.geometry.attributes.position;
+    positions.setXYZ(0, posA.x, posA.y, posA.z);
+    positions.setXYZ(1, posB.x, posB.y, posB.z);
+    positions.needsUpdate = true;
+  });
+}
+
+function updateAllScene(frameIdx) {
+  trackIds.forEach((tid, i) => {
+    const skel = allSceneSkeletons[tid];
+    const kpts = getKptsAtFrame(tid, frameIdx);
+    updateSkeleton(skel, kpts);
+    skel.group.position.x = (i - (trackIds.length - 1) / 2) * 2.5;
+  });
+}
+
+function updateIndividualScene(frameIdx) {
+  if (selectedTid === null) return;
+  updateSkeleton(indSkel, getKptsAtFrame(selectedTid, frameIdx));
+}
+
+const dancerList = document.getElementById('dancer-list');
+trackIds.forEach((tid, i) => {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'dancer-btn' + (tid === selectedTid ? ' active' : '');
+  btn.textContent = `Dancer ${tid}`;
+  const dot = document.createElement('span');
+  const color = DANCER_COLORS[i % DANCER_COLORS.length];
+  dot.style.cssText = `display:inline-block;width:8px;height:8px;border-radius:50%;background:#${color.toString(16).padStart(6, '0')};margin-right:8px;vertical-align:middle;`;
+  btn.prepend(dot);
+  btn.addEventListener('click', () => {
+    selectedTid = tid;
+    dancerList.querySelectorAll('.dancer-btn').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+  dancerList.appendChild(btn);
+});
+
+const scrubber = document.getElementById('scrubber');
+const tf = Math.max(1, Math.floor(total_frames || 1));
+scrubber.max = tf - 1;
+let currentFrame = 0;
+let playing = false;
+let lastTime = null;
+
+document.getElementById('btn-play').addEventListener('click', function () {
+  playing = !playing;
+  this.textContent = playing ? 'Pause' : 'Play';
+  if (playing) lastTime = null;
+});
+
+document.getElementById('btn-reset-cam').addEventListener('click', () => {
+  cameraAll.position.set(0, 2, 5);
+  controlsAll.target.set(0, 1, 0);
+  controlsAll.update();
+});
+
+scrubber.addEventListener('input', () => {
+  currentFrame = parseInt(scrubber.value, 10);
+  document.getElementById('frame-label').textContent =
+    `Frame ${currentFrame} / ${(currentFrame / (fps || 30)).toFixed(2)}s`;
+});
+
+function resize() {
+  const wAll = canvasAll.parentElement.clientWidth;
+  const hAll = Math.max(200, window.innerHeight - 0);
+  canvasAll.style.height = `${hAll}px`;
+  rendererAll.setSize(wAll, hAll);
+  cameraAll.aspect = wAll / hAll;
+  cameraAll.updateProjectionMatrix();
+
+  const wInd = canvasInd.parentElement.clientWidth;
+  const hInd = 280;
+  rendererInd.setSize(wInd, hInd);
+  cameraInd.aspect = wInd / hInd;
+  cameraInd.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+function animate(timestamp) {
+  requestAnimationFrame(animate);
+
+  if (playing) {
+    if (lastTime === null) lastTime = timestamp;
+    const elapsed = timestamp - lastTime;
+    const frameDelta = (elapsed / 1000) * (fps || 30);
+    currentFrame = Math.floor(currentFrame + frameDelta) % tf;
+    lastTime = timestamp;
+    scrubber.value = String(currentFrame);
+    document.getElementById('frame-label').textContent =
+      `Frame ${currentFrame} / ${(currentFrame / (fps || 30)).toFixed(2)}s`;
+  }
+
+  updateAllScene(currentFrame);
+  updateIndividualScene(currentFrame);
+
+  controlsAll.update();
+  controlsInd.update();
+  rendererAll.render(sceneAll, cameraAll);
+  rendererInd.render(sceneInd, cameraInd);
+}
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

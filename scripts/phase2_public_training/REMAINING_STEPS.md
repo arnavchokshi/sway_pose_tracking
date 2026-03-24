@@ -1,4 +1,4 @@
-# What’s left for you — YOLO11x fine-tune
+# What’s left for you — YOLO26l fine-tune
 
 **Already done in this workspace (do not repeat):** DanceTrack is on disk under `datasets/dancetrack/`, and `convert_dancetrack_to_yolo.py` has been run → `datasets/dancetrack_yolo/` exists.
 
@@ -145,7 +145,7 @@ Check GPU:
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
-If training **OOM**s, edit `train_yolo11x.py`: lower `BATCH` (e.g. `8`) or `IMGSZ`. Apple Silicon: set `DEVICE = "mps"` (slow). CPU-only is not practical.
+If training **OOM**s, edit `train_yolo26l.py`: lower `BATCH` (e.g. `8`) or `IMGSZ`. Apple Silicon: set `DEVICE = "mps"` (slow). CPU-only is not practical. Use a recent **ultralytics** so `yolo26l.pt` is available.
 
 ---
 
@@ -154,17 +154,17 @@ If training **OOM**s, edit `train_yolo11x.py`: lower `BATCH` (e.g. `8`) or `IMGS
 From `sway_pose_mvp/`:
 
 ```bash
-python scripts/phase2_public_training/train_yolo11x.py
+python scripts/phase2_public_training/train_yolo26l.py
 ```
 
-First run may download **`yolo11x.pt`** (~100+ MB). When it finishes:
+First run may download **`yolo26l.pt`**. When it finishes:
 
 ```bash
 mkdir -p models
-cp runs/detect/yolo11x_dancetrack/weights/best.pt models/yolo11x_dancetrack.pt
+cp runs/detect/yolo26l_dancetrack/weights/best.pt models/yolo26l_dancetrack.pt
 ```
 
-**Optional** — compare COCO vs fine-tuned mAP (needs `yolo11x.pt` in repo root or let Ultralytics fetch it):
+**Optional** — compare COCO vs fine-tuned mAP (needs `yolo26l.pt` in repo root or let Ultralytics fetch it):
 
 ```bash
 python scripts/phase2_public_training/validate_trained_model.py
@@ -173,11 +173,11 @@ python scripts/phase2_public_training/validate_trained_model.py
 **Use in pipeline:**
 
 ```bash
-export SWAY_YOLO_WEIGHTS=models/yolo11x_dancetrack.pt
+export SWAY_YOLO_WEIGHTS=models/yolo26l_dancetrack.pt
 python main.py --video /path/to/your_video.mp4
 ```
 
-Windows cmd: `set SWAY_YOLO_WEIGHTS=models\yolo11x_dancetrack.pt`
+Windows cmd: `set SWAY_YOLO_WEIGHTS=models\yolo26l_dancetrack.pt`
 
 No change to `sway/tracker.py` — it reads `SWAY_YOLO_WEIGHTS` via `resolve_yolo_model_path()`.
 
@@ -187,17 +187,17 @@ No change to `sway/tracker.py` — it reads `SWAY_YOLO_WEIGHTS` via `resolve_yol
 
 | Symptom | Action |
 |--------|--------|
-| `train_yolo11x.py` → `❌ Setup incomplete` | Run §1 step 4; ensure `datasets/crowdhuman_yolo/images/{train,val}/` exist. |
+| `train_yolo26l.py` → `❌ Setup incomplete` | Run §1 step 4; ensure `datasets/crowdhuman_yolo/images/{train,val}/` exist. |
 | CrowdHuman converter: `Converted 0 images` | Images must be `Images/<split>/<ID>.jpg` matching IDs in the `.odgt` lines. |
 | `download_datasets.py` exit 1 | Fix whatever path it prints (usually CrowdHuman still missing or wrong names). |
-| Training OOM | Smaller `BATCH` / `IMGSZ` in `train_yolo11x.py`. |
+| Training OOM | Smaller `BATCH` / `IMGSZ` in `train_yolo26l.py`. |
 
 ---
 
 ## 6. Done when
 
 1. `download_datasets.py` exits **0**.  
-2. `train_yolo11x.py` completed and `models/yolo11x_dancetrack.pt` exists.  
+2. `train_yolo26l.py` completed and `models/yolo26l_dancetrack.pt` exists.  
 3. `SWAY_YOLO_WEIGHTS` points at that file and `main.py` looks good on your videos.
 
 ---

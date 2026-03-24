@@ -4,14 +4,14 @@ Run Ultralytics YOLO val() to report mAP / precision / recall.
 
 - Picks a **data YAML** from what is on disk: merged (DanceTrack+CrowdHuman) if both
   converted datasets exist, else DanceTrack-only or CrowdHuman-only.
-- Compares **COCO-pretrained yolo11x.pt** vs your fine-tuned weights on the **same val split**
+- Compares **COCO-pretrained yolo26l.pt** vs your fine-tuned weights on the **same val split**
   when the baseline weights are present (use --no-baseline to skip).
 
 Run from sway_pose_mvp/:
 
   python scripts/phase2_public_training/validate_trained_model.py
   python scripts/phase2_public_training/validate_trained_model.py \\
-    --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt
+    --weights runs/detect/yolo26l_dancetrack_only/weights/best.pt
 """
 
 from __future__ import annotations
@@ -73,6 +73,10 @@ def resolve_data_yaml() -> tuple[Path, str]:
 
 def default_finetuned_weights() -> Path | None:
     candidates = (
+        REPO_ROOT / "models" / "yolo26l_dancetrack.pt",
+        REPO_ROOT / "runs" / "detect" / "yolo26l_dancetrack_only" / "weights" / "best.pt",
+        REPO_ROOT / "runs" / "detect" / "yolo26l_dancetrack" / "weights" / "best.pt",
+        REPO_ROOT / "runs" / "detect" / "yolo26l_crowdhuman_ft" / "weights" / "best.pt",
         REPO_ROOT / "models" / "yolo11x_dancetrack.pt",
         REPO_ROOT / "runs" / "detect" / "yolo11x_dancetrack_only" / "weights" / "best.pt",
         REPO_ROOT / "runs" / "detect" / "yolo11x_dancetrack" / "weights" / "best.pt",
@@ -120,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-baseline",
         action="store_true",
-        help="Do not run COCO yolo11x.pt baseline (faster if you only care about fine-tuned mAP)",
+        help="Do not run COCO yolo26l.pt baseline (faster if you only care about fine-tuned mAP)",
     )
     return p.parse_args()
 
@@ -147,8 +151,8 @@ def main() -> None:
         if found is None:
             print(
                 "\nNo fine-tuned weights found. Pass --weights PATH, e.g.\n"
-                "  --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt\n"
-                "or copy best.pt to models/yolo11x_dancetrack.pt",
+                "  --weights runs/detect/yolo26l_dancetrack_only/weights/best.pt\n"
+                "or copy best.pt to models/yolo26l_dancetrack.pt",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -160,8 +164,8 @@ def main() -> None:
             sys.exit(1)
 
     if not args.no_baseline:
-        # Local yolo11x.pt or Ultralytics download on first use (cwd is REPO_ROOT).
-        validate("yolo11x.pt", "YOLO11x COCO baseline", data_yaml, args.imgsz)
+        # Local yolo26l.pt or Ultralytics download on first use (cwd is REPO_ROOT).
+        validate("yolo26l.pt", "YOLO26l COCO baseline", data_yaml, args.imgsz)
 
     validate(str(ft), f"Fine-tuned ({ft.name})", data_yaml, args.imgsz)
     print(f"\nWeights evaluated: {ft}")

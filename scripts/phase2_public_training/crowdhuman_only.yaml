@@ -1,7 +1,7 @@
 # CrowdHuman only — second stage after DanceTrack (sequential fine-tune).
 # Start from DanceTrack checkpoint, e.g.:
-#   python scripts/phase2_public_training/train_yolo11x.py --phase crowdhuman \
-#     --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt
+#   python scripts/phase2_public_training/train_yolo26l.py --phase crowdhuman \
+#     --weights runs/detect/yolo26l_dancetrack_only/weights/best.pt
 
 path: .
 

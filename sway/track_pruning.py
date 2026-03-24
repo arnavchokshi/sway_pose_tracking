@@ -1,5 +1,9 @@
 """
-Phase 3 & 6: Track Pruning — V3.5 Non-Person Object Detection
+Pre-pose + post-pose track pruning — V3.5 Non-Person Object Detection
+
+Pre-pose rules run in main Phase 4; post-pose Tier A/B/C runs in main Phase 8:
+Tier C hard skeleton auto-reject, Tier A confirmed-human
+whitelist (torso + span + mirror-edge spatial sanity), Tier B weighted vote across six signals.
 
 V3.5 Pruning (additions):
 - Bbox Aspect Ratio: Pre-pose prune tracks with median width/height > 1.2 (non-person objects)
@@ -25,6 +29,8 @@ V3.1 Pruning (retained):
 import numpy as np
 from typing import Dict, List, Tuple, Set, Any, Optional
 
+from .track_observation import coerce_observation
+
 # COCO lower-body keypoint indices: knees (13, 14), ankles (15, 16) — used by Smart Mirror
 LOWER_BODY_INDICES = (13, 14, 15, 16)
 # Phase 6 Completeness Audit (V3.2): shoulders (5, 6), knees (13, 14), ankles (15, 16)
@@ -38,6 +44,17 @@ KINETIC_STD_FRAC = 0.02
 EDGE_MARGIN_FRAC = 0.15
 # Min fraction of frames a track must be "on edge" to be considered
 EDGE_PRESENCE_FRAC = 0.3
+
+# Phase 8 — Tier B: weighted vote across legacy Phase-7 rules (tune via params / sweep_config.yaml)
+PRUNE_THRESHOLD = 0.65
+PRUNING_WEIGHTS = {
+    "prune_low_sync_tracks": 0.7,
+    "prune_smart_mirrors": 0.9,
+    "prune_completeness_audit": 0.6,
+    "prune_head_only_tracks": 0.8,
+    "prune_low_confidence_tracks": 0.5,
+    "prune_jittery_tracks": 0.5,
+}
 
 # Optional stage polygon definition: List of (x, y) normalized coordinates [0.0, 1.0]
 # e.g., [(0.1, 0.2), (0.9, 0.2), (1.0, 0.9), (0.0, 0.9)]
@@ -1092,15 +1109,58 @@ def prune_mirror_tracks(
     return to_prune
 
 
+def _track_mirror_edge_frame_fraction(
+    all_frame_data_pre: List[Dict[str, Any]],
+    tid: int,
+    frame_width: int,
+    edge_margin_frac: float = EDGE_MARGIN_FRAC,
+) -> Optional[float]:
+    """
+    Among frames where `tid` has a bbox in all_frame_data_pre, fraction of frames whose bbox
+    center lies in the mirror-prone left/right edge strips (same geometry as smart mirror).
+    Returns None if there are no such frames.
+    """
+    if frame_width <= 0:
+        return None
+    margin_px = frame_width * edge_margin_frac
+    left_edge = margin_px
+    right_edge = frame_width - margin_px
+    on_edge = 0
+    total = 0
+    for fd in all_frame_data_pre:
+        tids = fd.get("track_ids") or []
+        boxes = fd.get("boxes") or []
+        if tid not in tids:
+            continue
+        idx = tids.index(tid)
+        if idx >= len(boxes):
+            continue
+        box = boxes[idx]
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2
+        total += 1
+        if cx <= left_edge or cx >= right_edge:
+            on_edge += 1
+    if total == 0:
+        return None
+    return on_edge / total
+
+
 def compute_confirmed_human_set(
     all_frame_data_pre: List[Dict[str, Any]],
     total_frames: int,
     min_torso_conf: float = 0.5,
     min_frame_frac: float = 0.40,
     min_span_frac: float = 0.10,
+    frame_width: int = 0,
+    edge_margin_frac: float = EDGE_MARGIN_FRAC,
+    max_edge_presence_frac: float = 0.20,
 ) -> Set[int]:
     """
-    Tracks with strong torso keypoints on enough frames and sufficient span — exempt from aggressive Phase 7 prunes.
+    Tier A (protected from Tier B voting): strong mean torso conf on enough pose frames,
+    temporal span >= min_span_frac of video (short FP tracks fail), and spatial sanity —
+    not in mirror-prone edge zone on >80% of bbox frames (i.e. edge presence <= 20%).
+    When frame_width <= 0, spatial sanity is skipped (tests / callers without geometry).
     """
     TORSO_KPT_INDICES = (5, 6, 11, 12)
     frame_counts: Dict[int, int] = {}
@@ -1128,8 +1188,16 @@ def compute_confirmed_human_set(
     for tid, total in frame_counts.items():
         span = (last_frame.get(tid, 0) - first_frame.get(tid, 0)) / tf
         conf_frac = confident_counts.get(tid, 0) / max(total, 1)
-        if conf_frac >= min_frame_frac and span >= min_span_frac:
-            confirmed.add(tid)
+        if conf_frac < min_frame_frac or span < min_span_frac:
+            continue
+        if frame_width > 0:
+            edge_frac = _track_mirror_edge_frame_fraction(
+                all_frame_data_pre, tid, frame_width, edge_margin_frac=edge_margin_frac
+            )
+            # Require bbox-backed spatial check; edge in >20% of bbox frames => fail
+            if edge_frac is None or edge_frac > max_edge_presence_frac:
+                continue
+        confirmed.add(tid)
     return confirmed
 
 
@@ -1161,9 +1229,50 @@ def _phase7_should_skip_confirmed(
     return True
 
 
-# Tier C: auto-reject uniformly empty skeleton (complements mean-confidence prune)
+# Tier C: hard auto-reject — no confident skeleton (replaces geometric FP rules for bad poses)
 ULTRA_LOW_SKELETON_MEAN = 0.15
 ULTRA_LOW_SKELETON_FRAME_FRAC = 0.80
+
+
+def _extract_pose_scores_list(pose: Dict) -> List[float]:
+    scores = pose.get("scores")
+    if scores is None and "keypoints" in pose:
+        kp = pose["keypoints"]
+        if hasattr(kp, "shape") and kp.ndim == 2 and kp.shape[1] > 2:
+            scores = kp[:, 2].tolist()
+        elif isinstance(kp, list) and kp and len(kp[0]) > 2:
+            scores = [float(k[2]) for k in kp]
+    if scores is None:
+        return []
+    return [float(s) for s in scores]
+
+
+def is_auto_reject(
+    tid: int,
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    threshold: float = ULTRA_LOW_SKELETON_MEAN,
+    min_frac: float = ULTRA_LOW_SKELETON_FRAME_FRAC,
+) -> bool:
+    """
+    Tier C: True if the track should be auto-rejected — no ViTPose skeleton confidence.
+    Mean keypoint confidence < threshold on >= min_frac of pose frames, or no pose at all.
+    """
+    low_conf_frames = 0
+    total_pose_frames = 0
+    for poses in raw_poses_by_frame:
+        pose = poses.get(tid)
+        if pose is None:
+            continue
+        total_pose_frames += 1
+        scores = _extract_pose_scores_list(pose)
+        if not scores:
+            low_conf_frames += 1
+            continue
+        if (sum(scores) / len(scores)) < threshold:
+            low_conf_frames += 1
+    if total_pose_frames == 0:
+        return True
+    return (low_conf_frames / total_pose_frames) >= min_frac
 
 
 def prune_ultra_low_skeleton_tracks(
@@ -1178,33 +1287,19 @@ def prune_ultra_low_skeleton_tracks(
     frame_height: int = 0,
     total_frames: int = 0,
 ) -> Set[int]:
-    """Prune when mean keypoint confidence is below threshold on most frames (Tier C)."""
-    to_prune: Set[int] = set()
-    for tid in surviving_ids:
-        if _phase7_should_skip_confirmed(
-            tid, confirmed_humans, phase7_prune_log, raw_tracks,
-            "prune_ultra_low_skeleton", frame_width, frame_height, total_frames,
-        ):
-            continue
-        frame_means: List[float] = []
-        for poses in raw_poses_by_frame:
-            if tid not in poses:
-                continue
-            data = poses[tid]
-            scores = data.get("scores")
-            if scores is None and "keypoints" in data:
-                kp = data["keypoints"]
-                if hasattr(kp, "shape") and kp.shape[1] > 2:
-                    scores = kp[:, 2]
-            if scores is None:
-                continue
-            frame_means.append(float(np.mean([float(s) for s in scores])))
-        if not frame_means:
-            continue
-        low_n = sum(1 for m in frame_means if m < mean_thresh)
-        if low_n / len(frame_means) >= min_low_frac:
-            to_prune.add(tid)
-    return to_prune
+    """
+    Tier C: auto-reject from skeleton confidence only. No Tier-A exemption — if there is no
+    confident skeleton, drop the track. Legacy kwargs are ignored.
+    """
+    _ = (
+        confirmed_humans,
+        phase7_prune_log,
+        raw_tracks,
+        frame_width,
+        frame_height,
+        total_frames,
+    )
+    return {tid for tid in surviving_ids if is_auto_reject(tid, raw_poses_by_frame, mean_thresh, min_low_frac)}
 
 
 # V3.4: Sync score pruning — minimum correlation to keep a track
@@ -1290,6 +1385,132 @@ def prune_low_sync_tracks(
     return to_prune
 
 
+def compute_phase7_voting_prune_set(
+    all_frame_data_pre: List[Dict[str, Any]],
+    candidate_ids: Set[int],
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
+    raw_poses_by_frame: List[Dict[int, Dict]],
+    frame_width: int,
+    frame_height: int,
+    total_frames: int,
+    confirmed_humans: Set[int],
+    pruning_weights: Dict[str, float],
+    prune_threshold: float,
+    min_sync_score: float = SYNC_SCORE_MIN,
+    edge_margin_frac: float = EDGE_MARGIN_FRAC,
+    edge_presence_frac: float = EDGE_PRESENCE_FRAC,
+    min_lower_body_conf: float = 0.3,
+    min_mean_conf: float = MEAN_CONFIDENCE_MIN,
+    max_jitter: float = JITTER_RATIO_MAX,
+    phase7_prune_log: Optional[list] = None,
+) -> Tuple[Set[int], Dict[int, Dict[str, Any]]]:
+    """
+    Tier B: run each Phase-7 rule without confirmed-human skips, map hit/miss to 0/1 scores,
+    prune when sum(weight_i * score_i) > prune_threshold. Tier-A tracks are never pruned here.
+    """
+    _no_skip: Dict[str, Any] = {"confirmed_humans": None, "phase7_prune_log": None}
+
+    sync_ids = prune_low_sync_tracks(
+        all_frame_data_pre,
+        candidate_ids,
+        min_sync_score=min_sync_score,
+        raw_tracks=raw_tracks,
+        total_frames=total_frames,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        **_no_skip,
+    )
+    mirror_ids = prune_smart_mirrors(
+        raw_tracks,
+        candidate_ids,
+        raw_poses_by_frame,
+        frame_width,
+        edge_margin_frac=edge_margin_frac,
+        edge_presence_frac=edge_presence_frac,
+        min_lower_body_conf=min_lower_body_conf,
+        frame_height=frame_height,
+        total_frames=total_frames,
+        **_no_skip,
+    )
+    completeness_ids = prune_completeness_audit(
+        raw_tracks,
+        candidate_ids,
+        raw_poses_by_frame,
+        frame_width,
+        frame_height,
+        total_frames=total_frames,
+        **_no_skip,
+    )
+    head_ids = prune_head_only_tracks(
+        raw_tracks,
+        candidate_ids,
+        raw_poses_by_frame,
+        frame_width,
+        frame_height,
+        total_frames=total_frames,
+        **_no_skip,
+    )
+    low_conf_ids = prune_low_confidence_tracks(
+        candidate_ids,
+        raw_poses_by_frame,
+        min_mean_conf=min_mean_conf,
+        raw_tracks=raw_tracks,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        total_frames=total_frames,
+        **_no_skip,
+    )
+    jitter_ids = prune_jittery_tracks(
+        raw_tracks,
+        candidate_ids,
+        raw_poses_by_frame,
+        max_jitter=max_jitter,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        total_frames=total_frames,
+        **_no_skip,
+    )
+
+    rule_sets = {
+        "prune_low_sync_tracks": sync_ids,
+        "prune_smart_mirrors": mirror_ids,
+        "prune_completeness_audit": completeness_ids,
+        "prune_head_only_tracks": head_ids,
+        "prune_low_confidence_tracks": low_conf_ids,
+        "prune_jittery_tracks": jitter_ids,
+    }
+
+    voted: Set[int] = set()
+    telemetry: Dict[int, Dict[str, Any]] = {}
+    for tid in candidate_ids:
+        if tid in confirmed_humans:
+            continue
+        scores_hit = {name: (1.0 if tid in pset else 0.0) for name, pset in rule_sets.items()}
+        wsum = sum(pruning_weights.get(name, 0.0) * v for name, v in scores_hit.items())
+        telemetry[tid] = {
+            "rule_hits": scores_hit,
+            "weighted_sum": round(wsum, 4),
+            "prune_threshold": prune_threshold,
+        }
+        if wsum > prune_threshold:
+            voted.add(tid)
+
+    if phase7_prune_log is not None:
+        for tid in sorted(voted):
+            info = get_pruned_track_info(
+                raw_tracks,
+                tid,
+                "phase7_voting",
+                frame_width,
+                frame_height,
+                total_frames=total_frames,
+            )
+            info["tier_b_vote"] = telemetry.get(tid, {})
+            phase7_prune_log.append(info)
+
+    return voted, telemetry
+
+
 def get_pruned_track_info(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     tid: int,
@@ -1335,6 +1556,13 @@ def get_pruned_track_info(
         "aspect_ratio": round(med_w / med_h, 2) if med_h > 0 else None,
         "decision": decision,
     }
+    if med_w > 0 and med_h > 0:
+        info["bbox_xyxy_median"] = [
+            round(med_cx - med_w / 2, 1),
+            round(med_cy - med_h / 2, 1),
+            round(med_cx + med_w / 2, 1),
+            round(med_cy + med_h / 2, 1),
+        ]
     if total_frames > 0:
         info["frames_in_video_pct"] = round(span / total_frames, 4)
     if threshold is not None:
@@ -1409,8 +1637,11 @@ def raw_tracks_to_per_frame(
     for track_id in surviving_ids:
         if track_id not in raw_tracks:
             continue
-        for frame_idx, box, conf in raw_tracks[track_id]:
-            frame_boxes[frame_idx].append((box, track_id, conf))
+        for entry in raw_tracks[track_id]:
+            obs = coerce_observation(entry)
+            frame_boxes[obs.frame_idx].append(
+                (obs.bbox, track_id, obs.conf, obs.is_sam_refined, obs.segmentation_mask)
+            )
 
     results = []
     for frame_idx in range(total_frames):
@@ -1419,10 +1650,14 @@ def raw_tracks_to_per_frame(
         boxes = [e[0] for e in entries]
         track_ids = [e[1] for e in entries]
         confs = [e[2] for e in entries]
+        is_sam_refined = [e[3] for e in entries]
+        segmentation_masks = [e[4] for e in entries]
         results.append({
             "frame_idx": frame_idx,
             "boxes": boxes,
             "track_ids": track_ids,
             "confs": confs,
+            "is_sam_refined": is_sam_refined,
+            "segmentation_masks": segmentation_masks,
         })
     return results

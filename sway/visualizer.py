@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple
@@ -228,6 +229,119 @@ def draw_frame(
     return out
 
 
+def _track_id_bgr(tid: int) -> Tuple[int, int, int]:
+    """Stable saturated BGR for per-instance overlays (segmentation-style preview)."""
+    hue = (abs(int(tid)) * 47) % 180
+    hsv = np.uint8([[[hue, 210, 255]]])
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+    return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+
+
+def draw_segmentation_style(
+    frame: np.ndarray,
+    boxes: List[tuple],
+    track_ids: List[int],
+    *,
+    is_sam_refined: Optional[List[bool]] = None,
+    segmentation_masks: Optional[List[Optional[np.ndarray]]] = None,
+    alpha: float = 0.45,
+) -> np.ndarray:
+    """
+    Colored pixels only for detections that were hybrid-SAM-refined (is_sam_refined).
+    Uses per-instance SAM mask when present; otherwise a bbox-region fill for that instance.
+    Non-SAM tracks: boxes and ID labels only (no colored fill).
+    """
+    h, w = frame.shape[:2]
+    flags = is_sam_refined if isinstance(is_sam_refined, list) else []
+    masks = segmentation_masks if isinstance(segmentation_masks, list) else []
+    out = frame.astype(np.float32)
+
+    for i, (box, tid) in enumerate(zip(boxes, track_ids)):
+        sam = bool(flags[i]) if i < len(flags) else False
+        if not sam:
+            continue
+        color = np.array(_track_id_bgr(int(tid)), dtype=np.float32)
+        x1, y1, x2, y2 = map(int, box)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = out[y1:y2, x1:x2]
+        bh, bw = y2 - y1, x2 - x1
+        m = masks[i] if i < len(masks) else None
+        if m is not None:
+            mm = np.asarray(m)
+            if mm.dtype == bool:
+                mb = mm
+            else:
+                mb = mm > 0.5
+            if mb.shape[0] != bh or mb.shape[1] != bw:
+                mb = cv2.resize(mb.astype(np.uint8), (bw, bh), interpolation=cv2.INTER_NEAREST).astype(bool)
+            if mb.shape[:2] != roi.shape[:2]:
+                mb = cv2.resize(mb.astype(np.uint8), (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+            roi[mb] = roi[mb] * (1.0 - alpha) + color * alpha
+        else:
+            layer = np.zeros_like(roi)
+            layer[:, :] = color
+            roi[:] = roi * (1.0 - alpha) + layer * alpha
+
+    out_u8 = np.clip(out, 0, 255).astype(np.uint8)
+    return draw_boxes_only(out_u8, boxes, track_ids)
+
+
+def draw_skeleton_only(
+    frame: np.ndarray,
+    _boxes: List[tuple],
+    _track_ids: List[int],
+    poses: Dict[int, Dict],
+    deviations: Optional[Dict[int, Dict[str, float]]] = None,
+    shape_errors: Optional[Dict[int, Dict[str, float]]] = None,
+    timing_errors: Optional[Dict[int, Dict[str, float]]] = None,
+) -> np.ndarray:
+    """Heatmap skeletons + keypoints only (no bounding boxes or ID labels)."""
+    out = frame.copy()
+    for tid, data in poses.items():
+        keypoints = data["keypoints"]
+        scores = data.get("scores", np.ones(17))
+        if keypoints.shape[0] < 17:
+            continue
+        track_deviations = (deviations or {}).get(tid, {})
+        track_shape = (shape_errors or {}).get(tid, {})
+        track_timing = (timing_errors or {}).get(tid, {})
+
+        for (a, b) in COCO_SKELETON_EDGES:
+            if a >= keypoints.shape[0] or b >= keypoints.shape[0]:
+                continue
+            sa = float(scores[a]) if hasattr(scores, "__len__") else float(scores)
+            sb = float(scores[b]) if hasattr(scores, "__len__") else float(scores)
+            if sa < KEYPOINT_THRESHOLD or sb < KEYPOINT_THRESHOLD:
+                continue
+            x1, y1 = int(keypoints[a, 0]), int(keypoints[a, 1])
+            x2, y2 = int(keypoints[b, 0]), int(keypoints[b, 1])
+            edge = (a, b)
+            if edge in EDGE_TO_DEVIATION_KEY:
+                dev_key = EDGE_TO_DEVIATION_KEY[edge]
+                dev = track_deviations.get(dev_key)
+                base = dev_key.replace("_diff", "")
+                shape_key = f"{base}_shape"
+                timing_key = f"{base}_timing"
+                se = track_shape.get(shape_key)
+                te = track_timing.get(timing_key)
+                color = _deviation_to_color(dev, se, te, joint_base=base)
+            else:
+                color = COLOR_OCCLUDED
+            cv2.line(out, (x1, y1), (x2, y2), color, 2)
+
+        for j in range(keypoints.shape[0]):
+            sc = float(scores[j]) if hasattr(scores, "__len__") else float(scores)
+            if sc < KEYPOINT_THRESHOLD:
+                continue
+            x, y = int(keypoints[j, 0]), int(keypoints[j, 1])
+            cv2.circle(out, (x, y), 4, KEYPOINT_COLOR, -1)
+
+    return out
+
+
 def _serialize_angle(val) -> Optional[float]:
     """Convert angle to JSON-safe float. None/NaN -> null."""
     if val is None:
@@ -276,6 +390,9 @@ def _poses_to_serializable(
             entry["timing_errors"] = {
                 k: _serialize_angle(v) for k, v in timing_errors[tid].items()
             }
+        k3 = data.get("keypoints_3d")
+        if k3 is not None:
+            entry["keypoints_3d"] = k3
         out[str(tid)] = entry
     return out
 
@@ -506,6 +623,38 @@ def _interpolate_frame_data(
         elif tid in timing_hi:
             timing_out[tid] = timing_hi[tid]
 
+    def _sam_by_tid(fd: Dict) -> Dict[int, Tuple[bool, Optional[np.ndarray]]]:
+        tids = fd.get("track_ids", [])
+        fl = fd.get("is_sam_refined")
+        ml = fd.get("segmentation_masks")
+        if not isinstance(fl, list):
+            fl = []
+        if not isinstance(ml, list):
+            ml = []
+        m: Dict[int, Tuple[bool, Optional[np.ndarray]]] = {}
+        for ii, tid in enumerate(tids):
+            fb = bool(fl[ii]) if ii < len(fl) else False
+            mk = ml[ii] if ii < len(ml) else None
+            m[int(tid)] = (fb, mk)
+        return m
+
+    sam_lo = _sam_by_tid(fd_lo)
+    sam_hi = _sam_by_tid(fd_hi)
+    pick_hi = t >= 0.5
+    is_sam_out: List[bool] = []
+    seg_masks_out: List[Optional[np.ndarray]] = []
+    for tid in track_ids_out:
+        primary = sam_hi if pick_hi else sam_lo
+        fallback = sam_lo if pick_hi else sam_hi
+        if tid in primary:
+            fb, mk = primary[tid]
+        elif tid in fallback:
+            fb, mk = fallback[tid]
+        else:
+            fb, mk = False, None
+        is_sam_out.append(fb)
+        seg_masks_out.append(mk)
+
     return {
         "boxes": boxes_out,
         "track_ids": track_ids_out,
@@ -513,6 +662,8 @@ def _interpolate_frame_data(
         "deviations": deviations_out,
         "shape_errors": shape_out,
         "timing_errors": timing_out,
+        "is_sam_refined": is_sam_out,
+        "segmentation_masks": seg_masks_out,
     }
 
 
@@ -701,22 +852,20 @@ def render_and_export(
     pruned_overlay: Optional[List[Dict[str, Any]]] = None,
     prune_entries: Optional[List[Dict[str, Any]]] = None,
     dropped_pose_overlay: Optional[List[Dict[str, Any]]] = None,
-) -> None:
+    pose_3d: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     """
-    Write JSON keypoint data and rendered MP4 video.
+    Write JSON keypoint data and rendered MP4 videos.
 
-    JSON and pose data use processed_fps (15 FPS). Output video is at native_fps
+    JSON and pose data use processed_fps (15 FPS). Output videos are at native_fps
     with overlays interpolated from the 15 FPS data.
 
-    Args:
-        video_path: Input video path.
-        all_frame_data: List of {"frame_idx", "frame", "boxes", "track_ids", "poses"} at processed_fps.
-        processed_fps: FPS of pose data (15).
-        native_fps: Original video FPS for output.
-        output_dir: Output directory.
-        pruned_overlay: Optional per-frame list of pruned boxes for review UI (same length as frames).
-        prune_entries: Optional copy of prune diagnostics (track_id, rule, …) for review UI.
-        dropped_pose_overlay: Optional per-frame boxes removed by dedup/sanitize (review UI).
+    Writes the primary ``{stem}_poses.mp4`` plus review variants: track IDs only,
+    skeleton-only heatmap, and SAM-style colored pixels only on hybrid-SAM-refined detections.
+
+    Returns:
+        Map of logical keys to output filenames (under ``output_dir``): full, track_ids,
+        skeleton, segmentation_style. Empty dict if there are no frames to render.
     """
     output_dir = Path(output_dir)
     base_name = video_path.stem
@@ -764,6 +913,8 @@ def render_and_export(
         payload["pruned_overlay"] = pruned_overlay
     if dropped_pose_overlay is not None:
         payload["dropped_pose_overlay"] = dropped_pose_overlay
+    if pose_3d is not None:
+        payload["pose_3d"] = pose_3d
 
     with open(json_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -772,7 +923,7 @@ def render_and_export(
     # Write video at native FPS with interpolated overlays
     if len(all_frame_data) == 0:
         print("  No frames to render.")
-        return
+        return {}
 
     # V3.0: Get dimensions from video (frame may be None in streaming mode)
     cap = cv2.VideoCapture(str(video_path))
@@ -780,11 +931,70 @@ def render_and_export(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     cap.release()
 
-    if video_part_path.exists():
-        video_part_path.unlink()
+    track_ids_path = output_dir / f"{base_name}_track_ids.mp4"
+    track_ids_part = output_dir / f"{base_name}_track_ids.part.mp4"
+    skeleton_path = output_dir / f"{base_name}_skeleton.mp4"
+    skeleton_part = output_dir / f"{base_name}_skeleton.part.mp4"
+    seg_path = output_dir / f"{base_name}_sam_style.mp4"
+    seg_part = output_dir / f"{base_name}_sam_style.part.mp4"
+
+    variant_rows: List[Tuple[str, Path, Path, Any]] = [
+        (
+            "full",
+            video_out_path,
+            video_part_path,
+            lambda fr, itp: draw_frame(
+                fr,
+                itp["boxes"],
+                itp["track_ids"],
+                itp["poses"],
+                deviations=itp.get("deviations"),
+                shape_errors=itp.get("shape_errors"),
+                timing_errors=itp.get("timing_errors"),
+            ),
+        ),
+        (
+            "track_ids",
+            track_ids_path,
+            track_ids_part,
+            lambda fr, itp: draw_boxes_only(fr, itp["boxes"], itp["track_ids"]),
+        ),
+        (
+            "skeleton",
+            skeleton_path,
+            skeleton_part,
+            lambda fr, itp: draw_skeleton_only(
+                fr,
+                itp["boxes"],
+                itp["track_ids"],
+                itp["poses"],
+                deviations=itp.get("deviations"),
+                shape_errors=itp.get("shape_errors"),
+                timing_errors=itp.get("timing_errors"),
+            ),
+        ),
+        (
+            "segmentation_style",
+            seg_path,
+            seg_part,
+            lambda fr, itp: draw_segmentation_style(
+                fr,
+                itp["boxes"],
+                itp["track_ids"],
+                is_sam_refined=itp.get("is_sam_refined"),
+                segmentation_masks=itp.get("segmentation_masks"),
+            ),
+        ),
+    ]
+
+    for _, _, part_p, _ in variant_rows:
+        if part_p.exists():
+            part_p.unlink()
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(video_part_path), fourcc, native_fps, (w, h))
+    writers = [
+        cv2.VideoWriter(str(part_p), fourcc, native_fps, (w, h)) for _, _, part_p, _ in variant_rows
+    ]
     num_processed = len(all_frame_data)
 
     cap = cv2.VideoCapture(str(video_path))
@@ -793,7 +1003,6 @@ def render_and_export(
         ret, frame = cap.read()
         if not ret:
             break
-        # Map original frame index to processed frame position (V3.0: 1:1 at native FPS)
         alpha = orig_idx * processed_fps / native_fps if native_fps > 0 else orig_idx
         idx_lo = max(0, min(int(alpha), num_processed - 1))
         idx_hi = min(idx_lo + 1, num_processed - 1)
@@ -803,29 +1012,94 @@ def render_and_export(
         fd_hi = all_frame_data[idx_hi]
         interp = _interpolate_frame_data(fd_lo, fd_hi, t)
 
-        annotated = draw_frame(
-            frame,
-            interp["boxes"],
-            interp["track_ids"],
-            interp["poses"],
-            deviations=interp.get("deviations"),
-            shape_errors=interp.get("shape_errors"),
-            timing_errors=interp.get("timing_errors"),
-        )
-        writer.write(annotated)
+        for wr, (_, _, _, draw_fn) in zip(writers, variant_rows):
+            wr.write(draw_fn(frame, interp))
         orig_idx += 1
     cap.release()
-    writer.release()
+    for wr in writers:
+        wr.release()
 
-    # Mux audio from source video into output (OpenCV drops audio)
-    _mux_audio(video_path, video_part_path)
+    rel_map: Dict[str, str] = {}
+    for key, final_p, part_p, _ in variant_rows:
+        _mux_audio(video_path, part_p)
+        os.replace(part_p, final_p)
+        rel_map[key] = final_p.name
+        print(f"  Wrote {final_p} @ {native_fps:.1f} FPS")
 
-    os.replace(video_part_path, video_out_path)
-
-    print(f"  Wrote {video_out_path} @ {native_fps:.1f} FPS")
+    return rel_map
 
 
 # ── Montage rendering ─────────────────────────────────────────────────
+
+
+def _reencode_mp4_for_html5_video(path: Path) -> None:
+    """
+    OpenCV mp4v (MPEG-4 Part 2) often plays as a black / empty canvas in Safari
+    and other browsers' <video>. Re-encode to H.264 yuv420p + faststart when ffmpeg exists.
+    """
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return
+    tmp = path.with_suffix(".html5.tmp.mp4")
+    cmd_chains: list[list[str]] = []
+    if sys.platform == "darwin":
+        cmd_chains.append(
+            [
+                ff,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-c:v",
+                "h264_videotoolbox",
+                "-b:v",
+                "8M",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-an",
+                str(tmp),
+            ]
+        )
+    cmd_chains.append(
+        [
+            ff,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-an",
+            str(tmp),
+        ]
+    )
+    for cmd in cmd_chains:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 64:
+                tmp.replace(path)
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
 
 
 def _make_title_card(
@@ -871,37 +1145,57 @@ def render_phase_clip(
     clip_duration: float = 9.0,
     start_frame: int = 0,
     caption: Optional[str] = None,
+    *,
+    full_length: bool = False,
+    show_title_card: bool = False,
 ) -> Path:
     """
-    Render a short clip for one pipeline phase: title card + overlay segment.
+    Render a clip for one pipeline phase (optionally full source length).
 
     Args:
         video_path: Source video.
         frame_data: Per-frame overlay data (boxes, track_ids, poses, etc.).
-        phase_label: Title text, e.g. "Stage 1: Detection".
+        phase_label: Label for logs / optional title card.
         draw_fn: Callable(frame, fd) -> annotated_frame.
         native_fps: Source video FPS.
         processed_fps: FPS of frame_data.
         output_path: Where to write this clip.
-        clip_duration: Seconds of video to include.
-        start_frame: Source video frame to start the clip from.
-        caption: Text shown at top of each clip frame (what this stage shows).
+        clip_duration: Seconds of video (ignored when full_length=True).
+        start_frame: First source frame (ignored when full_length=True; uses 0).
+        caption: Text shown at top of each overlay frame.
+        full_length: If True, encode from frame 0 through end of source (or len(frame_data)).
+        show_title_card: If True, prepend a short title slate (legacy montage-style).
     """
     cap = cv2.VideoCapture(str(video_path))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
     total_source_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    num_fd = len(frame_data)
 
-    clip_frames = int(native_fps * clip_duration)
-    start_frame = min(start_frame, max(0, total_source_frames - clip_frames))
-    end_frame = min(total_source_frames, start_frame + clip_frames)
+    if full_length:
+        start_frame = 0
+        if total_source_frames > 0:
+            end_frame = total_source_frames
+        else:
+            end_frame = max(num_fd, 1)
+        end_frame = max(end_frame, 1)
+    else:
+        clip_frames = max(1, int(native_fps * clip_duration))
+        if total_source_frames > 0:
+            start_frame = min(start_frame, max(0, total_source_frames - clip_frames))
+            end_frame = min(total_source_frames, start_frame + clip_frames)
+        else:
+            start_frame = min(start_frame, max(0, num_fd - clip_frames))
+            end_frame = min(max(num_fd, 1), start_frame + clip_frames)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, native_fps, (w, h))
+    if not writer.isOpened():
+        print(f"    Warning: VideoWriter failed for {output_path.name} (mp4v); phase clip may be empty.")
 
-    # Write title card
-    for card in _make_title_card(phase_label, w, h, native_fps):
-        writer.write(card)
+    if show_title_card:
+        for card in _make_title_card(phase_label, w, h, native_fps):
+            writer.write(card)
 
     # Seek to start
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -933,7 +1227,8 @@ def render_phase_clip(
 
     cap.release()
     writer.release()
-    print(f"    Montage clip: {output_path.name}")
+    _reencode_mp4_for_html5_video(output_path)
+    print(f"    Phase clip: {output_path.name} ({end_frame - start_frame} frames @ {native_fps:.1f} fps)")
     return output_path
 
 

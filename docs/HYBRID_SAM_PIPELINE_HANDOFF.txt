@@ -1,0 +1,154 @@
+================================================================================
+Sway — Hybrid tracking (BoxMOT + SAM2 overlap refiner): design, pipeline place,
+and handoff to downstream phases
+================================================================================
+Last aligned with repo: sway_pose_mvp (tracker + hybrid_sam_refiner + pose + main).
+
+--------------------------------------------------------------------------------
+1. What “hybrid” means here
+--------------------------------------------------------------------------------
+
+Hybrid tracking keeps BoxMOT (DeepOCSORT) as the single source of track IDs and
+association. SAM2 is not a second tracker; it is an optional geometry refiner
+when person detections overlap heavily.
+
+Pipeline per frame (BoxMOT path, default):
+  1) YOLO person detection at configured resolution (default SWAY_DETECT_SIZE,
+     class 0, SWAY_YOLO_CONF).
+  2) DIoU-NMS on boxes → detector output as N×6 float32:
+     [x1, y1, x2, y2, conf, cls] (cls 0 = person). This is the standard det
+     tensor BoxMOT expects.
+  3) If SWAY_HYBRID_SAM_OVERLAP is enabled: compute max pairwise IoU over those
+     boxes. If count ≥ SWAY_HYBRID_SAM_MIN_DETS and max IoU ≥
+     SWAY_HYBRID_SAM_IOU_TRIGGER, run Ultralytics SAM2.1 on the frame with those
+     boxes as prompts, derive tight boxes from instance masks, and replace the
+     xyxy portion of each row before the tracker sees them. Per-detection boolean
+     masks (cropped to the tight box region) are kept in refiner metadata for
+     handoff to tracking observations.
+  4) DeepOcSort.update(dets, frame) → tracked boxes + stable integer track IDs.
+     Hybrid code matches masks to tracker rows (IoU) and stores them on each
+     TrackObservation where applicable.
+
+SAM never assigns or renumbers IDs. Any ID the rest of the pipeline sees comes
+from BoxMOT after (optionally SAM-refined) detections.
+
+--------------------------------------------------------------------------------
+2. Where this sits in the end-to-end pipeline (main.py)
+--------------------------------------------------------------------------------
+
+Full stack (benchmarks, YOLO26l plan, phase map): docs/FINAL_OPTIMIZED_PIPELINE.md
+
+main.py orders work roughly as (see docs/FINAL_OPTIMIZED_PIPELINE.md):
+
+  [1/11]–[2/11] Phase 1–2 — Detection + tracking (single streaming pass):
+        run_tracking_before_post_stitch(video) — YOLO + (optional hybrid SAM) + BoxMOT.
+
+  [3/11] Phase 3 — Post-track stitching:
+        apply_post_track_stitching(...) — dormant, stitch, coalesce, merge (was inside run_tracking).
+
+  [4/11] Pre-pose pruning — surviving_ids mask on raw_tracks.
+
+  [5/11] Pose estimation (ViTPose, etc.)
+        Per-frame dicts from raw_tracks_to_per_frame(...) include boxes,
+        track_ids, confs, is_sam_refined, and segmentation_masks (aligned lists).
+        PoseEstimator.estimate_poses(..., segmentation_masks=...) applies
+        mask-gated expanded crops for SAM-refined observations.
+
+  [6/11]–[11/11] Association, collision cleanup, post-pose prune, smooth, score, export.
+
+So the hybrid phase is contained in “tracking,” but the handoff is no longer
+only “tighter xyxy”: optional per-observation masks and flags travel with the
+same track IDs.
+
+--------------------------------------------------------------------------------
+3. Handoff to the next phase (explicit)
+--------------------------------------------------------------------------------
+
+DELIVERABLE to pre-pose pruning and pose:
+  • raw_tracks: Dict[int, List[TrackObservation | legacy (frame_idx, xyxy, conf)]]
+        Legacy 3-tuples are coerced via coerce_observation() (is_sam_refined=False,
+        segmentation_mask=None).
+  • total_frames, native_fps, frame_width, frame_height
+
+TrackObservation (sway/track_observation.py):
+  • frame_idx: int
+  • bbox: (x1, y1, x2, y2) floats
+  • conf: float
+  • is_sam_refined: bool — True when hybrid SAM produced a mask matched to this
+        detection before BoxMOT.
+  • segmentation_mask: optional bool ndarray, shape ~(H_bbox, W_bbox) aligned to
+        integer-rounded bbox; True = target dancer from SAM.
+
+Per-frame view (after raw_tracks_to_per_frame):
+  • frame_idx, boxes, track_ids, confs — same as before (parallel lists).
+  • is_sam_refined: List[bool] — parallel to boxes.
+  • segmentation_masks: List[Optional[np.ndarray]] — parallel to boxes.
+
+SEMANTICS:
+  • Track IDs are integers from DeepOCSORT (BoxMOT). Hybrid SAM does not create
+    new IDs or merge/split identities by itself; it changes coordinates and may
+    attach a mask to the observation.
+  • On frames where SAM did not run, boxes are pure YOLO+NMS geometry and masks
+    are None.
+  • On frames where SAM ran, boxes are mask-tightened for matched detections;
+    masks are resized to the tracker box when passed to pose.
+
+OBSERVABILITY:
+  • No module-level “last SAM frame indices.” Tools such as
+    scripts/render_hybrid_tracking_video.py derive “run SAM overlay on this frame”
+    from any(per_frame["is_sam_refined"]) after raw_tracks_to_per_frame.
+
+--------------------------------------------------------------------------------
+4. Configuration (env / Pipeline Lab)
+--------------------------------------------------------------------------------
+
+Primary flags:
+  SWAY_HYBRID_SAM_OVERLAP=0          Disable hybrid refiner (default on).
+  SWAY_HYBRID_SAM_IOU_TRIGGER=0.42   Max pairwise IoU threshold (default 0.42 in code).
+  SWAY_HYBRID_SAM_MIN_DETS=2         Minimum person count to evaluate overlap.
+  SWAY_HYBRID_SAM_WEIGHTS=sam2.1_b.pt  Ultralytics SAM checkpoint.
+  SWAY_YOLO_WEIGHTS, SWAY_YOLO_CONF, SWAY_DETECT_SIZE, SWAY_YOLO_DETECTION_STRIDE
+                                     Same as non-hybrid tracking.
+
+Pipeline Lab: schema phase "hybrid_sam" (sway_hybrid_sam_*) binds to these (stage 3 after Detection + Tracking)
+env vars so runs can toggle hybrid without code changes.
+
+--------------------------------------------------------------------------------
+5. Ancillary tooling (not part of core pipeline output)
+--------------------------------------------------------------------------------
+
+scripts/render_hybrid_tracking_video.py
+  Re-runs tracking then encodes a review MP4. Default visual mode “overlap” runs
+  SAM for mask overlay only on frames where at least one observation has
+  is_sam_refined=True (from raw_tracks_to_per_frame), not on every frame. IDs and
+  colors follow BoxMOT track_ids.
+
+sway/sam2_optional.py
+  Placeholder / sketches for optional paths; mask-gated pose is implemented in
+  sway/pose_estimator.py via segmentation_masks.
+
+--------------------------------------------------------------------------------
+6. How we plan to evolve this phase
+--------------------------------------------------------------------------------
+
+Near-term:
+  • Tune SWAY_HYBRID_SAM_IOU_TRIGGER / MIN_DETS from validation (plan targets 0.42;
+    see docs/FINAL_OPTIMIZED_PIPELINE.md) without changing the TrackObservation fields.
+
+Optional next:
+  • Mask-gated appearance / Re-ID crops (BoxMOT feature extractor): feed masked
+    crops instead of raw bbox crops during heavy overlap — not wired by default.
+
+Long-term:
+  • Evaluate whether hybrid SAM cost is justified vs BoxMOT-only; hybrid can stay
+    off by default for production latency.
+
+--------------------------------------------------------------------------------
+7. Summary one-liner
+--------------------------------------------------------------------------------
+
+Hybrid = “SAM tightens overlapping person boxes before BoxMOT, and can attach
+instance masks on those observations”; pose and diagnostics consume
+TrackObservation / per-frame parallel masks without a global SAM frame list.
+
+================================================================================

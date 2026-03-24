@@ -2,8 +2,8 @@
 
 Generated from every text field in each review record (except `updated_at`), plus `metadata`, `track_summaries`, per-frame **`tracks`** counts from `data.json`, and `prune_log.json`.
 
-- Review file: `/Users/arnavchokshi/Desktop/human_review_flight_batch (2).jsonl` (51 videos)
-- Data root: `/Users/arnavchokshi/Desktop/sway_test/sway_pose_mvp/output/flight_batch`
+- Review file: (local export JSONL, e.g. human review export)
+- Data root: `sway_pose_mvp/output/flight_batch` (relative to repo; batch output from `batch_run_for_review.py`)
 
 
 ---

@@ -10,6 +10,10 @@ Example:
   python batch_run_for_review.py --input-dir input --output-root output/review_batch \\
       --pose-model base --skip-existing
 
+Large batch queue (default inbox layout):
+  python batch_run_for_review.py --input-dir data/videos_inbox --output-root output/flight_batch \\
+      --pose-model base --skip-existing
+
 Afterwards open the review UI — for reliable video scrubbing offline, prefer:
   python review_app/serve_review.py output/flight_batch
   → http://127.0.0.1:8899/review/index.html
@@ -137,7 +141,7 @@ def main() -> None:
         "--pose-model",
         choices=["base", "large", "huge"],
         default="base",
-        help="Passed to main.py --pose-model (huge = ViTPose-H; needs VRAM).",
+        help="Passed to main.py --pose-model (default base; use large/huge for accuracy).",
     )
     ap.add_argument(
         "--pose-stride",

@@ -1,6 +1,8 @@
-# Input videos (offline batch)
+# Input videos (short clips / smoke tests)
 
-Drop **all** videos you want to process here (`.mp4`, `.mov`, `.m4v`, `.webm`). They are gitignored so large files stay local.
+Drop **small** videos you want to try here (`.mp4`, `.mov`, `.m4v`, `.webm`). Blobs are gitignored.
+
+For **many** large flight clips, use **`data/videos_inbox/`** instead (see `data/videos_inbox/README.md`).
 
 Then from `sway_pose_mvp/`:
 

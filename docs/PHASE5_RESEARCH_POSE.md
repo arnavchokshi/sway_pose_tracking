@@ -46,10 +46,9 @@ Step-by-step training commands live with the external project; see `scripts/phas
 To reduce **jitter** without Poseidon weights, the pipeline can apply **confidence-weighted smoothing of (x, y)** over ±N frames per track **after** ViTPose and stride interpolation:
 
 ```bash
-python main.py video.mp4 --pose-model huge --temporal-pose-refine --temporal-pose-radius 2
-# or
-export SWAY_TEMPORAL_POSE_REFINE=1
-export SWAY_TEMPORAL_POSE_RADIUS=2
+python main.py video.mp4 --pose-model huge --temporal-pose-radius 2
+# Temporal refine is default on. Disable with --no-temporal-pose-refine or:
+# export SWAY_TEMPORAL_POSE_REFINE=0
 ```
 
 Implementation: `sway/temporal_pose_refine.py`. This is explicitly **not** Poseidon; it is a practical stopgap until a Poseidon (or similar) backend is wired in.

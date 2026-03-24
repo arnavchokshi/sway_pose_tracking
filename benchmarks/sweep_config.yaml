@@ -34,6 +34,7 @@ param_sets:
   # Prune (if ghost, not fragmentation)
   - name: higher_sync_0.12
     params: { SYNC_SCORE_MIN: 0.12 }
+  # Phase 7 Tier B (weighted vote): PRUNE_THRESHOLD, optional per-rule PRUNING_WEIGHTS: { prune_low_sync_tracks: 0.7, ... }
   - name: higher_mean_conf
     params: { MEAN_CONFIDENCE_MIN: 0.50 }
   - name: tighter_spatial

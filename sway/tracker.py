@@ -1,9 +1,13 @@
 """
-Detection & Tracking Module — YOLO11l + BoxMOT Deep OC-SORT by default (V3.4)
+Detection & Tracking Module — YOLO26l + BoxMOT Deep OC-SORT by default (V3.4)
 
-V3.0: Streaming 300-frame chunks, native FPS, YOLO11l conf=0.25.
+Hybrid SAM (default on): SWAY_HYBRID_SAM_OVERLAP=0 disables. When enabled, Ultralytics SAM2 runs on frames where
+person boxes overlap heavily, tightening xyxy before DeepOCSORT (see hybrid_sam_refiner.py).
+
+V3.0: Streaming 300-frame chunks, native FPS; default detector YOLO26l (Core ML yolo11* still used if present).
 V3.3: YOLO runs on every frame for better dancer detection.
 V3.4: Relative stitch radius (0.5x bbox height) + velocity-consistency check.
+YOLO26 weights: pre-track DIoU-NMS is skipped (Ultralytics NMS + classical IoU-NMS at 0.50 only).
 
 Double-Layer Tracking: Base tracker + OKS crossover refinement (see crossover.py)
 handles dense overlaps when IoU > 0.6.
@@ -11,13 +15,21 @@ handles dense overlaps when IoU > 0.6.
 
 import os
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Generator, Set
+from typing import Any, List, Dict, Tuple, Optional, Generator, Set
 
 import cv2
 import numpy as np
 import torch
 from torchvision.ops import box_iou
 from ultralytics import YOLO
+
+from sway.hybrid_sam_refiner import HybridSamRefiner, load_hybrid_sam_config
+from sway.track_observation import (
+    coerce_observation,
+    TrackObservation,
+    assign_sam_masks_to_tracker_output,
+    resize_mask_to_bbox,
+)
 
 # V3.0: Streaming chunk size (10 seconds at 30 FPS)
 CHUNK_SIZE = 300
@@ -42,6 +54,76 @@ STITCH_MAX_PIXEL_RADIUS = 120.0
 STITCH_PREDICTED_RADIUS_FRAC = 0.75
 # Short-gap threshold: gaps this short use generous matching (no velocity check)
 SHORT_GAP_FRAMES = 20
+
+
+def load_tracking_runtime() -> Dict[str, Any]:
+    """
+    Read tracking/detection/stitch overrides from the environment (set per subprocess by Pipeline Lab).
+
+    Defaults match module constants when env is unset.
+    """
+    def _iget(name: str, default: int) -> int:
+        v = os.environ.get(name, "").strip()
+        if not v:
+            return default
+        return int(v)
+
+    def _fget(name: str, default: float) -> float:
+        v = os.environ.get(name, "").strip()
+        if not v:
+            return default
+        return float(v)
+
+    return {
+        "chunk_size": _iget("SWAY_CHUNK_SIZE", CHUNK_SIZE),
+        "detect_size": _iget("SWAY_DETECT_SIZE", DETECT_SIZE),
+        "yolo_conf": _fget("SWAY_YOLO_CONF", YOLO_CONF),
+        "yolo_stride": _iget("SWAY_YOLO_DETECTION_STRIDE", YOLO_DETECTION_STRIDE),
+        "stitch_max_gap": _iget("SWAY_STITCH_MAX_FRAME_GAP", STITCH_MAX_FRAME_GAP),
+        "stitch_radius_bbox_frac": _fget("SWAY_STITCH_RADIUS_BBOX_FRAC", STITCH_RADIUS_BBOX_FRAC),
+        "stitch_max_pixel_radius": _fget("SWAY_STITCH_MAX_PIXEL_RADIUS", STITCH_MAX_PIXEL_RADIUS),
+        "stitch_predicted_radius_frac": _fget(
+            "SWAY_STITCH_PREDICTED_RADIUS_FRAC", STITCH_PREDICTED_RADIUS_FRAC
+        ),
+        "short_gap_frames": _iget("SWAY_SHORT_GAP_FRAMES", SHORT_GAP_FRAMES),
+        "coalescence_iou": _fget("SWAY_COALESCENCE_IOU_THRESH", 0.70),
+        "coalescence_consecutive": _iget("SWAY_COALESCENCE_CONSECUTIVE_FRAMES", 8),
+        "dormant_max_gap": _iget("SWAY_DORMANT_MAX_GAP", 150),
+    }
+
+
+def apply_post_track_stitching(
+    raw_tracks: Dict[int, List[Any]],
+    total_frames: int,
+    *,
+    ystride: Optional[int] = None,
+) -> Dict[int, List[Any]]:
+    """
+    Doc Phase 3 — dormant registry, fragment stitch, coalescence, complementary merge,
+    coexisting merge, stride gap fill. Runs after per-frame detection + tracking (Phases 1–2).
+    """
+    tr = load_tracking_runtime()
+    if ystride is None:
+        ystride = int(tr["yolo_stride"])
+    raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
+    raw_tracks = stitch_fragmented_tracks(
+        raw_tracks,
+        total_frames,
+        max_frame_gap=int(tr["stitch_max_gap"]),
+        radius_bbox_frac=float(tr["stitch_radius_bbox_frac"]),
+        predicted_radius_frac=float(tr["stitch_predicted_radius_frac"]),
+        fallback_radius=float(tr["stitch_max_pixel_radius"]),
+        short_gap_frames=int(tr["short_gap_frames"]),
+    )
+    raw_tracks = coalescence_deduplicate(
+        raw_tracks,
+        iou_thresh=float(tr["coalescence_iou"]),
+        consecutive_frames=int(tr["coalescence_consecutive"]),
+    )
+    raw_tracks = merge_complementary_tracks(raw_tracks)
+    raw_tracks = merge_coexisting_fragments(raw_tracks)
+    _fill_stride_gaps(raw_tracks, ystride)
+    return raw_tracks
 
 
 def _use_boxmot() -> bool:
@@ -88,6 +170,73 @@ def diou_nms_indices(
     return np.array(keep, dtype=np.int64)
 
 
+# Pre-tracker: after DIoU-NMS (when used), drop near-duplicate boxes (high IoU, same person).
+# 0.50 was chosen to suppress duplicate / hallucinated person boxes; 0.90 was too loose.
+_PRETRACK_CLASSICAL_NMS_IOU = 0.50
+
+
+def _pretrack_classical_nms_iou() -> float:
+    v = os.environ.get("SWAY_PRETRACK_NMS_IOU", "").strip()
+    if not v:
+        return float(_PRETRACK_CLASSICAL_NMS_IOU)
+    try:
+        return float(v)
+    except ValueError:
+        return float(_PRETRACK_CLASSICAL_NMS_IOU)
+
+
+def _deepocsort_extra_from_env() -> Dict[str, Any]:
+    """BoxMOT DeepOcSort knobs from env (Pipeline Lab + CLI experiments)."""
+    max_age = 150
+    try:
+        max_age = int(os.environ.get("SWAY_BOXMOT_MAX_AGE", "").strip() or "150")
+    except ValueError:
+        pass
+    iou_thr = 0.3
+    try:
+        iou_thr = float(os.environ.get("SWAY_BOXMOT_MATCH_THRESH", "").strip() or "0.3")
+    except ValueError:
+        pass
+    reid_on = os.environ.get("SWAY_BOXMOT_REID_ON", "").strip().lower() in ("1", "true", "yes")
+    raw_asso = (os.environ.get("SWAY_BOXMOT_ASSOC_METRIC", "iou").strip().lower() or "iou")
+    if raw_asso in ("giou",):
+        asso = "giou"
+    elif raw_asso in ("diou", "ciou"):
+        asso = raw_asso
+    else:
+        asso = "iou"
+    return {
+        "max_age": max_age,
+        "iou_threshold": iou_thr,
+        "embedding_off": not reid_on,
+        "asso_func": asso,
+    }
+
+
+def classical_nms_indices(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_thresh: float = _PRETRACK_CLASSICAL_NMS_IOU,
+) -> np.ndarray:
+    """Score-sorted NMS on plain IoU — suppresses duplicate / hallucinated boxes after YOLO (and after DIoU when used)."""
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=np.int64)
+    device = torch.device("cpu")
+    b = torch.tensor(boxes, dtype=torch.float32, device=device)
+    s = torch.tensor(scores, dtype=torch.float32, device=device)
+    order = torch.argsort(s, descending=True)
+    keep: List[int] = []
+    while order.numel() > 0:
+        i = int(order[0].item())
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        iou = box_iou(b[i : i + 1], b[rest])[0]
+        order = rest[iou < iou_thresh]
+    return np.array(keep, dtype=np.int64)
+
+
 def _resolve_boxmot_reid_weights() -> Path:
     env = os.environ.get("SWAY_BOXMOT_REID_WEIGHTS", "").strip()
     if env:
@@ -111,11 +260,14 @@ def _apply_dormant_and_global(
     total_frames: int,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     from sway.dormant_tracks import apply_dormant_merges
-    from sway.global_track_link import heuristic_global_stitch
+    from sway.global_track_link import maybe_global_stitch
 
-    raw_tracks = apply_dormant_merges(raw_tracks, total_frames)
+    tr_rt = load_tracking_runtime()
+    raw_tracks = apply_dormant_merges(
+        raw_tracks, total_frames, max_gap=int(tr_rt["dormant_max_gap"])
+    )
     if _use_global_link():
-        raw_tracks = heuristic_global_stitch(raw_tracks, total_frames)
+        raw_tracks = maybe_global_stitch(raw_tracks, total_frames)
     return raw_tracks
 
 
@@ -126,28 +278,83 @@ def _env_offline() -> bool:
     return False
 
 
+# Pipeline Lab enum / SWAY_YOLO_WEIGHTS token → Ultralytics hub id or local .pt basename
+# (yolo11* kept for legacy env strings; Lab UI only exposes YOLO26 + optional YOLO11 L/X fallback.)
+_SWAY_YOLO_WEIGHTS_ALIASES: Dict[str, str] = {
+    "yolov11n": "yolo11n.pt",
+    "yolov11s": "yolo11s.pt",
+    "yolov11m": "yolo11m.pt",
+    "yolov11l": "yolo11l.pt",
+    "yolov11x": "yolo11x.pt",
+    "yolo26s": "yolo26s.pt",
+    "yolo26l": "yolo26l.pt",
+    "yolo26x": "yolo26x.pt",
+    "yolo26l_dancetrack": "yolo26l_dancetrack.pt",
+    "yolo26x_dancetrack": "yolo26x_dancetrack.pt",
+}
+
+
 def resolve_yolo_model_path() -> str:
     """
     Path for ultralytics.YOLO(). Prefer on-disk weights so the pipeline can run
     air-gapped after prefetch or manual copy.
-    """
-    env = os.environ.get("SWAY_YOLO_WEIGHTS")
-    if env:
-        p = Path(env).expanduser()
-        if p.is_file():
-            return str(p.resolve())
-        if _env_offline():
-            raise FileNotFoundError(f"SWAY_YOLO_WEIGHTS is set but file not found: {env}")
 
-    # Package lives in sway/; repo root is sway_pose_mvp/
+    If SWAY_YOLO_WEIGHTS is a filesystem path to a .pt, that file wins. If it is a
+    Pipeline Lab enum token (e.g. yolo26l, yolov11x), it maps to a hub .pt name.
+
+    When SWAY_YOLO_WEIGHTS is unset:
+    1) On-disk .pt in models/, repo root, cwd (YOLO26 first, e.g. yolo26l.pt then yolo26l_dancetrack.pt, then YOLO11).
+    2) Core ML yolo11l/yolo11m .mlpackage if present (legacy Apple path).
+    3) Hub fallback yolo26l.pt.
+    """
     repo = Path(__file__).resolve().parent.parent
     models_dir = repo / "models"
+    cwd = Path.cwd()
+    bases = (models_dir, repo, cwd)
+
+    env_raw = os.environ.get("SWAY_YOLO_WEIGHTS")
+    if env_raw:
+        env_s = env_raw.strip()
+        p = Path(env_s).expanduser()
+        if p.is_file():
+            return str(p.resolve())
+        key = env_s.lower()
+        mapped = _SWAY_YOLO_WEIGHTS_ALIASES.get(key)
+        if mapped:
+            basename = Path(mapped).name
+            for base in bases:
+                hit = base / basename
+                if hit.is_file():
+                    return str(hit.resolve())
+            return mapped
+        if _env_offline():
+            raise FileNotFoundError(f"SWAY_YOLO_WEIGHTS is set but file not found: {env_raw}")
+        return env_s
+
+    pt_priority = (
+        "yolo26l.pt",
+        "yolo26l_dancetrack.pt",
+        "yolo11x_dancetrack.pt",
+        "yolo26m.pt",
+        "yolo26x.pt",
+        "yolo26s.pt",
+        "yolo11l.pt",
+        "yolo11m.pt",
+        "yolo11x.pt",
+        "yolo11n.pt",
+        "yolo11x_dancetrack.pt",
+    )
+    for name in pt_priority:
+        for base in bases:
+            p = base / name
+            if p.is_file():
+                return str(p.resolve())
+
     for base in (models_dir, repo):
         for name in ("yolo11l.mlpackage", "yolo11m.mlpackage"):
             p = base / name
             if p.exists():
                 return str(p.resolve())
-    cwd = Path.cwd()
     for c in (
         cwd / "yolo11l.mlpackage",
         cwd / "yolo11m.mlpackage",
@@ -157,22 +364,19 @@ def resolve_yolo_model_path() -> str:
         if c.exists():
             return str(c.resolve())
 
-    candidates = [
-        models_dir / "yolo11m.pt",
-        cwd / "yolo11m.pt",
-        repo / "yolo11m.pt",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return str(c.resolve())
-
     if _env_offline():
         raise FileNotFoundError(
             "Offline mode: no YOLO weights found. While online, run:\n"
             "  python prefetch_models.py\n"
-            "Or place yolo11m.pt in models/ or set SWAY_YOLO_WEIGHTS."
+            "Or place yolo26l.pt in repo or models/, or set SWAY_YOLO_WEIGHTS."
         )
-    return "yolo11m.pt"
+    return "yolo26l.pt"
+
+
+def _yolo26_series_weights(model_path: str) -> bool:
+    """True if resolved weights path or hub id is YOLO26 (l/s/x or fine-tunes with yolo26 in the name)."""
+    s = str(model_path).lower().replace("\\", "/")
+    return "yolo26" in s
 
 
 def _box_center(box: Tuple) -> Tuple[float, float]:
@@ -211,16 +415,25 @@ def _fill_stride_gaps(
     if stride <= 1:
         return
     for tid, entries in list(raw_tracks.items()):
-        sorted_entries = sorted(entries, key=lambda e: e[0])
+        sorted_entries = sorted(entries, key=lambda e: coerce_observation(e).frame_idx)
         new_entries = []
-        for i, (f, box, conf) in enumerate(sorted_entries):
-            new_entries.append((f, box, conf))
+        for i, entry in enumerate(sorted_entries):
+            obs = coerce_observation(entry)
+            f, box = obs.frame_idx, obs.bbox
+            new_entries.append(
+                TrackObservation(
+                    f, tuple(box), float(obs.conf), obs.is_sam_refined, obs.segmentation_mask
+                )
+            )
             if i + 1 < len(sorted_entries):
-                next_f, next_box, _ = sorted_entries[i + 1]
+                next_obs = coerce_observation(sorted_entries[i + 1])
+                next_f, next_box = next_obs.frame_idx, next_obs.bbox
                 for gap_f in range(f + 1, next_f):
                     t = (gap_f - f) / (next_f - f)
                     interp_box = _interpolate_box(box, next_box, t)
-                    new_entries.append((gap_f, interp_box, 0.5))
+                    new_entries.append(
+                        TrackObservation(gap_f, tuple(interp_box), 0.5, False, None)
+                    )
         raw_tracks[tid] = sorted(new_entries, key=lambda e: e[0])
 
 
@@ -238,7 +451,7 @@ def _interpolate_box_sequence(
     for f in range(frame_last + 1, frame_first):
         t = (f - frame_last) / (frame_first - frame_last)
         box = _interpolate_box(box_last, box_first, t)
-        entries.append((f, box, conf))
+        entries.append(TrackObservation(f, tuple(box), float(conf), False, None))
     return entries
 
 
@@ -274,6 +487,7 @@ def stitch_fragmented_tracks(
     predicted_radius_frac: float = STITCH_PREDICTED_RADIUS_FRAC,
     fallback_radius: float = STITCH_MAX_PIXEL_RADIUS,
     max_speed_bbox_frac: float = 0.25,
+    short_gap_frames: int = SHORT_GAP_FRAMES,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     V3.4: Stitch tracks that fragmented due to occlusion. Uses relative stitch
@@ -342,7 +556,7 @@ def stitch_fragmented_tracks(
                     if ratio > 1.6:
                         continue
 
-                short_gap = gap <= SHORT_GAP_FRAMES
+                short_gap = gap <= short_gap_frames
 
                 # Short gaps: generous radius (1x bbox height), no velocity check
                 eff_radius_last = max(h_a, fallback_radius) if (short_gap and h_a > 0) else radius_last
@@ -753,57 +967,95 @@ def _iter_video_chunks(
 
 
 def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
-    Dict[int, List[Tuple[int, Tuple, float]]],
+    Dict[int, List[Any]],
     int,
     float,
     Optional[List[Tuple[int, np.ndarray]]],
     float,
     int,
     int,
+    int,
 ]:
-    """YOLO predict + DIoU-NMS + BoxMOT Deep OC-SORT (default; SWAY_USE_BOXMOT=0 for BoT-SORT)."""
+    """Phases 1–2: YOLO predict + pre-track NMS + BoxMOT Deep OC-SORT (no post-track stitch)."""
     from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
 
     apply_boxmot_kf_unfreeze_guard()
     from boxmot import DeepOcSort
 
+    tr = load_tracking_runtime()
+    yconf = float(tr["yolo_conf"])
+    ystride = int(tr["yolo_stride"])
+    base_detect = int(tr["detect_size"])
+
     model_path = resolve_yolo_model_path()
     print(f"Loading detection model: {model_path} (BoxMOT Deep OC-SORT path)")
+    if _yolo26_series_weights(model_path):
+        print("  Pre-track: DIoU-NMS off for YOLO26 weights (classical IoU-NMS only).")
     model = YOLO(model_path)
+    print("  YOLO weights loaded; building DeepOcSort tracker…", flush=True)
     reid_w = _resolve_boxmot_reid_weights()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _doc_kw = _deepocsort_extra_from_env()
     tracker = DeepOcSort(
         reid_weights=reid_w,
         device=dev,
         half=bool(dev.type == "cuda"),
-        det_thresh=float(YOLO_CONF),
-        max_age=150,
+        det_thresh=yconf,
+        max_age=int(_doc_kw["max_age"]),
         min_hits=2,
-        iou_threshold=0.3,
-        embedding_off=True,
+        iou_threshold=float(_doc_kw["iou_threshold"]),
+        asso_func=str(_doc_kw["asso_func"]),
+        embedding_off=bool(_doc_kw["embedding_off"]),
     )
+    hybrid_cfg = load_hybrid_sam_config()
+    hybrid_refiner: Optional[HybridSamRefiner] = None
+    if hybrid_cfg["enabled"]:
+        hybrid_refiner = HybridSamRefiner(hybrid_cfg)
+        print(
+            f"  Hybrid SAM overlap refiner ON (IoU≥{hybrid_cfg['iou_trigger']}, "
+            f"min_dets={hybrid_cfg['min_dets']}, weights={hybrid_cfg['weights']})",
+            flush=True,
+        )
+    else:
+        print("  Hybrid SAM overlap refiner OFF.", flush=True)
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
     total_frames = 0
     native_fps = 30.0
     frame_width = 1920
     frame_height = 1080
     max_dancers_last_chunk = 0
-    current_detect_size = DETECT_SIZE
+    current_detect_size = base_detect
+    yolo_infer_count = 0
+    if dev.type == "cpu":
+        print(
+            "  Note: CUDA not available — Phases 1–2 (YOLO + DeepOcSort) on CPU can take "
+            "**many minutes** per video with little console output between YOLO steps.",
+            flush=True,
+        )
 
-    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, CHUNK_SIZE):
+    chunk_idx = -1
+    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
+        chunk_idx += 1
+        if chunk_idx == 0:
+            print(
+                f"  Video streaming: first chunk has {len(chunk_frames)} frames "
+                f"(chunk_size={tr['chunk_size']}), ~{nfps:.2f} fps, {w_f}x{h_f}, "
+                f"YOLO stride={ystride}, base detect {base_detect}px.",
+                flush=True,
+            )
         native_fps = nfps
         frame_width = w_f
         frame_height = h_f
         if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
-            current_detect_size = 960
+            current_detect_size = max(base_detect, 960)
         elif max_dancers_last_chunk > 4:
-            current_detect_size = 960
+            current_detect_size = max(base_detect, 960)
         else:
-            current_detect_size = DETECT_SIZE
+            current_detect_size = base_detect
         max_dancers_this_chunk = 0
 
         for frame_idx, frame in chunk_frames:
-            if frame_idx % YOLO_DETECTION_STRIDE != 0:
+            if frame_idx % ystride != 0:
                 continue
             h_fr, w_fr = frame.shape[:2]
             frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
@@ -811,10 +1063,22 @@ def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
             scale_x = w_fr / current_detect_size
             scale_y = h_fr / current_detect_size
 
+            yolo_infer_count += 1
+            if yolo_infer_count == 1:
+                print(
+                    f"  First YOLO inference (frame {frame_idx}, letterbox {current_detect_size})…",
+                    flush=True,
+                )
+            elif yolo_infer_count % 25 == 0:
+                print(
+                    f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}…",
+                    flush=True,
+                )
+
             res = model.predict(
                 frame_low_rgb,
                 classes=[0],
-                conf=YOLO_CONF,
+                conf=yconf,
                 verbose=False,
             )
             r0 = res[0] if isinstance(res, list) else res
@@ -827,68 +1091,104 @@ def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
                 xyxy[:, 1] *= scale_y
                 xyxy[:, 2] *= scale_x
                 xyxy[:, 3] *= scale_y
-                keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
-                xyxy = xyxy[keep]
-                conf = conf[keep]
+                # YOLO26 already applies strong NMS; extra DIoU here removed valid dancers / caused duplicates.
+                if not _yolo26_series_weights(model_path):
+                    diou_keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
+                    xyxy = xyxy[diou_keep]
+                    conf = conf[diou_keep]
+                keep2 = classical_nms_indices(xyxy, conf, iou_thresh=_pretrack_classical_nms_iou())
+                xyxy = xyxy[keep2]
+                conf = conf[keep2]
                 # BoxMOT v16+ expects (x1,y1,x2,y2,conf,cls); class 0 = person
                 cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
                 dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
 
+            if hybrid_refiner is not None:
+                dets, hmeta = hybrid_refiner.refine_person_dets(frame, dets)
+            else:
+                hmeta = {}
+
+            per_det_masks = hmeta.get("per_det_masks")
+            if per_det_masks is None:
+                per_det_masks = [None] * int(len(dets))
+
             out = tracker.update(dets, frame)
             valid_dancers_this_frame = 0
             if out is not None and len(out) > 0:
-                for row in np.atleast_2d(out):
+                out_arr = np.atleast_2d(out)
+                mask_assign = assign_sam_masks_to_tracker_output(dets, out_arr, per_det_masks)
+                for row_idx, row in enumerate(out_arr):
                     x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
                     tid = int(row[4])
-                    cf = float(row[5]) if len(row) > 5 else float(YOLO_CONF)
+                    cf = float(row[5]) if len(row) > 5 else float(yconf)
                     if tid < 0:
                         continue
                     valid_dancers_this_frame += 1
                     box_hr = (x1, y1, x2, y2)
+                    is_sam, msk = mask_assign[row_idx] if row_idx < len(mask_assign) else (False, None)
+                    msk_fit = resize_mask_to_bbox(msk, box_hr) if msk is not None else None
+                    has_mask = msk_fit is not None and bool(np.any(msk_fit))
                     if tid not in raw_tracks:
                         raw_tracks[tid] = []
-                    raw_tracks[tid].append((frame_idx, box_hr, cf))
+                    raw_tracks[tid].append(
+                        TrackObservation(
+                            frame_idx,
+                            box_hr,
+                            cf,
+                            is_sam_refined=bool(is_sam and has_mask),
+                            segmentation_mask=msk_fit if has_mask else None,
+                        )
+                    )
             max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
             if frame_idx == 0 or frame_idx == 30:
-                print(f"  Frame {frame_idx}: {valid_dancers_this_frame} persons (BoxMOT, YOLO {current_detect_size})")
+                extra = ""
+                if hybrid_refiner is not None:
+                    extra = f", maxIoU={hmeta.get('max_iou', 0):.2f}"
+                    if hmeta.get("used_sam"):
+                        extra += " (SAM refined dets)"
+                print(
+                    f"  Frame {frame_idx}: {valid_dancers_this_frame} persons "
+                    f"(BoxMOT, YOLO {current_detect_size}{extra})",
+                    flush=True,
+                )
 
         max_dancers_last_chunk = max_dancers_this_chunk
         total_frames += len(chunk_frames)
         del chunk_frames
 
+    if hybrid_refiner is not None:
+        print(f"  Hybrid SAM summary: {hybrid_refiner.summary()}")
+
     output_fps = native_fps
-    raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
-    raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
-    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.65, consecutive_frames=8)
-    raw_tracks = merge_complementary_tracks(raw_tracks)
-    raw_tracks = merge_coexisting_fragments(raw_tracks)
-    _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
-    return raw_tracks, total_frames, float(output_fps), None, float(native_fps), frame_width, frame_height
+    return (
+        raw_tracks,
+        total_frames,
+        float(output_fps),
+        None,
+        float(native_fps),
+        frame_width,
+        frame_height,
+        int(ystride),
+    )
 
 
-def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, float]]], int, float, Optional[List[Tuple[int, np.ndarray]]], float, int, int]:
-    """
-    V3.0: Run YOLO11l detection + tracking in streaming 300-frame chunks at native FPS.
-
-    - Default tracker: BoxMOT Deep OC-SORT (SWAY_USE_BOXMOT unset). Set SWAY_USE_BOXMOT=0 for Ultralytics BoT-SORT.
-    - Reads video in 300-frame chunks to avoid full RAM load
-    - Processes every frame (native FPS, no decimation)
-    - YOLO11l at 640x640, conf=0.22
-    - BoT-SORT path: track_buffer=90 (3s at 30 FPS)
-    - Wave 1 box stitch within 90 frames
-
-    Returns:
-        Tuple of:
-        - raw_tracks: Dict[track_id, List[(frame_idx, (x1,y1,x2,y2), conf), ...]]
-        - total_frames: Number of processed frames
-        - output_fps: Native FPS (for downstream logic)
-        - frames_list: None (V3.0 streaming — caller re-reads video for pose phase)
-        - native_fps: Original video FPS
-        - frame_width: Video width
-        - frame_height: Video height
-    """
-    if _use_boxmot():
-        return _run_tracking_boxmot_diou(video_path)
+def _run_tracking_botsort_pre_stitch(
+    video_path: str,
+) -> Tuple[
+    Dict[int, List[Any]],
+    int,
+    float,
+    Optional[List[Tuple[int, np.ndarray]]],
+    float,
+    int,
+    int,
+    int,
+]:
+    """Phases 1–2: YOLO track() + BoT-SORT (no post-track stitch)."""
+    tr = load_tracking_runtime()
+    yconf = float(tr["yolo_conf"])
+    ystride = int(tr["yolo_stride"])
+    base_detect = int(tr["detect_size"])
 
     model_path = resolve_yolo_model_path()
     print(f"Loading detection model: {model_path}")
@@ -901,28 +1201,25 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
 
     tracker_cfg = _get_tracker_config()
 
-    # Dynamic resolution scaling initialization
     max_dancers_last_chunk = 0
-    current_detect_size = DETECT_SIZE
+    current_detect_size = base_detect
 
-    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, CHUNK_SIZE):
+    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
         native_fps = nfps
         frame_width = w_f
         frame_height = h_f
 
-        # Adjust detection size: group videos (env) or previous-chunk crowd density
         if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
-            current_detect_size = 960
+            current_detect_size = max(base_detect, 960)
         elif max_dancers_last_chunk > 4:
-            current_detect_size = 960
-            # print(f"  [Dynamic Scaling] Crowd detected. Up-scaling YOLO resolution to {current_detect_size}x{current_detect_size}")
+            current_detect_size = max(base_detect, 960)
         else:
-            current_detect_size = DETECT_SIZE
+            current_detect_size = base_detect
 
         max_dancers_this_chunk = 0
 
         for frame_idx, frame in chunk_frames:
-            if frame_idx % YOLO_DETECTION_STRIDE != 0:
+            if frame_idx % ystride != 0:
                 continue
             h_fr, w_fr = frame.shape[:2]
             frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
@@ -930,13 +1227,11 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
             scale_x = w_fr / current_detect_size
             scale_y = h_fr / current_detect_size
 
-            # V3.8: Lower NMS IoU (0.5) to suppress duplicate detections for same dancer.
-            # IoU < 0.5 = more aggressive NMS; overlaps > 50% get suppressed (keeps higher-conf).
             result = model.track(
                 frame_low_rgb,
                 tracker=tracker_cfg,
                 classes=[0],
-                conf=YOLO_CONF,
+                conf=yconf,
                 iou=0.5,
                 persist=True,
                 verbose=False,
@@ -959,8 +1254,10 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
                 )
                 if tid not in raw_tracks:
                     raw_tracks[tid] = []
-                raw_tracks[tid].append((frame_idx, box_hr, conf))
-            
+                raw_tracks[tid].append(
+                    TrackObservation(frame_idx, box_hr, float(conf), False, None)
+                )
+
             max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
 
             if frame_idx == 0 or frame_idx == 30:
@@ -968,30 +1265,55 @@ def run_tracking(video_path: str) -> Tuple[Dict[int, List[Tuple[int, Tuple, floa
                 print(f"  Frame {frame_idx}: {n} persons (YOLO resol: {current_detect_size})")
 
         max_dancers_last_chunk = max_dancers_this_chunk
-
         total_frames += len(chunk_frames)
         del chunk_frames
 
     output_fps = native_fps
+    return (
+        raw_tracks,
+        total_frames,
+        float(output_fps),
+        None,
+        float(native_fps),
+        frame_width,
+        frame_height,
+        int(ystride),
+    )
 
-    raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
-    # Post-tracking: stitch fragments from occlusion drop-outs
-    raw_tracks = stitch_fragmented_tracks(raw_tracks, total_frames)
-    
-    # Wave 1.5: Coexistence deduplication — catch true ghost duplicates (same person, two IDs)
-    # V3.9: Relaxed from 0.40/2 — was killing real overlapping dancers (front person, red/blue on right)
-    # IoU 0.65, 8 consecutive = strong overlap for sustained period; avoids formations with brief overlap
-    raw_tracks = coalescence_deduplicate(raw_tracks, iou_thresh=0.65, consecutive_frames=8)
 
-    # Wave 1.6: Merge complementary tracks (same person, alternating IDs, zero overlap)
-    raw_tracks = merge_complementary_tracks(raw_tracks)
+def run_tracking_before_post_stitch(
+    video_path: str,
+) -> Tuple[
+    Dict[int, List[Any]],
+    int,
+    float,
+    Optional[List[Tuple[int, np.ndarray]]],
+    float,
+    int,
+    int,
+    int,
+]:
+    """Phases 1–2 only: streaming YOLO + tracker; caller runs apply_post_track_stitching for Phase 3."""
+    if _use_boxmot():
+        return _run_tracking_boxmot_diou(video_path)
+    return _run_tracking_botsort_pre_stitch(video_path)
 
-    # Wave 1.7: Merge coexisting fragments (same person, two IDs, spatially close — e.g. ID 51 above ID 2)
-    raw_tracks = merge_coexisting_fragments(raw_tracks)
 
-    _fill_stride_gaps(raw_tracks, YOLO_DETECTION_STRIDE)
+def run_tracking(
+    video_path: str,
+) -> Tuple[Dict[int, List[Any]], int, float, Optional[List[Tuple[int, np.ndarray]]], float, int, int]:
+    """
+    Phases 1–3 in one call: run_tracking_before_post_stitch + apply_post_track_stitching.
 
-    return raw_tracks, total_frames, float(output_fps), None, float(native_fps), frame_width, frame_height
+    - Default tracker: BoxMOT Deep OC-SORT (SWAY_USE_BOXMOT unset). Set SWAY_USE_BOXMOT=0 for Ultralytics BoT-SORT.
+    - Streaming 300-frame chunks; native FPS (stride via SWAY_YOLO_DETECTION_STRIDE).
+
+    Returns:
+        raw_tracks, total_frames, output_fps, frames_list (None), native_fps, frame_width, frame_height
+    """
+    raw, tf, ofps, fl, nf, fw, fh, ys = run_tracking_before_post_stitch(video_path)
+    raw = apply_post_track_stitching(raw, tf, ystride=ys)
+    return raw, tf, ofps, fl, nf, fw, fh
 
 
 def iter_video_frames(video_path: str) -> Generator[Tuple[int, np.ndarray], None, None]:

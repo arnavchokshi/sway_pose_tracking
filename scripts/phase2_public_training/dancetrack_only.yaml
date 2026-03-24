@@ -1,5 +1,5 @@
 # DanceTrack only — use when CrowdHuman is not on disk yet.
-# Run from sway_pose_mvp/:  python scripts/phase2_public_training/train_yolo11x.py --phase dancetrack
+# Run from sway_pose_mvp/:  python scripts/phase2_public_training/train_yolo26l.py --phase dancetrack
 
 path: .
 

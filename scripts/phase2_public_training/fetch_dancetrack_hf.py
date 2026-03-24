@@ -132,19 +132,19 @@ def main() -> int:
             if extract.exists():
                 shutil.rmtree(extract)
             extract.mkdir(parents=True)
-            print(f"Unzipping {zname} …")
+            print(f"Unzipping {zname} …", flush=True)
             _unzip(zpath, extract)
             for seq in _find_sequence_dirs(extract):
                 if _copy_sequence(seq, out_train, args.overwrite):
                     copied_train += 1
-                    print(f"  train ← {seq.name}")
+                    print(f"  train ← {seq.name}", flush=True)
                 else:
                     skipped_train += 1
-                    print(f"  skip (exists) train/{seq.name}")
+                    print(f"  skip (exists) train/{seq.name}", flush=True)
             shutil.rmtree(extract)
             if prune_zips and zpath.is_file():
                 zpath.unlink()
-                print(f"  removed {zname}")
+                print(f"  removed {zname}", flush=True)
 
         for zname in ZIPS_VAL:
             zpath = cache_dir / zname
@@ -153,27 +153,27 @@ def main() -> int:
             if extract.exists():
                 shutil.rmtree(extract)
             extract.mkdir(parents=True)
-            print(f"Unzipping {zname} …")
+            print(f"Unzipping {zname} …", flush=True)
             _unzip(zpath, extract)
             for seq in _find_sequence_dirs(extract):
                 if _copy_sequence(seq, out_val, args.overwrite):
                     copied_val += 1
-                    print(f"  val ← {seq.name}")
+                    print(f"  val ← {seq.name}", flush=True)
                 else:
                     skipped_val += 1
-                    print(f"  skip (exists) val/{seq.name}")
+                    print(f"  skip (exists) val/{seq.name}", flush=True)
             shutil.rmtree(extract)
             if prune_zips and zpath.is_file():
                 zpath.unlink()
-                print(f"  removed {zname}")
+                print(f"  removed {zname}", flush=True)
     finally:
         if extract.exists():
             shutil.rmtree(extract, ignore_errors=True)
 
-    print("\nDone.")
-    print(f"  train: {out_train}  (copied {copied_train}, skipped {skipped_train})")
-    print(f"  val:   {out_val}    (copied {copied_val}, skipped {skipped_val})")
-    print("Next: python scripts/phase2_public_training/download_datasets.py")
+    print("\nDone.", flush=True)
+    print(f"  train: {out_train}  (copied {copied_train}, skipped {skipped_train})", flush=True)
+    print(f"  val:   {out_val}    (copied {copied_val}, skipped {skipped_val})", flush=True)
+    print("Next: python scripts/phase2_public_training/download_datasets.py", flush=True)
     return 0
 
 

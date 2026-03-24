@@ -12,15 +12,21 @@ from sway.track_pruning import compute_confirmed_human_set  # noqa: E402
 
 def test_confirmed_human_set():
     scores = np.ones(17, dtype=np.float32) * 0.9
+    # Bbox center in-frame (not mirror edge) so Tier A spatial sanity passes with frame_width set
+    box = (500.0, 100.0, 600.0, 400.0)
     fd0 = {
         "frame_idx": 0,
+        "track_ids": [1],
+        "boxes": [box],
         "poses": {1: {"scores": scores}},
     }
     fd1 = {
         "frame_idx": 50,
+        "track_ids": [1],
+        "boxes": [box],
         "poses": {1: {"scores": scores}},
     }
-    conf = compute_confirmed_human_set([fd0, fd1], total_frames=100)
+    conf = compute_confirmed_human_set([fd0, fd1], total_frames=100, frame_width=1920)
     assert 1 in conf
 
 

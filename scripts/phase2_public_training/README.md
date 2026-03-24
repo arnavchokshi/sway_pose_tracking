@@ -1,8 +1,8 @@
-# Phase 2: YOLO11x Fine-Tune on DanceTrack + CrowdHuman
+# Phase 2: YOLO26l Fine-Tune on DanceTrack + CrowdHuman
 
 ## What this does
 
-Fine-tunes YOLO11x on dance-domain person detection data so it correctly detects dancers in extreme poses (splits, inversions, floor routines) and dense formations that COCO-pretrained models miss.
+Fine-tunes YOLO26l on dance-domain person detection data so it correctly detects dancers in extreme poses (splits, inversions, floor routines) and dense formations that COCO-pretrained models miss.
 
 ## What you need to do manually (cannot be automated)
 
@@ -55,16 +55,16 @@ python scripts/phase2_public_training/convert_dancetrack_to_yolo.py
 python scripts/phase2_public_training/convert_crowdhuman_to_yolo.py
 
 # 2. Run training
-python scripts/phase2_public_training/train_yolo11x.py
+python scripts/phase2_public_training/train_yolo26l.py
 
 # 3. Copy best checkpoint
-cp runs/detect/yolo11x_dancetrack/weights/best.pt models/yolo11x_dancetrack.pt
+cp runs/detect/yolo26l_dancetrack/weights/best.pt models/yolo26l_dancetrack.pt
 
 # 4. Validate improvement
 python scripts/phase2_public_training/validate_trained_model.py
 
 # 5. Use in pipeline
-export SWAY_YOLO_WEIGHTS=models/yolo11x_dancetrack.pt
+export SWAY_YOLO_WEIGHTS=models/yolo26l_dancetrack.pt
 python main.py --video your_video.mp4
 ```
 
@@ -83,4 +83,4 @@ Use OpenMMLab MMPose training configs on **COCO** keypoints (auto-downloaded by 
 
 ## AFLink (neural)
 
-Full **AFLink** (`StrongSORT/AFLink`) expects CUDA and `newmodel_epoch20.pth`. This repo uses `SWAY_GLOBAL_LINK=1` for a lightweight appearance-free stitch in `sway/global_track_link.py` by default.
+With `SWAY_GLOBAL_LINK=1`, **StrongSORT AFLink** runs when `models/AFLink_epoch20.pth` is present (or `SWAY_AFLINK_WEIGHTS` is set); see StrongSORT [data prep](https://github.com/dyhBUPT/StrongSORT#datamodel-preparation). Otherwise `sway/global_track_link.py` falls back to the heuristic stitch. Set `SWAY_GLOBAL_AFLINK=0` to force the heuristic even if weights exist.

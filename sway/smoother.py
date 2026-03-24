@@ -6,7 +6,7 @@ V3.0: Suspended when keypoint confidence < 0.3 to prevent smoothing hallucinated
 """
 
 import math
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 
 def _smoothing_factor(t_e: float, cutoff: float) -> float:
@@ -179,5 +179,9 @@ class PoseSmoother:
                 if keypoints.shape[1] > 2:
                     smoothed_kpts[j, 2] = keypoints[j, 2]
 
-            result[track_id] = {"keypoints": smoothed_kpts, "scores": scores}
+            entry: Dict[str, Any] = {"keypoints": smoothed_kpts, "scores": scores}
+            for extra in ("keypoints_3d", "lift_xyz"):
+                if extra in data:
+                    entry[extra] = data[extra]
+            result[track_id] = entry
         return result

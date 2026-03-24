@@ -1,10 +1,12 @@
 # Model weights
 
-Put YOLO assets here so the project root stays clean:
+Keep all downloadable checkpoints here so the package root stays clean:
 
-- **Core ML:** `yolo11l.mlpackage` or `yolo11m.mlpackage` (preferred on Apple Silicon when present)
-- **PyTorch:** `yolo11m.pt` (default for `prefetch_models.py` and offline fallback)
+- **YOLO (PyTorch):** `yolo26l.pt` (default for `prefetch_models.py` and hub fallback), plus any other `yolo*.pt` you use
+- **Hybrid SAM2:** `sam2.1_b.pt` (default for `SWAY_HYBRID_SAM_WEIGHTS` / overlap refiner; resolved from `models/` automatically)
+- **Core ML (legacy):** `yolo11l.mlpackage` or `yolo11m.mlpackage` when no `.pt` is found
+- **BoxMOT Re-ID:** `osnet_x0_25_msmt17.pt` (from `prefetch_models.py`)
 
-Optional extra `.pt` sizes (`yolo11l.pt`, etc.) can live here; point `SWAY_YOLO_WEIGHTS` at the file you want if it is not the default.
+Point `SWAY_YOLO_WEIGHTS` or `SWAY_HYBRID_SAM_WEIGHTS` at a specific file if the default priority is not what you want.
 
 ViTPose weights are cached by Hugging Face (see main README, Offline).

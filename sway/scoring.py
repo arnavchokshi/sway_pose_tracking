@@ -14,9 +14,11 @@ import numpy as np
 from scipy.stats import circmean
 from scipy.signal import correlate
 
+from .pose_lift_3d import compute_joint_angles_3d
 from .kinematics import (
     JOINT_NAMES,
     compute_joint_angles_vectorized,
+    compute_joint_angles_vectorized_3d,
 )
 
 # Confidence threshold for occlusion / low-quality keypoints
@@ -75,6 +77,34 @@ def _build_keypoints_array(
             kpts_arr[f, t_idx, :, :] = kpts[:17, :]
 
     return kpts_arr, tid_to_idx, track_ids_per_frame
+
+
+def _build_lift_xyz_array(
+    all_frame_data: List[Dict],
+    tid_to_idx: Dict[int, int],
+    num_frames: int,
+    num_tracks: int,
+) -> np.ndarray:
+    """Model-space 3D joints from pose['lift_xyz'], shape (F, T, 17, 3)."""
+    arr = np.full((num_frames, num_tracks, 17, 3), np.nan, dtype=np.float64)
+    for f in range(num_frames):
+        fd = all_frame_data[f]
+        poses = fd.get("poses", {})
+        for tid in fd.get("track_ids", []):
+            if tid not in tid_to_idx:
+                continue
+            t_idx = tid_to_idx[tid]
+            pose = poses.get(tid)
+            if not pose:
+                continue
+            lx = pose.get("lift_xyz")
+            if lx is None:
+                continue
+            a = np.asarray(lx, dtype=np.float64)
+            if a.shape[0] < 17 or a.shape[1] < 3:
+                continue
+            arr[f, t_idx, :, :] = a[:17, :3]
+    return arr
 
 
 def _rolling_median_1d(arr: np.ndarray, window: int = CONSENSUS_ROLLING_WINDOW) -> np.ndarray:
@@ -190,7 +220,11 @@ def process_all_frames_scoring_vectorized(
     kpts_arr, tid_to_idx, track_ids_per_frame = _build_keypoints_array(all_frame_data)
     num_frames, num_tracks, _, _ = kpts_arr.shape
 
-    angles = compute_joint_angles_vectorized(kpts_arr, confidence_threshold=CONFIDENCE_THRESHOLD)
+    lift_xyz = _build_lift_xyz_array(all_frame_data, tid_to_idx, num_frames, num_tracks)
+    angles_2d = compute_joint_angles_vectorized(kpts_arr, confidence_threshold=CONFIDENCE_THRESHOLD)
+    scores = kpts_arr[:, :, :, 2]
+    angles_3d = compute_joint_angles_vectorized_3d(lift_xyz, scores, confidence_threshold=CONFIDENCE_THRESHOLD)
+    angles = np.where(np.isfinite(angles_3d), angles_3d, angles_2d)
     group_truth = _compute_group_truth(angles)
 
     # V3.0 Ripple: std > 30° → deviations = NaN (not 0)

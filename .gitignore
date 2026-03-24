@@ -3,6 +3,10 @@ input/*
 !input/README.md
 !input/.gitkeep
 
+# Large batch queue (same idea as input/)
+data/videos_inbox/*
+!data/videos_inbox/README.md
+
 # DanceTrack HF cache / temp extract (large; local only)
 dancetrack_hf/
 .dancetrack_extract_tmp/
@@ -23,6 +27,14 @@ output/
 *.mp4
 *.mov
 *.json
+# Allow JS/TS toolchain manifests (parent *.json rule would hide them)
+!**/package.json
+!**/package-lock.json
+!**/tsconfig.json
+!**/tsconfig.*.json
+
+# Pipeline Lab queued runs (local only)
+pipeline_lab/runs/
 
 # Model weights (folder layout tracked; blobs stay local)
 models/*

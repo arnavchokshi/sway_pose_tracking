@@ -1,16 +1,20 @@
 """
 Sway Pose Tracking V3.4 — Main Orchestrator
 
-Production-ready, M2-optimized pipeline:
-  1. Streaming ingestion & detection (YOLO every frame)
-  2. High-tenacity tracking & box stitch (track_buffer=90, relative radius)
-  3. Resolution-aware box pruning (duration, kinetic, spatial outlier, traversal, bbox size, mirrors)
-  4. High-fidelity pose (ViTPose, fp16 MPS) with visibility scoring
-  5. Keypoint collision dedup (remove duplicate pose overlays)
-  6. Skeleton re-association (OKS stitch, hybrid CVM crossover)
-  7. Post-pose sync pruning + smart mirror pruning
-  8. Temporal smoothing (1 Euro, conf<0.3 guard)
-  9. Spatio-temporal scoring & export
+Canonical plan: docs/FINAL_OPTIMIZED_PIPELINE.md
+
+Pipeline order (prints [1/11]…[11/11]) matches doc Phases 1–10 plus export:
+  [1/11]–[2/11]  Phase 1 Detection + Phase 2 Tracking (one streaming pass)
+  [3/11]  Phase 3 Post-track stitching (dormant, stitch, coalesce, merge)
+  [4/11]  Phase 4 Pre-pose pruning
+  [5/11]  Phase 5 Pose (ViTPose)
+  [6/11]  Phase 6 Association (occlusion re-ID, crossover, acceleration audit)
+  [7/11]  Phase 7 Collision cleanup (keypoint dedup, bbox sanitize)
+  [8/11]  Phase 8 Post-pose pruning (Tier A/B/C)
+  [9/11]  Phase 9 Temporal smoothing (1 Euro)
+  [10/11] Phase 10 Spatio-temporal scoring
+  [11/11] Export & visualization
+Hybrid SAM handoff: docs/HYBRID_SAM_PIPELINE_HANDOFF.txt
 """
 # Suppress protobuf/onnx MessageFactory GetPrototype noise (non-fatal)
 import sys
@@ -44,6 +48,7 @@ sys.stderr = _FilterStderr(sys.stderr)
 warnings.filterwarnings("ignore", message=".*GetPrototype.*")
 
 import json
+import logging
 import os
 import sys
 import warnings
@@ -55,7 +60,11 @@ import cv2
 import numpy as np
 import torch
 
-from sway.tracker import run_tracking, iter_video_frames
+from sway.tracker import (
+    apply_post_track_stitching,
+    iter_video_frames,
+    run_tracking_before_post_stitch,
+)
 from sway.track_pruning import (
     prune_tracks,
     prune_geometric_mirrors,
@@ -65,15 +74,12 @@ from sway.track_pruning import (
     prune_late_entrant_short_span,
     prune_bbox_size_outliers,
     prune_bad_aspect_ratio,
-    prune_smart_mirrors,
-    prune_low_sync_tracks,
-    prune_low_confidence_tracks,
-    prune_jittery_tracks,
-    prune_completeness_audit,
-    prune_head_only_tracks,
     prune_ultra_low_skeleton_tracks,
     prune_by_stage_polygon,
     compute_confirmed_human_set,
+    compute_phase7_voting_prune_set,
+    PRUNING_WEIGHTS,
+    PRUNE_THRESHOLD,
     log_pruned_tracks,
     raw_tracks_to_per_frame,
 )
@@ -105,6 +111,32 @@ from sway.visualizer import (
     draw_frame_with_boxes,
     draw_frame,
 )
+
+
+def _apply_stack_default_env() -> None:
+    """
+    Production stack defaults for group-dance runs. Unset is OK: setdefault only fills missing keys.
+    Override with env or params YAML (SWAY_* applied after this).
+    """
+    os.environ.setdefault("SWAY_GROUP_VIDEO", "1")
+    os.environ.setdefault("SWAY_GLOBAL_LINK", "1")
+
+
+def _ensure_collision_cleanup_logging() -> None:
+    """
+    Collision cleanup mutates poses without prune_log for limb keypoint zeros.
+    Emit sway.crossover INFO on stderr during the pipeline (root logger defaults to WARNING).
+    """
+    log = logging.getLogger("sway.crossover")
+    if getattr(log, "_sway_pipeline_collision_handler", None) is not None:
+        return
+    h = logging.StreamHandler(sys.stderr)
+    h.setLevel(logging.INFO)
+    h.setFormatter(logging.Formatter("  [collision] %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    log._sway_pipeline_collision_handler = h  # type: ignore[attr-defined]
 
 
 def _interpolate_pose_gaps(
@@ -169,6 +201,40 @@ def get_device() -> torch.device:
 _LAB_CTX: Optional[Dict[str, Any]] = None
 
 
+def _lab_track_summary_heuristic(raw_tracks: Dict[int, List[Any]], ystride: int) -> Dict[str, Any]:
+    """Cheap post-stitch stats for the Lab (no ground truth — not TrackEval IDF1/HOTA)."""
+    from sway.track_observation import coerce_observation
+
+    if not raw_tracks:
+        return {
+            "track_count": 0,
+            "median_track_observations": 0.0,
+            "mean_track_observations": 0.0,
+            "internal_timeline_jumps": 0,
+            "note": "IDF1, IDSW, HOTA require MOT ground truth (see benchmark_trackeval.py).",
+        }
+    lens: List[int] = []
+    jumps = 0
+    ys = max(1, int(ystride))
+    thresh = max(ys * 3, 5)
+    for _tid, entries in raw_tracks.items():
+        if not entries:
+            continue
+        frames = sorted({int(coerce_observation(e).frame_idx) for e in entries})
+        lens.append(len(frames))
+        for i in range(1, len(frames)):
+            if frames[i] - frames[i - 1] > thresh:
+                jumps += 1
+    arr = np.asarray(lens, dtype=np.float64)
+    return {
+        "track_count": int(len(raw_tracks)),
+        "median_track_observations": float(np.median(arr)) if arr.size else 0.0,
+        "mean_track_observations": float(np.mean(arr)) if arr.size else 0.0,
+        "internal_timeline_jumps": int(jumps),
+        "note": "IDF1, IDSW, HOTA require MOT ground truth (see benchmark_trackeval.py).",
+    }
+
+
 def _lab_init(
     *,
     progress_jsonl: Optional[str],
@@ -179,13 +245,31 @@ def _lab_init(
     if not progress_jsonl and not run_manifest_path:
         _LAB_CTX = None
         return
+    import time
     from pathlib import Path as P
     _LAB_CTX = {
         "progress_jsonl": progress_jsonl,
         "run_manifest_path": P(run_manifest_path) if run_manifest_path else None,
         "previews": [],
         "stage_log": [],
+        "perf_t0": time.perf_counter(),
+        "run_context": {},
     }
+
+
+def _lab_update_context(**kwargs: Any) -> None:
+    """Merge key/value run metadata into progress JSONL lines and final manifest."""
+    if _LAB_CTX is None:
+        return
+    ctx = _LAB_CTX.setdefault("run_context", {})
+    for k, v in kwargs.items():
+        if v is not None:
+            if isinstance(v, float):
+                ctx[k] = round(v, 6) if abs(v) < 1e10 else v
+            elif isinstance(v, (list, dict)) and len(str(v)) > 2000:
+                ctx[k] = f"<omitted len={len(v)}>"
+            else:
+                ctx[k] = v
 
 
 def _lab_progress(
@@ -196,14 +280,15 @@ def _lab_progress(
     status: str = "done",
     preview_relpath: Optional[str] = None,
     elapsed_s: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     if _LAB_CTX is None:
         return
-    if not _LAB_CTX.get("progress_jsonl"):
-        return
     import time
-    payload = {
+    cumulative = time.perf_counter() - float(_LAB_CTX["perf_t0"])
+    payload: Dict[str, Any] = {
         "ts": time.time(),
+        "cumulative_elapsed_s": round(cumulative, 3),
         "stage": stage,
         "stage_key": stage_key,
         "label": label,
@@ -213,15 +298,38 @@ def _lab_progress(
         payload["preview_relpath"] = preview_relpath
     if elapsed_s is not None:
         payload["elapsed_s"] = round(elapsed_s, 3)
-    _LAB_CTX.setdefault("stage_log", []).append(payload)
-    with open(_LAB_CTX["progress_jsonl"], "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
+    rc = _LAB_CTX.get("run_context") or {}
+    if rc:
+        payload["meta"] = dict(rc)
+    if extra:
+        payload["extra"] = extra
+    # Heartbeats (status=running) go to progress.jsonl only — avoid bloating manifest stage_log.
+    if status != "running":
+        _LAB_CTX.setdefault("stage_log", []).append(payload)
+    pj = _LAB_CTX.get("progress_jsonl")
+    if pj:
+        with open(pj, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
 
 
 def _lab_register_preview(stage_key: str, rel_path: str) -> None:
     if _LAB_CTX is None:
         return
     _LAB_CTX.setdefault("previews", []).append({"stage_key": stage_key, "relpath": rel_path})
+
+
+def _prune_events_extra(prune_log_entries: list, start_i: int, max_items: int = 400) -> Dict[str, Any]:
+    """Slice of prune_log_entries for progress.jsonl (cap size for browser JSON)."""
+    chunk = prune_log_entries[start_i:]
+    if not chunk:
+        return {}
+    if len(chunk) > max_items:
+        return {
+            "prune_events": chunk[:max_items],
+            "prune_events_truncated": True,
+            "prune_events_total": len(chunk),
+        }
+    return {"prune_events": chunk}
 
 
 def _lab_write_manifest(
@@ -233,6 +341,7 @@ def _lab_write_manifest(
     model_id: str,
     total_elapsed: float,
     final_video_relpath: str,
+    view_variants: Optional[Dict[str, str]] = None,
 ) -> None:
     if _LAB_CTX is None or _LAB_CTX.get("run_manifest_path") is None:
         return
@@ -259,6 +368,7 @@ def _lab_write_manifest(
         "SWAY_VITPOSE_MODEL",
         "SWAY_TRACKER_YAML",
         "SWAY_GROUP_VIDEO",
+        "SWAY_GLOBAL_LINK",
         "SWAY_CHUNK_SIZE",
         "SWAY_DETECT_SIZE",
         "SWAY_YOLO_CONF",
@@ -267,17 +377,20 @@ def _lab_write_manifest(
         "SWAY_AUTO_STAGE_DEPTH",
         "SWAY_TEMPORAL_POSE_REFINE",
         "SWAY_TEMPORAL_POSE_RADIUS",
+        "SWAY_3D_LIFT",
+        "SWAY_MOTIONAGFORMER_ROOT",
+        "SWAY_MOTIONAGFORMER_WEIGHTS",
     ]
     env_snap = {k: os.environ.get(k) for k in env_keys if os.environ.get(k)}
 
-    manifest = {
+    manifest: Dict[str, Any] = {
         "video_path": str(video_path),
         "output_dir": str(output_dir),
         "vitpose_model_id": model_id,
         "cli": {
             "pose_model": getattr(args, "pose_model", None),
             "pose_stride": getattr(args, "pose_stride", None),
-            "temporal_pose_refine": want_temporal_pose_refine(getattr(args, "temporal_pose_refine", False)),
+            "temporal_pose_refine": want_temporal_pose_refine(getattr(args, "temporal_pose_refine", True)),
             "temporal_pose_radius": temporal_pose_radius(getattr(args, "temporal_pose_radius", 2)),
             "montage": getattr(args, "montage", None),
             "save_phase_previews": getattr(args, "save_phase_previews", None),
@@ -287,8 +400,11 @@ def _lab_write_manifest(
         "env": env_snap,
         "previews": list(_LAB_CTX.get("previews", [])),
         "final_video_relpath": final_video_relpath,
+        "view_variants": view_variants or {},
         "total_elapsed_s": round(total_elapsed, 3),
         "git_commit": git_sha,
+        "pipeline_stages": list(_LAB_CTX.get("stage_log", [])),
+        "run_context_final": dict(_LAB_CTX.get("run_context", {})),
     }
     mp = _LAB_CTX["run_manifest_path"]
     with open(mp, "w", encoding="utf-8") as f:
@@ -362,7 +478,7 @@ def main():
         type=str,
         choices=["base", "large", "huge"],
         default="base",
-        help="ViTPose+: base / large / huge (ViT-H class; needs VRAM). Override with SWAY_VITPOSE_MODEL.",
+        help="ViTPose+: default base for speed/VRAM; use large/huge for accuracy. Override with SWAY_VITPOSE_MODEL.",
     )
     parser.add_argument(
         "--pose-stride",
@@ -373,12 +489,12 @@ def main():
     )
     parser.add_argument(
         "--temporal-pose-refine",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "After ViTPose: confidence-weighted (x,y) smoothing over ±N frames per track. "
-            "Lightweight jitter reduction — not the Poseidon video model. "
-            "Also: SWAY_TEMPORAL_POSE_REFINE=1."
+            "Default on; --no-temporal-pose-refine to skip. Not the Poseidon video model. "
+            "Env SWAY_TEMPORAL_POSE_REFINE=0|1 overrides CLI."
         ),
     )
     parser.add_argument(
@@ -417,7 +533,14 @@ def main():
         default=None,
         help="Write run_manifest.json to this path when the run completes.",
     )
+    parser.add_argument(
+        "--no-pose-3d-lift",
+        action="store_true",
+        default=False,
+        help="Disable MotionAGFormer 3D lift and pose_3d JSON export. Env SWAY_3D_LIFT=0 also disables.",
+    )
     args = parser.parse_args()
+    _apply_stack_default_env()
 
     params = {}
     if args.params:
@@ -440,6 +563,10 @@ def main():
     if manifest_path is None and (args.save_phase_previews or args.progress_jsonl):
         manifest_path = str(output_dir / "run_manifest.json")
     _lab_init(progress_jsonl=args.progress_jsonl, run_manifest_path=manifest_path)
+    _lab_update_context(
+        input_video=str(video_path.resolve()),
+        input_bytes=int(video_path.stat().st_size),
+    )
 
     phase_preview_dir = None
     montage_dir = None
@@ -459,49 +586,87 @@ def main():
 
     device = get_device()
     print(f"Using device: {device}")
+    _lab_update_context(device=str(device), pose_model_cli=getattr(args, "pose_model", None))
     log_resource_usage("startup")
 
     total_start = time.time()
 
-    # ── Phase 1 & 2: Detection + Tracking ────────────────────────────────
-    print("\n[1/9] Running detection & tracking (YOLO + BoxMOT default; SWAY_USE_BOXMOT=0 for BoT-SORT)...")
+    # ── Phase 1 & 2: Detection + Tracking (single streaming pass) ─────────
+    print("\n[1/11] Phase 1 — Detection (YOLO)")
+    print("[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT + hybrid SAM when enabled)")
+    print("  (Single pass over the video: detection and association per frame.)")
     t0 = time.time()
-    raw_tracks, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height = run_tracking(
-        str(video_path)
+    raw_pre, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height, ystride = (
+        run_tracking_before_post_stitch(str(video_path))
     )
     dt_track = time.time() - t0
-    print(f"  └─ {dt_track:.1f}s")
-    log_resource_usage("1-detection+tracking")
+    print(f"  └─ Phases 1–2: {dt_track:.1f}s")
+    log_resource_usage("1-2-detection-tracking")
+
+    # ── Phase 3: Post-track stitching ───────────────────────────────────
+    print("\n[3/11] Phase 3 — Post-track stitching (dormant, fragment stitch, coalesce, merge)…")
+    t0 = time.time()
+    raw_tracks = apply_post_track_stitching(raw_pre, total_frames, ystride=ystride)
+    dt_stitch = time.time() - t0
+    print(f"  └─ {dt_stitch:.1f}s")
+    log_resource_usage("3-post-track-stitch")
+
+    _lab_update_context(
+        total_frames=int(total_frames),
+        native_fps=round(float(native_fps), 4),
+        frame_width=int(frame_width),
+        frame_height=int(frame_height),
+        raw_track_count=int(len(raw_tracks)),
+        output_fps=round(float(output_fps), 4),
+        track_summary=_lab_track_summary_heuristic(raw_tracks, int(ystride)),
+    )
 
     if clip_dir is not None:
-        montage_clip_frames = int(native_fps * 6)
-        montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        print(
+            "  Phase preview videos: full source length, no title slate "
+            "(encoding may take noticeably longer than short samples).",
+            flush=True,
+        )
         all_ids = set(raw_tracks.keys())
         all_tracking = raw_tracks_to_per_frame(raw_tracks, total_frames, all_ids)
         all_fd = [{"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"],
                     "poses": {}} for i, t in enumerate(all_tracking)]
-        p1 = clip_dir / "01_detection.mp4"
+        p1 = clip_dir / "01_tracks_post_stitch.mp4"
         montage_clips.append(render_phase_clip(
-            video_path, all_fd, "Stage 1: Detection",
+            video_path, all_fd, "Phases 1–3: Tracks",
             lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
             native_fps, output_fps, p1,
-            clip_duration=6.0,
-            start_frame=montage_start,
-            caption="All raw YOLO bounding boxes (noise and all)",
+            caption="After detection, tracking, and post-track stitching",
+            full_length=True,
+            show_title_card=False,
         ))
         prv = f"phase_previews/{p1.name}" if args.save_phase_previews else None
-        _lab_progress(1, "detection", "Detection & tracking", elapsed_s=dt_track, preview_relpath=prv)
+        _lab_extra_early = {
+            "track_ids_sample": sorted(raw_tracks.keys(), key=lambda x: int(x) if isinstance(x, int) else 0)[:80],
+            "track_count": len(raw_tracks),
+        }
+        _lab_progress(1, "phases_1_2", "Phases 1–2: Detection & tracking", elapsed_s=dt_track, extra=_lab_extra_early)
+        _lab_progress(
+            2,
+            "phase3_post_stitch",
+            "Phase 3: Post-track stitching",
+            elapsed_s=dt_stitch,
+            preview_relpath=prv,
+            extra={**_lab_extra_early, "phase": "post_track_stitch"},
+        )
         if prv:
-            _lab_register_preview("detection", prv)
+            _lab_register_preview("tracks_post_stitch", prv)
     else:
-        _lab_progress(1, "detection", "Detection & tracking", elapsed_s=dt_track)
+        _lab_progress(1, "phases_1_2", "Phases 1–2: Detection & tracking", elapsed_s=dt_track)
+        _lab_progress(2, "phase3_post_stitch", "Phase 3: Post-track stitching", elapsed_s=dt_stitch)
 
-    # Diagnostic log for debugging (prune_log.json)
+    # Diagnostic log for debugging (prune_log.json) + progress.jsonl phase_detail
     prune_log_entries = []
+    _prune_mark = 0
     tracker_ids_before_prune = sorted(raw_tracks.keys(), key=lambda x: int(x) if isinstance(x, int) else 999)
 
-    # ── Phase 3: Pre-pose pruning (V3.4 enhanced) ───────────────────────
-    print("\n[2/9] Track pruning (duration, kinetic, spatial, traversal, bbox size, mirrors)...")
+    # ── Phase 4: Pre-pose pruning (V3.4 enhanced) ─────────────────────────
+    print("\n[4/11] Phase 4 — Pre-pose pruning (duration, kinetic, spatial, stage, mirrors, …)…")
     t0 = time.time()
     _prune_kw = {}
     if "min_duration_ratio" in params:
@@ -610,14 +775,22 @@ def main():
 
     tracking_results = raw_tracks_to_per_frame(raw_tracks, total_frames, surviving_ids)
     print(f"  Kept {len(surviving_ids)} of {initial_count} tracks after pre-pose pruning")
+    _lab_update_context(
+        surviving_after_pre_pose_prune=int(len(surviving_ids)),
+        pre_pose_prune_dropped=int(initial_count - len(surviving_ids)),
+    )
     dt_preprune = time.time() - t0
     print(f"  └─ {dt_preprune:.1f}s")
-    log_resource_usage("2-pruning")
+    log_resource_usage("4-pre-pose-prune")
+
+    _ex4 = {
+        **_prune_events_extra(prune_log_entries, _prune_mark),
+        "tracks_before_prune": initial_count,
+        "tracks_after_pre_pose_prune": len(surviving_ids),
+    }
+    _prune_mark = len(prune_log_entries)
 
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         pre_fd = [
             {"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"], "poses": {}}
             for i, t in enumerate(tracking_results)
@@ -626,23 +799,23 @@ def main():
         montage_clips.append(render_phase_clip(
             video_path,
             pre_fd,
-            "Stage 2: After pre-pose prune",
+            "Phase 4: After pre-pose prune",
             lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
             native_fps,
             output_fps,
             p2,
-            clip_duration=6.0,
-            start_frame=montage_start,
             caption="Surviving boxes after pre-pose pruning",
+            full_length=True,
+            show_title_card=False,
         ))
         prv2 = f"phase_previews/{p2.name}" if args.save_phase_previews else None
-        _lab_progress(2, "pre_pose_prune", "Pre-pose pruning", elapsed_s=dt_preprune, preview_relpath=prv2)
+        _lab_progress(3, "pre_pose_prune", "Phase 4: Pre-pose pruning", elapsed_s=dt_preprune, preview_relpath=prv2, extra=_ex4)
         if prv2:
             _lab_register_preview("pre_pose_prune", prv2)
     else:
-        _lab_progress(2, "pre_pose_prune", "Pre-pose pruning", elapsed_s=dt_preprune)
+        _lab_progress(3, "pre_pose_prune", "Phase 4: Pre-pose pruning", elapsed_s=dt_preprune, extra=_ex4)
 
-    # ── Phase 4: Pose estimation with visibility scoring ─────────────────
+    # ── Phase 5: Pose estimation with visibility scoring ──────────────────
     env_pose = os.environ.get("SWAY_VITPOSE_MODEL", "").strip()
     if env_pose:
         model_id = env_pose
@@ -652,16 +825,27 @@ def main():
         model_id = "usyd-community/vitpose-plus-large"
     else:
         model_id = "usyd-community/vitpose-plus-base"
+    _lab_update_context(vitpose_model_id=model_id, pose_stride=int(args.pose_stride))
     stride_note = f" stride={args.pose_stride}" if args.pose_stride > 1 else ""
-    print(f"\n[3/9] Running pose estimation (ViTPose-{args.pose_model.title()}{stride_note}, visibility-gated)...")
+    print(f"\n[5/11] Phase 5 — Pose estimation (ViTPose-{args.pose_model.title()}{stride_note}, visibility-gated)…")
     t0 = time.time()
+    print(f"  Loading ViTPose ({model_id}) on {device}…", flush=True)
     pose_estimator = PoseEstimator(device=device, model_name=model_id)
+    print(f"  ViTPose weights loaded in {time.time() - t0:.1f}s (first forward may add MPS/CUDA compile time)", flush=True)
 
     raw_poses_by_frame = [{} for _ in range(total_frames)]
     embeddings_by_frame = [{} for _ in range(total_frames)]  # V3.8: Appearance for Re-ID
     frames_stored = [None] * total_frames
     last_pct = -1
     occluded_skips = 0
+    # Phase 5 progress: old code only printed every 10% of *video* frames, so the first ~10%
+    # of frames could run ViTPose with zero logs (minutes on huge + MPS). See SWAY_POSE_LOG_* env.
+    phase5_pose_passes = 0
+    last_phase5_wall_log = time.time()
+    pose_log_every_sec = float(os.environ.get("SWAY_POSE_LOG_EVERY_SEC", "20"))
+    pose_log_every_n = max(1, int(os.environ.get("SWAY_POSE_LOG_EVERY_N_PASSES", "8")))
+    pose_slow_sec = float(os.environ.get("SWAY_POSE_SLOW_FORWARD_SEC", "4"))
+    phase5_logged_first_forward = False
 
     frame_q = queue.Queue(maxsize=30)
     def frame_producer():
@@ -712,10 +896,37 @@ def main():
 
             run_pose = (frame_idx % args.pose_stride == 0) and len(boxes) > 0
             if run_pose:
+                phase5_pose_passes += 1
                 pct = int(100 * (frame_idx + 1) / total_frames) if total_frames else 0
-                if pct >= last_pct + 10 or pct == 100:
-                    print(f"  Frame {frame_idx + 1}/{total_frames} ({pct}%)")
-                    last_pct = pct
+                now = time.time()
+                wall_dt = now - last_phase5_wall_log
+                pct_milestone = pct >= last_pct + 5 or pct == 100
+                pass_milestone = phase5_pose_passes == 1 or (phase5_pose_passes % pose_log_every_n == 0)
+                time_heartbeat = wall_dt >= pose_log_every_sec
+                if pct_milestone or pass_milestone or time_heartbeat:
+                    elapsed = now - t0
+                    print(
+                        f"  [phase5] {elapsed:.0f}s | frame {frame_idx + 1}/{total_frames} ({pct}%) "
+                        f"| pose_pass {phase5_pose_passes} | tracks {len(boxes)}",
+                        flush=True,
+                    )
+                    _lab_progress(
+                        4,
+                        "pose",
+                        "Phase 5: Pose estimation",
+                        status="running",
+                        extra={
+                            "frame": int(frame_idx + 1),
+                            "total_frames": int(total_frames),
+                            "pct": int(pct),
+                            "pose_pass": int(phase5_pose_passes),
+                            "tracks": int(len(boxes)),
+                            "wall_s_in_phase": round(elapsed, 1),
+                        },
+                    )
+                    last_phase5_wall_log = now
+                    if pct_milestone:
+                        last_pct = pct
 
                 # V3.4: Compute visibility scores to skip occluded tracks
                 vis_scores = compute_visibility_scores(boxes, track_ids)
@@ -788,6 +999,15 @@ def main():
                 if boxes_to_estimate:
                     frame_rgb = frame[:, :, ::-1]
                     seg_arg = masks_to_estimate if any(x is not None for x in masks_to_estimate) else None
+                    n_mask = sum(1 for x in (seg_arg or []) if x is not None)
+                    if not phase5_logged_first_forward:
+                        print(
+                            f"  [phase5] first ViTPose forward: {len(boxes_to_estimate)} people "
+                            f"({n_mask} mask-gated) — first batch often slow (graph compile on MPS/CUDA)…",
+                            flush=True,
+                        )
+                        phase5_logged_first_forward = True
+                    t_inf = time.perf_counter()
                     estimated = pose_estimator.estimate_poses(
                         frame_rgb,
                         boxes_to_estimate,
@@ -795,6 +1015,13 @@ def main():
                         paddings,
                         segmentation_masks=seg_arg,
                     )
+                    inf_dt = time.perf_counter() - t_inf
+                    if inf_dt >= pose_slow_sec:
+                        print(
+                            f"  [phase5] slow forward {inf_dt:.1f}s @ frame {frame_idx + 1} "
+                            f"({len(boxes_to_estimate)} people, {n_mask} mask paths)",
+                            flush=True,
+                        )
                     for tid, est in estimated.items():
                         poses[tid] = est
                         last_good_pose[tid] = {
@@ -825,13 +1052,19 @@ def main():
         print(f"  Skipped {occluded_skips} occluded track-frames (visibility < {vis_skip})")
     dt_pose = time.time() - t0
     print(f"  └─ {dt_pose:.1f}s")
-    log_resource_usage("3-pose")
+    log_resource_usage("5-pose")
 
     # Build all_frame_data_pre for downstream phases
     all_frame_data_pre = []
     for i, (fidx, _frame, boxes, track_ids) in enumerate(frames_stored):
         raw_poses = raw_poses_by_frame[i]
         emb = embeddings_by_frame[i] if i < len(embeddings_by_frame) else {}
+        tr = tracking_results[i] if i < len(tracking_results) else {}
+        sam_f = list(tr.get("is_sam_refined") or [])
+        sam_m = list(tr.get("segmentation_masks") or [])
+        nb = len(track_ids)
+        sam_f = [bool(sam_f[j]) if j < len(sam_f) else False for j in range(nb)]
+        sam_m = [sam_m[j] if j < len(sam_m) else None for j in range(nb)]
         all_frame_data_pre.append({
             "frame_idx": fidx,
             "frame": None,
@@ -839,36 +1072,41 @@ def main():
             "track_ids": list(track_ids),
             "poses": dict(raw_poses),
             "embeddings": emb,  # V3.8: Per-track appearance for crossover Re-ID
+            "is_sam_refined": sam_f,
+            "segmentation_masks": sam_m,
         })
 
+    _ex5 = {
+        "vitpose_model_id": model_id,
+        "pose_stride": int(args.pose_stride),
+        "occluded_track_frames_skipped": int(occluded_skips),
+    }
+
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         p3 = clip_dir / "03_pose.mp4"
         montage_clips.append(render_phase_clip(
             video_path,
             all_frame_data_pre,
-            "Stage 3: Pose estimation",
+            "Phase 5: Pose estimation",
             lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
             native_fps,
             output_fps,
             p3,
-            clip_duration=6.0,
-            start_frame=montage_start,
             caption="Boxes + skeleton (before re-ID / dedup)",
+            full_length=True,
+            show_title_card=False,
         ))
         prv3 = f"phase_previews/{p3.name}" if args.save_phase_previews else None
-        _lab_progress(3, "pose", "Pose estimation", elapsed_s=dt_pose, preview_relpath=prv3)
+        _lab_progress(4, "pose", "Phase 5: Pose estimation", elapsed_s=dt_pose, preview_relpath=prv3, extra=_ex5)
         if prv3:
             _lab_register_preview("pose", prv3)
     else:
-        _lab_progress(3, "pose", "Pose estimation", elapsed_s=dt_pose)
+        _lab_progress(4, "pose", "Phase 5: Pose estimation", elapsed_s=dt_pose, extra=_ex5)
 
-    # ── Phase 5: Occlusion re-ID (before dedup so both fragments exist for IoU) ─
-    print("\n[4/9] Occlusion re-ID + crossover refinement (hybrid CVM)...")
+    # ── Phase 6: Association (occlusion re-ID before collision dedup) ──
+    _prune_mark_ph67 = len(prune_log_entries)
+    print("\n[6/11] Phase 6 — Association (occlusion re-ID, crossover, acceleration audit)…")
     t0 = time.time()
-    t_reid_block = t0
     _reid_kw = {}
     if "REID_MAX_FRAME_GAP" in params:
         _reid_kw["max_frame_gap"] = params["REID_MAX_FRAME_GAP"]
@@ -879,9 +1117,13 @@ def main():
     apply_occlusion_reid(all_frame_data_pre, **_reid_kw)
     apply_crossover_refinement(all_frame_data_pre, frame_width=frame_width, frame_height=frame_height)
     apply_acceleration_audit(all_frame_data_pre)
+    dt_association = time.time() - t0
+    print(f"  └─ Phase 6: {dt_association:.1f}s")
 
-    # ── Phase 6: Keypoint collision dedup (after Re-ID merges fragments) ────
-    print("\n[5/9] Keypoint collision dedup...")
+    # ── Phase 7: Collision cleanup (keypoint dedup + bbox sanitize) ──────
+    print("\n[7/11] Phase 7 — Collision cleanup (keypoint dedup, bbox sanitize)…")
+    t0 = time.time()
+    _ensure_collision_cleanup_logging()
     # V3.8: Removed late_entrant_candidates protection — ghosts (e.g. 61) were exempt from
     # post-pose prunes and dedup. Now all tracks subject to same prune/dedup rules.
     late_entrant_candidates = set()
@@ -892,6 +1134,7 @@ def main():
             track_frame_count[tid] = track_frame_count.get(tid, 0) + 1
     dedup_count = 0
     sanitize_count = 0
+    sanitize_keypoints_zeroed = 0
     phase6_log: list = []
     snap_pre_dedup = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
     for fd in all_frame_data_pre:
@@ -905,180 +1148,189 @@ def main():
         dedup_count += before - len(fd["poses"])
     snap_post_dedup_pre_sanitize = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
     for fd in all_frame_data_pre:
-        sanitize_count += sanitize_pose_bbox_consistency(fd, phase6_log=phase6_log)
+        n_pose, n_kpt = sanitize_pose_bbox_consistency(fd, phase6_log=phase6_log)
+        sanitize_count += n_pose
+        sanitize_keypoints_zeroed += n_kpt
     if dedup_count:
         print(f"  Removed {dedup_count} duplicate pose overlays")
     if sanitize_count:
         print(f"  Sanitized {sanitize_count} poses with keypoints outside bbox")
+    if sanitize_keypoints_zeroed:
+        print(
+            f"  Zeroed {sanitize_keypoints_zeroed} limb keypoint confidences "
+            f"(outside bbox; not recorded in prune_log_entries)"
+        )
     if phase6_log:
         prune_log_entries.extend(phase6_log)
-    dt_reid_dedup = time.time() - t_reid_block
-    print(f"  └─ {dt_reid_dedup:.1f}s")
-    log_resource_usage("5-crossover")
+    prune_log_entries.append(
+        {
+            "rule": "phase6_summary",
+            "dedup_removed_poses": int(dedup_count),
+            "sanitize_removed_poses": int(sanitize_count),
+            "sanitize_keypoints_zeroed": int(sanitize_keypoints_zeroed),
+            "per_event_log_count": len(phase6_log),
+        }
+    )
+    dt_collision = time.time() - t0
+    print(f"  └─ Phase 7: {dt_collision:.1f}s")
+    log_resource_usage("6-association")
+    log_resource_usage("7-collision-cleanup")
+
+    _ex67 = {
+        **_prune_events_extra(prune_log_entries, _prune_mark_ph67),
+        "dedup_removed_pose_rows": int(dedup_count),
+        "sanitize_removed_poses": int(sanitize_count),
+        "sanitize_keypoints_zeroed": int(sanitize_keypoints_zeroed),
+        "phase6_event_log_rows": len(phase6_log),
+    }
+    _prune_mark = len(prune_log_entries)
 
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
-        p4 = clip_dir / "04_reid_dedup.mp4"
+        p4 = clip_dir / "04_phases_6_7.mp4"
         montage_clips.append(render_phase_clip(
             video_path,
             all_frame_data_pre,
-            "Stage 4: After re-ID & dedup",
+            "Phases 6–7: Association & collision cleanup",
             lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
             native_fps,
             output_fps,
             p4,
-            clip_duration=6.0,
-            start_frame=montage_start,
-            caption="After occlusion re-ID, crossover, and dedup",
+            caption="After occlusion re-ID, crossover, dedup, and bbox sanitize",
+            full_length=True,
+            show_title_card=False,
         ))
         prv4 = f"phase_previews/{p4.name}" if args.save_phase_previews else None
-        _lab_progress(4, "reid_dedup", "Re-ID & dedup", elapsed_s=dt_reid_dedup, preview_relpath=prv4)
+        _lab_progress(
+            5,
+            "association",
+            "Phase 6: Association",
+            elapsed_s=dt_association,
+            extra={
+                "steps": ["occlusion_reid", "crossover_refinement", "acceleration_audit"],
+                "reid_max_frame_gap": _reid_kw.get("max_frame_gap"),
+                "reid_min_oks": _reid_kw.get("min_oks"),
+            },
+        )
+        _lab_progress(
+            6,
+            "collision_cleanup",
+            "Phase 7: Collision cleanup",
+            elapsed_s=dt_collision,
+            preview_relpath=prv4,
+            extra=_ex67,
+        )
         if prv4:
-            _lab_register_preview("reid_dedup", prv4)
+            _lab_register_preview("phases_6_7", prv4)
     else:
-        _lab_progress(4, "reid_dedup", "Re-ID & dedup", elapsed_s=dt_reid_dedup)
+        _lab_progress(
+            5,
+            "association",
+            "Phase 6: Association",
+            elapsed_s=dt_association,
+            extra={
+                "steps": ["occlusion_reid", "crossover_refinement", "acceleration_audit"],
+                "reid_max_frame_gap": _reid_kw.get("max_frame_gap"),
+                "reid_min_oks": _reid_kw.get("min_oks"),
+            },
+        )
+        _lab_progress(6, "collision_cleanup", "Phase 7: Collision cleanup", elapsed_s=dt_collision, extra=_ex67)
 
-    # ── Phase 7: Post-pose pruning (sync score + smart mirror + completeness) ─
-    print("\n[6/9] Post-pose pruning (sync score + smart mirror + completeness)...")
+    # ── Phase 8: Post-pose pruning — Tier C, Tier A whitelist, Tier B vote ─
+    _prune_mark_ph8 = len(prune_log_entries)
+    print("\n[8/11] Phase 8 — Post-pose pruning (Tier C auto-reject, Tier B weighted rules)…")
     t0 = time.time()
 
-    confirmed_humans = compute_confirmed_human_set(all_frame_data_pre, total_frames)
-    # Phase-7 kwargs only: no raw_tracks / frame_width / frame_height — those are positional for several pruners.
-    _p7_extras = {
-        "confirmed_humans": confirmed_humans,
-        "phase7_prune_log": prune_log_entries,
-        "total_frames": total_frames,
-    }
+    _edge_m = float(params.get("EDGE_MARGIN_FRAC", 0.15))
+    _ch_span = float(params.get("CONFIRMED_HUMAN_MIN_SPAN_FRAC", 0.10))
+    confirmed_humans = compute_confirmed_human_set(
+        all_frame_data_pre,
+        total_frames,
+        frame_width=frame_width,
+        edge_margin_frac=_edge_m,
+        min_span_frac=_ch_span,
+    )
+    phase7_poses_by_frame = [fd["poses"] for fd in all_frame_data_pre]
 
-    # V3.8: No late-entrant exemption — all tracks subject to post-pose prunes
-    def _exclude_late_entrants(prune_set):
-        return prune_set
-
-    _sync_kw = {}
-    if "SYNC_SCORE_MIN" in params:
-        _sync_kw["min_sync_score"] = params["SYNC_SCORE_MIN"]
-    _sync_kw["raw_tracks"] = raw_tracks
-    _sync_kw["total_frames"] = total_frames
-    _sync_kw["frame_width"] = frame_width
-    _sync_kw["frame_height"] = frame_height
-    _sync_kw.update(_p7_extras)
-    sync_prune_ids = _exclude_late_entrants(prune_low_sync_tracks(all_frame_data_pre, surviving_ids, **_sync_kw))
-    if sync_prune_ids:
-        print(f"  Pruned {len(sync_prune_ids)} tracks with low sync score (non-dancers)")
-        log_pruned_tracks(
-            raw_tracks, sync_prune_ids, "low_sync", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    _mirror_kw = {}
-    if "EDGE_MARGIN_FRAC" in params:
-        _mirror_kw["edge_margin_frac"] = params["EDGE_MARGIN_FRAC"]
-    if "EDGE_PRESENCE_FRAC" in params:
-        _mirror_kw["edge_presence_frac"] = params["EDGE_PRESENCE_FRAC"]
-    if "min_lower_body_conf" in params:
-        _mirror_kw["min_lower_body_conf"] = params["min_lower_body_conf"]
-    _mirror_kw["frame_height"] = frame_height
-    _mirror_kw.update(_p7_extras)
-    mirror_prune_ids = _exclude_late_entrants(prune_smart_mirrors(
-        raw_tracks,
+    _tier_c_kw = {}
+    if "TIER_C_SKELETON_MEAN" in params:
+        _tier_c_kw["mean_thresh"] = float(params["TIER_C_SKELETON_MEAN"])
+    if "TIER_C_LOW_FRAME_FRAC" in params:
+        _tier_c_kw["min_low_frac"] = float(params["TIER_C_LOW_FRAME_FRAC"])
+    tier_c_ids = prune_ultra_low_skeleton_tracks(
         surviving_ids,
-        [fd["poses"] for fd in all_frame_data_pre],
-        frame_width,
-        **_mirror_kw,
-    ))
-    if mirror_prune_ids:
-        print(f"  Pruned {len(mirror_prune_ids)} mirror tracks")
-        log_pruned_tracks(
-            raw_tracks, mirror_prune_ids, "smart_mirror", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    completeness_prune_ids = _exclude_late_entrants(
-        prune_completeness_audit(
-            raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height, **_p7_extras
-        )
-    )
-    if completeness_prune_ids:
-        print(f"  Pruned {len(completeness_prune_ids)} tracks (seated/partial-body observers)")
-        log_pruned_tracks(
-            raw_tracks, completeness_prune_ids, "completeness", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    head_only_prune_ids = _exclude_late_entrants(
-        prune_head_only_tracks(
-            raw_tracks, surviving_ids, raw_poses_by_frame, frame_width, frame_height, **_p7_extras
-        )
-    )
-    if head_only_prune_ids:
-        print(f"  Pruned {len(head_only_prune_ids)} head-only tracks (audience)")
-        log_pruned_tracks(
-            raw_tracks, head_only_prune_ids, "head_only", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    _conf_kw = {}
-    if "MEAN_CONFIDENCE_MIN" in params:
-        _conf_kw["min_mean_conf"] = params["MEAN_CONFIDENCE_MIN"]
-    _conf_kw["raw_tracks"] = raw_tracks
-    _conf_kw["frame_width"] = frame_width
-    _conf_kw["frame_height"] = frame_height
-    _conf_kw.update(_p7_extras)
-    low_conf_prune_ids = _exclude_late_entrants(
-        prune_low_confidence_tracks(surviving_ids, [fd["poses"] for fd in all_frame_data_pre], **_conf_kw)
-    )
-    if low_conf_prune_ids:
-        print(f"  Pruned {len(low_conf_prune_ids)} tracks with low mean keypoint confidence (non-person)")
-        log_pruned_tracks(
-            raw_tracks, low_conf_prune_ids, "low_confidence", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    jitter_prune_ids = _exclude_late_entrants(
-        prune_jittery_tracks(
-            raw_tracks,
-            surviving_ids,
-            [fd["poses"] for fd in all_frame_data_pre],
-            frame_width=frame_width,
-            frame_height=frame_height,
-            **_p7_extras,
-        )
-    )
-    if jitter_prune_ids:
-        print(f"  Pruned {len(jitter_prune_ids)} tracks with excessive keypoint jitter (non-person)")
-        log_pruned_tracks(
-            raw_tracks, jitter_prune_ids, "jitter", frame_width, frame_height, prune_log_entries, total_frames=total_frames
-        )
-
-    tier_c_ids = _exclude_late_entrants(
-        prune_ultra_low_skeleton_tracks(
-            surviving_ids,
-            [fd["poses"] for fd in all_frame_data_pre],
-            raw_tracks=raw_tracks,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            **_p7_extras,
-        )
+        phase7_poses_by_frame,
+        **_tier_c_kw,
     )
     if tier_c_ids:
-        print(f"  Pruned {len(tier_c_ids)} tracks (Tier C ultra-low skeleton confidence)")
+        print(f"  Pruned {len(tier_c_ids)} tracks (Tier C: no confident skeleton)")
         log_pruned_tracks(
-            raw_tracks, tier_c_ids, "tier_c_ultra_low_skeleton", frame_width, frame_height, prune_log_entries, total_frames=total_frames
+            raw_tracks,
+            tier_c_ids,
+            "tier_c_auto_reject",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
         )
 
-    phase7_prune_ids = (
-        sync_prune_ids
-        | mirror_prune_ids
-        | completeness_prune_ids
-        | head_only_prune_ids
-        | low_conf_prune_ids
-        | jitter_prune_ids
-        | tier_c_ids
+    surviving_after_tier_c = surviving_ids - tier_c_ids
+    _p7_vote_weights = dict(PRUNING_WEIGHTS)
+    if isinstance(params.get("PRUNING_WEIGHTS"), dict):
+        _p7_vote_weights.update({str(k): float(v) for k, v in params["PRUNING_WEIGHTS"].items()})
+    _prune_threshold = float(params.get("PRUNE_THRESHOLD", PRUNE_THRESHOLD))
+
+    _sync_min = float(params.get("SYNC_SCORE_MIN", 0.10))
+    _mirror_edge = float(params.get("EDGE_MARGIN_FRAC", 0.15))
+    _mirror_pres = float(params.get("EDGE_PRESENCE_FRAC", 0.3))
+    _mirror_lb = float(params.get("min_lower_body_conf", 0.3))
+    _mean_conf_min = float(params.get("MEAN_CONFIDENCE_MIN", 0.45))
+    _jitter_max = float(params.get("JITTER_RATIO_MAX", 0.10))
+
+    voting_prune_ids, _tier_b_telemetry = compute_phase7_voting_prune_set(
+        all_frame_data_pre,
+        surviving_after_tier_c,
+        raw_tracks,
+        phase7_poses_by_frame,
+        frame_width,
+        frame_height,
+        total_frames,
+        confirmed_humans,
+        _p7_vote_weights,
+        _prune_threshold,
+        min_sync_score=_sync_min,
+        edge_margin_frac=_mirror_edge,
+        edge_presence_frac=_mirror_pres,
+        min_lower_body_conf=_mirror_lb,
+        min_mean_conf=_mean_conf_min,
+        max_jitter=_jitter_max,
+        phase7_prune_log=prune_log_entries,
     )
+    if voting_prune_ids:
+        print(
+            f"  Pruned {len(voting_prune_ids)} tracks (Tier B voting, "
+            f"threshold={_prune_threshold})"
+        )
+        for tid in sorted(voting_prune_ids):
+            te = _tier_b_telemetry.get(tid, {})
+            rs = te.get("rule_hits") or {}
+            hits = [k.replace("prune_", "").replace("_tracks", "") for k, v in rs.items() if v > 0]
+            hit_s = ",".join(hits) if hits else "?"
+            wsum = te.get("weighted_sum", "?")
+            print(f"    [Tier B] track {tid}: weighted_sum={wsum} hits=[{hit_s}]")
+
+    phase7_prune_ids = tier_c_ids | voting_prune_ids
     surviving_after_prune = set()
     for fd in all_frame_data_pre:
         surviving_after_prune.update(t for t in fd["track_ids"] if t not in phase7_prune_ids)
     print(f"  {len(surviving_after_prune)} tracks after post-pose pruning")
+    _lab_update_context(
+        surviving_after_post_pose_prune=int(len(surviving_after_prune)),
+        post_pose_tier_c=int(len(tier_c_ids)),
+        post_pose_voting_pruned=int(len(voting_prune_ids)),
+    )
     dt_postprune = time.time() - t0
     print(f"  └─ {dt_postprune:.1f}s")
-    log_resource_usage("6-post-prune")
+    log_resource_usage("8-post-pose-prune")
 
     postprune_fd = []
     for fd_pre in all_frame_data_pre:
@@ -1087,28 +1339,34 @@ def main():
         filt_tids = [tid for tid in fd_pre["track_ids"] if tid not in phase7_prune_ids and tid in filt_poses]
         postprune_fd.append({"frame_idx": fd_pre["frame_idx"], "boxes": filt_boxes,
                               "track_ids": filt_tids, "poses": filt_poses})
+    _ex8 = {
+        **_prune_events_extra(prune_log_entries, _prune_mark_ph8),
+        "tier_c_pruned": len(tier_c_ids),
+        "tier_b_voting_pruned": len(voting_prune_ids),
+        "prune_threshold": _prune_threshold,
+        "tracks_after_post_pose_prune": len(surviving_after_prune),
+    }
+    _prune_mark = len(prune_log_entries)
+
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         p5 = clip_dir / "05_post_pose_prune.mp4"
         montage_clips.append(render_phase_clip(
-            video_path, postprune_fd, "Stage 5: After post-pose prune",
+            video_path, postprune_fd, "Phase 8: After post-pose prune",
             lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
             native_fps, output_fps, p5,
-            clip_duration=6.0,
-            start_frame=montage_start,
             caption="Surviving boxes after post-pose pruning",
+            full_length=True,
+            show_title_card=False,
         ))
         prv5 = f"phase_previews/{p5.name}" if args.save_phase_previews else None
-        _lab_progress(5, "post_pose_prune", "Post-pose pruning", elapsed_s=dt_postprune, preview_relpath=prv5)
+        _lab_progress(7, "post_pose_prune", "Phase 8: Post-pose pruning", elapsed_s=dt_postprune, preview_relpath=prv5, extra=_ex8)
         if prv5:
             _lab_register_preview("post_pose_prune", prv5)
     else:
-        _lab_progress(5, "post_pose_prune", "Post-pose pruning", elapsed_s=dt_postprune)
+        _lab_progress(7, "post_pose_prune", "Phase 8: Post-pose pruning", elapsed_s=dt_postprune, extra=_ex8)
 
-    # ── Phase 8: Temporal smoothing (1 Euro, conf<0.3 guard) ─────────────
-    print("\n[7/9] Temporal smoothing (1 Euro filter)...")
+    # ── Phase 9: Temporal smoothing (1 Euro, conf<0.3 guard) ────────────
+    print("\n[9/11] Phase 9 — Temporal smoothing (1 Euro filter)…")
     t0 = time.time()
     sm_cut = float(params.get("SMOOTHER_MIN_CUTOFF", 1.0))
     sm_beta = float(params.get("SMOOTHER_BETA", 0.7))
@@ -1125,6 +1383,14 @@ def main():
         # Filter out pruned tracks AND tracks that have no pose data (stripped by dedup)
         boxes_filtered = [b for b, tid in zip(boxes, track_ids) if tid not in phase7_prune_ids and tid in poses_filtered]
         track_ids_filtered = [tid for tid in track_ids if tid not in phase7_prune_ids and tid in poses_filtered]
+        sam_f = fd_pre.get("is_sam_refined") or []
+        sam_m = fd_pre.get("segmentation_masks") or []
+        sam_f_f = []
+        sam_m_f = []
+        for j, (b, tid) in enumerate(zip(boxes, track_ids)):
+            if tid not in phase7_prune_ids and tid in poses_filtered:
+                sam_f_f.append(bool(sam_f[j]) if j < len(sam_f) else False)
+                sam_m_f.append(sam_m[j] if j < len(sam_m) else None)
 
         frame_time = fidx / output_fps
         smoothed_poses = smoother.smooth_frame(poses_filtered, frame_time)
@@ -1138,38 +1404,75 @@ def main():
             "track_angles": {},
             "consensus_angles": {},
             "deviations": {},
+            "is_sam_refined": sam_f_f,
+            "segmentation_masks": sam_m_f,
         })
 
     dt_smooth = time.time() - t0
     print(f"  └─ {dt_smooth:.1f}s")
-    log_resource_usage("7-smoothing")
+    log_resource_usage("9-smoothing")
+
+    _ex9 = {"smoother_min_cutoff": sm_cut, "smoother_beta": sm_beta}
 
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         p6 = clip_dir / "06_smooth.mp4"
         montage_clips.append(render_phase_clip(
             video_path,
             all_frame_data,
-            "Stage 6: Smoothed poses",
+            "Phase 9: Smoothed poses",
             lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
             native_fps,
             output_fps,
             p6,
-            clip_duration=6.0,
-            start_frame=montage_start,
             caption="After temporal smoothing",
+            full_length=True,
+            show_title_card=False,
         ))
         prv6 = f"phase_previews/{p6.name}" if args.save_phase_previews else None
-        _lab_progress(6, "smooth", "Temporal smoothing", elapsed_s=dt_smooth, preview_relpath=prv6)
+        _lab_progress(8, "smooth", "Phase 9: Temporal smoothing", elapsed_s=dt_smooth, preview_relpath=prv6, extra=_ex9)
         if prv6:
             _lab_register_preview("smooth", prv6)
     else:
-        _lab_progress(6, "smooth", "Temporal smoothing", elapsed_s=dt_smooth)
+        _lab_progress(8, "smooth", "Phase 9: Temporal smoothing", elapsed_s=dt_smooth, extra=_ex9)
 
-    # ── Phase 9: Spatio-temporal scoring (circmean, cDTW, per-joint) ─────
-    print("\n[8/9] Spatio-temporal scoring...")
+    want_3d_lift = os.environ.get("SWAY_3D_LIFT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ) and not bool(getattr(args, "no_pose_3d_lift", False))
+    pose_3d_blob: Optional[Dict[str, Any]] = None
+    if want_3d_lift:
+        try:
+            from sway.depth_stage import get_depth_array
+            from sway.pose_lift_3d import export_3d_for_viewer, lift_poses_to_3d
+
+            depth_map_for_lift = None
+            for _, fr in iter_video_frames(str(video_path)):
+                depth_map_for_lift = get_depth_array(fr)
+                break
+            lift_poses_to_3d(
+                all_frame_data,
+                total_frames,
+                frame_width,
+                frame_height,
+                depth_map=depth_map_for_lift,
+            )
+            tids_final = sorted(
+                surviving_after_prune,
+                key=lambda x: int(x) if isinstance(x, int) else 0,
+            )
+            pose_3d_blob = export_3d_for_viewer(
+                all_frame_data,
+                tids_final,
+                len(all_frame_data),
+                float(output_fps),
+            )
+        except Exception as ex:
+            print(f"  [3D Lift] Skipped: {ex}", flush=True)
+
+    # ── Phase 10: Spatio-temporal scoring (circmean, cDTW, per-joint) ───
+    print("\n[10/11] Phase 10 — Spatio-temporal scoring…")
     t0 = time.time()
     scoring_data = process_all_frames_scoring_vectorized(all_frame_data)
     if scoring_data is not None:
@@ -1182,17 +1485,16 @@ def main():
 
     dt_score = time.time() - t0
     print(f"  └─ {dt_score:.1f}s")
-    log_resource_usage("8-scoring")
+    log_resource_usage("10-scoring")
+
+    _ex10 = {"scoring_enabled": scoring_data is not None}
 
     if clip_dir is not None:
-        if montage_clip_frames <= 0:
-            montage_clip_frames = int(native_fps * 6)
-            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         p7 = clip_dir / "07_scoring.mp4"
         montage_clips.append(render_phase_clip(
             video_path,
             all_frame_data,
-            "Stage 7: Scoring",
+            "Phase 10: Scoring",
             lambda f, d: draw_frame(
                 f,
                 d["boxes"],
@@ -1205,19 +1507,19 @@ def main():
             native_fps,
             output_fps,
             p7,
-            clip_duration=6.0,
-            start_frame=montage_start,
             caption="Heatmap skeletons (scored)",
+            full_length=True,
+            show_title_card=False,
         ))
         prv7 = f"phase_previews/{p7.name}" if args.save_phase_previews else None
-        _lab_progress(7, "scoring", "Scoring", elapsed_s=dt_score, preview_relpath=prv7)
+        _lab_progress(9, "scoring", "Phase 10: Scoring", elapsed_s=dt_score, preview_relpath=prv7, extra=_ex10)
         if prv7:
             _lab_register_preview("scoring", prv7)
     else:
-        _lab_progress(7, "scoring", "Scoring", elapsed_s=dt_score)
+        _lab_progress(9, "scoring", "Phase 10: Scoring", elapsed_s=dt_score, extra=_ex10)
 
-    # ── Phase 10: Export & visualization ──────────────────────────────────
-    print("\n[9/9] Rendering and exporting...")
+    # ── Export (after Phase 10) ───────────────────────────────────────────
+    print("\n[11/11] Export — rendering and writing outputs…")
     t0 = time.time()
     pruned_overlay = build_pruned_overlay_for_review(
         all_frame_data_pre,
@@ -1230,7 +1532,7 @@ def main():
         snap_post_dedup_pre_sanitize,
         all_frame_data_pre,
     )
-    render_and_export(
+    view_variants = render_and_export(
         video_path=video_path,
         all_frame_data=all_frame_data,
         processed_fps=output_fps,
@@ -1239,13 +1541,25 @@ def main():
         pruned_overlay=pruned_overlay,
         prune_entries=prune_log_entries,
         dropped_pose_overlay=dropped_pose_overlay,
+        pose_3d=pose_3d_blob,
     )
     dt_export = time.time() - t0
     print(f"  └─ {dt_export:.1f}s")
-    log_resource_usage("9-export")
+    log_resource_usage("11-export")
 
     final_video_relpath = f"{video_path.stem}_poses.mp4"
-    _lab_progress(8, "export", "Export", elapsed_s=dt_export, preview_relpath=final_video_relpath)
+    _lab_progress(
+        10,
+        "export",
+        "Export",
+        elapsed_s=dt_export,
+        preview_relpath=final_video_relpath,
+        extra={
+            "render_variants": list(view_variants.keys()) if view_variants else [],
+            "prune_log_file": "prune_log.json",
+            "data_json": "data.json",
+        },
+    )
 
     if args.montage and montage_clips:
         print("\n  Stitching montage...")
@@ -1259,6 +1573,18 @@ def main():
     print(f"Total pipeline: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
     log_resource_usage("final")
 
+    _lab_update_context(total_pipeline_wall_s=round(total_elapsed, 3))
+    _lab_progress(
+        11,
+        "pipeline_total",
+        "End-to-end wall time (all stages)",
+        elapsed_s=round(total_elapsed, 3),
+        extra={
+            "output_dir": str(output_dir.resolve()),
+            "final_mp4": final_video_relpath,
+        },
+    )
+
     _lab_write_manifest(
         video_path=video_path,
         output_dir=output_dir,
@@ -1267,6 +1593,7 @@ def main():
         model_id=model_id,
         total_elapsed=total_elapsed,
         final_video_relpath=final_video_relpath,
+        view_variants=view_variants,
     )
 
     # Write prune diagnostic log for debugging
@@ -1274,6 +1601,7 @@ def main():
     try:
         prune_log_data = {
             "video_path": str(video_path),
+            "native_fps": round(float(native_fps), 4),
             "total_frames": total_frames,
             "frame_width": frame_width,
             "frame_height": frame_height,

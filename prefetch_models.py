@@ -6,11 +6,13 @@ Run once while you have internet, from the sway_pose_mvp directory:
 
   cd sway_pose_mvp
   python prefetch_models.py
+  python prefetch_models.py --include-3d   # optional: MotionAGFormer-L + notes for repo clone
 
 This touches:
   - Ultralytics YOLO (yolo26l.pt → models/ or hub cache)
   - Hugging Face ViTPose base + large + huge (HF cache, usually ~/.cache/huggingface)
   - BoxMOT OSNet Re-ID weights → models/osnet_x0_25_msmt17.pt (default tracker path)
+  - Optional: StrongSORT AFLink_epoch20.pth → models/ (enables neural global stitch; see step 6)
 
 Fine-tuning YOLO26l on DanceTrack + CrowdHuman (optional): base weights `yolo26l.pt`
 are pulled automatically by Ultralytics the first time you run
@@ -22,6 +24,7 @@ After that, set SWAY_OFFLINE=1 when running without network (see README.md, Offl
 
 from __future__ import annotations
 
+import argparse
 import gc
 import os
 import sys
@@ -29,6 +32,38 @@ import urllib.request
 from pathlib import Path
 
 import _repo_path  # noqa: F401
+
+# Google Drive file id for MotionAGFormer-L H36M (official README table).
+_MOTIONAGFORMER_L_H36M_GDRIVE_ID = "1WI8QSsD84wlXIdK1dLp6hPZq4FPozmVZ"
+
+
+def prefetch_motionagformer_l(models_dir: Path) -> None:
+    """Download MotionAGFormer-L H36M checkpoint to models/ (same name as upstream eval)."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    dst = models_dir / "motionagformer-l-h36m.pth.tr"
+    if dst.is_file() and dst.stat().st_size > 10_000_000:
+        print(f"  ✓ MotionAGFormer-L already at {dst}")
+        return
+    print("  Downloading MotionAGFormer-L (~200MB, Google Drive)…")
+    try:
+        import gdown
+
+        gdown.download(
+            f"https://drive.google.com/uc?id={_MOTIONAGFORMER_L_H36M_GDRIVE_ID}",
+            str(dst),
+            quiet=False,
+        )
+    except Exception as ex:
+        print(f"  MotionAGFormer download failed ({ex}). Install gdown: pip install gdown")
+        print(
+            f"  Manual: save checkpoint as\n    {dst}\n"
+            "  Link: https://github.com/TaatiTeam/MotionAGFormer#evaluation"
+        )
+        return
+    if not dst.is_file() or dst.stat().st_size < 10_000_000:
+        print("  Download incomplete — remove partial file and retry.")
+        return
+    print(f"  ✓ Saved {dst}")
 
 
 def main() -> None:
@@ -40,14 +75,14 @@ def main() -> None:
 
     print(f"Working directory: {root}\n")
 
-    print("[1/5] YOLO yolo26l.pt …")
+    print("[1/6] YOLO yolo26l.pt …")
     from ultralytics import YOLO
 
     yolo_pt = root / "models" / "yolo26l.pt"
     YOLO(str(yolo_pt) if yolo_pt.is_file() else "yolo26l.pt")
     print("      OK\n")
 
-    print("[2/5] BoxMOT OSNet Re-ID (osnet_x0_25_msmt17.pt) …")
+    print("[2/6] BoxMOT OSNet Re-ID (osnet_x0_25_msmt17.pt) …")
     osnet_dst = root / "models" / "osnet_x0_25_msmt17.pt"
     if not osnet_dst.is_file():
         osnet_dst.parent.mkdir(parents=True, exist_ok=True)
@@ -92,13 +127,26 @@ def main() -> None:
         ),
         start=3,
     ):
-        print(f"[{i}/5] ViTPose {mid} …")
+        print(f"[{i}/6] ViTPose {mid} …")
         est = PoseEstimator(device=device, model_name=mid)
         del est
         gc.collect()
         if device.type == "mps" and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
         print(f"      OK\n")
+
+    print("[6/6] StrongSORT AFLink (neural global stitch) …")
+    aflink_dst = root / "models" / "AFLink_epoch20.pth"
+    if aflink_dst.is_file():
+        print(f"      already present: {aflink_dst}\n")
+    else:
+        print(
+            "      skipped — not in repo. With SWAY_GLOBAL_LINK=1, copy AFLink_epoch20.pth to:\n"
+            f"        {aflink_dst}\n"
+            "      or set SWAY_AFLINK_WEIGHTS to its path. Download from StrongSORT "
+            '"Data&Model Preparation" (Google Drive folder lists AFLink_epoch20.pth).\n'
+            "      https://github.com/dyhBUPT/StrongSORT#datamodel-preparation\n"
+        )
 
     print("Prefetch complete. Before an offline run:")
     print("  export SWAY_OFFLINE=1   # macOS/Linux")
@@ -107,4 +155,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Prefetch Sway pose pipeline weights.")
+    ap.add_argument(
+        "--include-3d",
+        action="store_true",
+        help="Also download MotionAGFormer-L (3D lift). Requires gdown for Google Drive.",
+    )
+    ns = ap.parse_args()
     main()
+    if ns.include_3d:
+        print("\n[Optional] MotionAGFormer-L (3D pose lift) …")
+        prefetch_motionagformer_l(Path(__file__).resolve().parent / "models")
+        print(
+            "Clone MotionAGFormer for imports:\n"
+            "  git clone https://github.com/TaatiTeam/MotionAGFormer.git vendor/MotionAGFormer\n"
+            "  pip install timm\n"
+            "Or set SWAY_MOTIONAGFORMER_ROOT to your clone path."
+        )

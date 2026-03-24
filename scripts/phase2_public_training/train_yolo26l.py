@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Fine-tune YOLO11x on DanceTrack ± CrowdHuman for dance-domain person detection.
+Fine-tune YOLO26l on DanceTrack ± CrowdHuman for dance-domain person detection.
 
 Requirements before running:
   - GPU with >=16GB VRAM recommended; CUDA for reasonable speed
-  - pip install ultralytics pillow  (Pillow is in repo requirements)
+  - pip install ultralytics pillow  (Pillow is in repo requirements; use a recent ultralytics for YOLO26)
 
 Phases (disk-friendly — train one dataset at a time):
   1) DanceTrack only (no CrowdHuman):
-       python scripts/phase2_public_training/train_yolo11x.py --phase dancetrack
-     Best: runs/detect/yolo11x_dancetrack_only/weights/best.pt
+       python scripts/phase2_public_training/train_yolo26l.py --phase dancetrack
+     Best: runs/detect/yolo26l_dancetrack_only/weights/best.pt
 
   2) After CrowdHuman is converted, continue from (1):
-       python scripts/phase2_public_training/train_yolo11x.py --phase crowdhuman \\
-         --weights runs/detect/yolo11x_dancetrack_only/weights/best.pt
+       python scripts/phase2_public_training/train_yolo26l.py --phase crowdhuman \\
+         --weights runs/detect/yolo26l_dancetrack_only/weights/best.pt
      (Omit --weights if that exact path exists — it is the default.)
-     Best: runs/detect/yolo11x_crowdhuman_ft/weights/best.pt
+     Best: runs/detect/yolo26l_crowdhuman_ft/weights/best.pt
 
   Merged (both datasets on disk, single run — same as before):
-       python scripts/phase2_public_training/train_yolo11x.py --phase merged
-     Best: runs/detect/yolo11x_dancetrack/weights/best.pt
+       python scripts/phase2_public_training/train_yolo26l.py --phase merged
+     Best: runs/detect/yolo26l_dancetrack/weights/best.pt
 
 Copy best.pt to models/ and set SWAY_YOLO_WEIGHTS=...
 """
@@ -41,7 +41,7 @@ PHASE_CONFIG = {
             "datasets/crowdhuman_yolo/images/train",
             "datasets/crowdhuman_yolo/images/val",
         ),
-        "run_name": "yolo11x_dancetrack",
+        "run_name": "yolo26l_dancetrack",
     },
     "dancetrack": {
         "data_yaml": "scripts/phase2_public_training/dancetrack_only.yaml",
@@ -49,7 +49,7 @@ PHASE_CONFIG = {
             "datasets/dancetrack_yolo/images/train",
             "datasets/dancetrack_yolo/images/val",
         ),
-        "run_name": "yolo11x_dancetrack_only",
+        "run_name": "yolo26l_dancetrack_only",
     },
     "crowdhuman": {
         "data_yaml": "scripts/phase2_public_training/crowdhuman_only.yaml",
@@ -57,12 +57,12 @@ PHASE_CONFIG = {
             "datasets/crowdhuman_yolo/images/train",
             "datasets/crowdhuman_yolo/images/val",
         ),
-        "run_name": "yolo11x_crowdhuman_ft",
+        "run_name": "yolo26l_crowdhuman_ft",
     },
 }
 
 DEFAULT_CROWDHUMAN_PARENT_WEIGHTS = (
-    REPO_ROOT / "runs/detect/yolo11x_dancetrack_only/weights/best.pt"
+    REPO_ROOT / "runs/detect/yolo26l_dancetrack_only/weights/best.pt"
 )
 
 # ── Shared train hyperparameters ─────────────────────────────────────────────
@@ -133,11 +133,11 @@ def resolve_weights(phase: str, weights_arg: str | None) -> str:
         return str(DEFAULT_CROWDHUMAN_PARENT_WEIGHTS.resolve())
 
     # merged / dancetrack: COCO-pretrained backbone (Ultralytics downloads if missing)
-    return "yolo11x.pt"
+    return "yolo26l.pt"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune YOLO11x (DanceTrack / CrowdHuman / merged).")
+    p = argparse.ArgumentParser(description="Fine-tune YOLO26l (DanceTrack / CrowdHuman / merged).")
     p.add_argument(
         "--phase",
         choices=("merged", "dancetrack", "crowdhuman"),
@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--weights",
         default=None,
-        help="Checkpoint to start from. Default: yolo11x.pt (merged/dancetrack), or "
+        help="Checkpoint to start from. Default: yolo26l.pt (merged/dancetrack), or "
         f"{DEFAULT_CROWDHUMAN_PARENT_WEIGHTS.relative_to(REPO_ROOT)} (crowdhuman).",
     )
     p.add_argument(
@@ -222,12 +222,12 @@ def train() -> None:
     print(f"  Best checkpoint: {best}")
     print(f"  Per-epoch log: {run_dir / 'results.csv'}")
     print("\nTo use in pipeline:")
-    print(f"  cp {best} models/yolo11x_dancetrack.pt")
-    print("  export SWAY_YOLO_WEIGHTS=models/yolo11x_dancetrack.pt")
+    print(f"  cp {best} models/yolo26l_dancetrack.pt")
+    print("  export SWAY_YOLO_WEIGHTS=models/yolo26l_dancetrack.pt")
     if args.phase == "dancetrack":
         print("\nNext (after CrowdHuman is on disk and converted):")
         print(
-            "  python scripts/phase2_public_training/train_yolo11x.py --phase crowdhuman \\\n"
+            "  python scripts/phase2_public_training/train_yolo26l.py --phase crowdhuman \\\n"
             f"    --weights {best}"
         )
 

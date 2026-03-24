@@ -26,9 +26,12 @@ V3.6 (Acceleration Audit):
 Runs AFTER pose estimation (requires keypoints). All math vectorized with NumPy.
 """
 
+import logging
 from typing import Dict, List, Tuple, Any, Optional, Set
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 # V3.8: Optional appearance cost for crossover (red vs blue during occlusion)
 try:
@@ -93,6 +96,25 @@ ACCEL_LOOKBACK_FRAMES = 2       # Use pose from t-2 if t-1 is missing
 
 # V3.8: Appearance weight in crossover — when red≠blue, appearance overrides OKS
 APPEARANCE_WEIGHT = 0.4         # Add sim*weight to score; red↔blue = low sim → reject swap
+
+
+def _sam_arrays_for_fd(fd: Dict[str, Any]) -> Tuple[List[bool], List[Any]]:
+    """Parallel is_sam_refined / segmentation_masks aligned with track_ids (same length)."""
+    n = len(fd.get("track_ids") or [])
+    fl = fd.get("is_sam_refined")
+    ml = fd.get("segmentation_masks")
+    if not isinstance(fl, list):
+        fl = []
+    if not isinstance(ml, list):
+        ml = []
+    flags = [bool(fl[i]) if i < len(fl) else False for i in range(n)]
+    masks = [ml[i] if i < len(ml) else None for i in range(n)]
+    return flags, masks
+
+
+def _fd_set_sam_parallel(fd: Dict[str, Any], flags: List[bool], masks: List[Any]) -> None:
+    fd["is_sam_refined"] = list(flags)
+    fd["segmentation_masks"] = list(masks)
 
 
 def _box_areas(boxes: np.ndarray) -> np.ndarray:
@@ -244,16 +266,18 @@ def sanitize_pose_bbox_consistency(
     frame_data: Dict[str, Any],
     max_offset_frac: float = KPT_BBOX_MAX_OFFSET_FRAC,
     phase6_log: Optional[list] = None,
-) -> int:
+) -> Tuple[int, int]:
     """
     Remove poses where head keypoints are largely outside their bbox (e.g. tracker ID switch),
     and zero out individual limb keypoints that fall far outside the bbox.
-    Returns number of poses removed.
+    Returns (number of poses removed, number of limb keypoint confidences zeroed).
     """
+    fj = int(frame_data.get("frame_idx", -1))
     poses = frame_data.get("poses", {})
     track_ids = frame_data.get("track_ids", [])
     boxes = frame_data.get("boxes", [])
     to_remove = set()
+    keypoints_zeroed = 0
     for idx, tid in enumerate(track_ids):
         if tid not in poses or idx >= len(boxes):
             continue
@@ -283,33 +307,65 @@ def sanitize_pose_bbox_consistency(
                     break
                 elif kpts.shape[1] > 2:
                     kpts[i, 2] = 0.0
-                    
+                    keypoints_zeroed += 1
+                    _log.debug(
+                        "sanitize_pose_bbox_consistency frame=%s track_id=%s keypoint_idx=%s "
+                        "action=zero_keypoint_conf",
+                        fj,
+                        tid,
+                        i,
+                    )
+
         if invalid_head:
             continue
-            
-    fj = int(frame_data.get("frame_idx", -1))
+
     for tid in to_remove:
+        _log.debug(
+            "sanitize_pose_bbox_consistency frame=%s track_id=%s action=removed_pose",
+            fj,
+            tid,
+        )
         if phase6_log is not None:
-            phase6_log.append(
-                {
-                    "rule": "sanitize_pose_bbox_consistency",
-                    "track_id": int(tid),
-                    "frame_idx": fj,
-                    "decision": "removed_pose",
-                }
-            )
+            _box = None
+            for _bi, _bt in enumerate(track_ids):
+                if _bt == tid and _bi < len(boxes):
+                    _box = tuple(float(x) for x in boxes[_bi])
+                    break
+            _row = {
+                "rule": "sanitize_pose_bbox_consistency",
+                "track_id": int(tid),
+                "frame_idx": fj,
+                "decision": "removed_pose",
+            }
+            if _box is not None:
+                _row["bbox_xyxy"] = [round(_box[0], 1), round(_box[1], 1), round(_box[2], 1), round(_box[3], 1)]
+            phase6_log.append(_row)
         if tid in poses:
             del poses[tid]
+    if to_remove or keypoints_zeroed:
+        _log.info(
+            "sanitize_pose_bbox_consistency frame=%s removed_poses=%s keypoints_zeroed=%s "
+            "(keypoint zeros are not written to prune_log_entries)",
+            fj,
+            len(to_remove),
+            keypoints_zeroed,
+        )
     if to_remove:
+        sam_f, sam_m = _sam_arrays_for_fd(frame_data)
         new_boxes = []
         new_track_ids = []
-        for box, t in zip(boxes, track_ids):
+        new_sf = []
+        new_sm = []
+        for i, (box, t) in enumerate(zip(boxes, track_ids)):
             if t not in to_remove:
                 new_boxes.append(box)
                 new_track_ids.append(t)
+                new_sf.append(sam_f[i] if i < len(sam_f) else False)
+                new_sm.append(sam_m[i] if i < len(sam_m) else None)
         frame_data["boxes"] = new_boxes
         frame_data["track_ids"] = new_track_ids
-    return len(to_remove)
+        _fd_set_sam_parallel(frame_data, new_sf, new_sm)
+    return len(to_remove), keypoints_zeroed
 
 
 def deduplicate_collocated_poses(
@@ -420,30 +476,54 @@ def deduplicate_collocated_poses(
                 to_suppress.add(suppressed)
 
     fj = int(frame_data.get("frame_idx", -1))
+    if to_suppress:
+        _log.info(
+            "deduplicate_collocated_poses frame=%s suppressed_track_ids=%s count=%s",
+            fj,
+            sorted(to_suppress),
+            len(to_suppress),
+        )
     for tid in to_suppress:
+        _log.debug(
+            "deduplicate_collocated_poses frame=%s track_id=%s action=suppressed_duplicate",
+            fj,
+            tid,
+        )
         if phase6_log is not None:
-            phase6_log.append(
-                {
-                    "rule": "deduplicate_collocated_poses",
-                    "track_id": int(tid),
-                    "frame_idx": fj,
-                    "decision": "suppressed_duplicate",
-                }
-            )
+            _box = None
+            for _bi, _bt in enumerate(track_ids):
+                if _bt == tid and _bi < len(boxes):
+                    _box = tuple(float(x) for x in boxes[_bi])
+                    break
+            _row = {
+                "rule": "deduplicate_collocated_poses",
+                "track_id": int(tid),
+                "frame_idx": fj,
+                "decision": "suppressed_duplicate",
+            }
+            if _box is not None:
+                _row["bbox_xyxy"] = [round(_box[0], 1), round(_box[1], 1), round(_box[2], 1), round(_box[3], 1)]
+            phase6_log.append(_row)
         if tid in poses:
             del poses[tid]
 
     # Also strip suppressed tracks from boxes and track_ids so phantom boxes
     # don't persist downstream (CVM, rendering, scoring).
     if to_suppress:
+        sam_f, sam_m = _sam_arrays_for_fd(frame_data)
         new_boxes = []
         new_track_ids = []
-        for box, tid in zip(boxes, track_ids):
+        new_sf = []
+        new_sm = []
+        for i, (box, tid) in enumerate(zip(boxes, track_ids)):
             if tid not in to_suppress:
                 new_boxes.append(box)
                 new_track_ids.append(tid)
+                new_sf.append(sam_f[i] if i < len(sam_f) else False)
+                new_sm.append(sam_m[i] if i < len(sam_m) else None)
         frame_data["boxes"] = new_boxes
         frame_data["track_ids"] = new_track_ids
+        _fd_set_sam_parallel(frame_data, new_sf, new_sm)
 
 
 # Late entrant window: tracks starting in this frame range are likely new people, not fragments
@@ -841,18 +921,24 @@ def apply_occlusion_reid(
                 unique_tids[mapped_tid] = (idx, score, tid)
                 
         # Reconstruct frame data without duplicates
+        sam_f, sam_m = _sam_arrays_for_fd(fd)
         new_track_ids = []
         new_boxes = []
         new_poses = {}
+        new_sf = []
+        new_sm = []
         for mapped_tid, (original_idx, _, original_tid) in unique_tids.items():
             new_track_ids.append(mapped_tid)
             new_boxes.append(boxes[original_idx])
+            new_sf.append(sam_f[original_idx] if original_idx < len(sam_f) else False)
+            new_sm.append(sam_m[original_idx] if original_idx < len(sam_m) else None)
             if original_tid in poses:
                 new_poses[mapped_tid] = poses[original_tid]
-                
+
         fd["track_ids"] = new_track_ids
         fd["boxes"] = new_boxes
         fd["poses"] = new_poses
+        _fd_set_sam_parallel(fd, new_sf, new_sm)
 
     return all_frame_data
 
@@ -971,6 +1057,11 @@ def _apply_id_swap_from_frame(
         if tid_a not in track_ids or tid_b not in track_ids:
             continue
         idx_a, idx_b = track_ids.index(tid_a), track_ids.index(tid_b)
+        sam_f, sam_m = _sam_arrays_for_fd(fd)
+        new_sf = list(sam_f)
+        new_sm = list(sam_m)
+        new_sf[idx_a], new_sf[idx_b] = new_sf[idx_b], new_sf[idx_a]
+        new_sm[idx_a], new_sm[idx_b] = new_sm[idx_b], new_sm[idx_a]
         new_track_ids = list(track_ids)
         new_boxes = list(boxes)
         new_poses = dict(poses)
@@ -980,6 +1071,7 @@ def _apply_id_swap_from_frame(
         fd["track_ids"] = new_track_ids
         fd["boxes"] = new_boxes
         fd["poses"] = new_poses
+        _fd_set_sam_parallel(fd, new_sf, new_sm)
 
 
 def apply_acceleration_audit(
@@ -1095,6 +1187,11 @@ def apply_acceleration_audit(
 
             if best_other is not None:
                 idx_b, tid_b = best_other
+                sam_f, sam_m = _sam_arrays_for_fd(fd)
+                new_sf = list(sam_f)
+                new_sm = list(sam_m)
+                new_sf[idx_a], new_sf[idx_b] = new_sf[idx_b], new_sf[idx_a]
+                new_sm[idx_a], new_sm[idx_b] = new_sm[idx_b], new_sm[idx_a]
                 new_track_ids = list(track_ids)
                 new_boxes = list(boxes)
                 new_poses = dict(poses)
@@ -1105,6 +1202,7 @@ def apply_acceleration_audit(
                 fd["track_ids"] = new_track_ids
                 fd["boxes"] = new_boxes
                 fd["poses"] = new_poses
+                _fd_set_sam_parallel(fd, new_sf, new_sm)
                 corrections += 1
                 break
 
