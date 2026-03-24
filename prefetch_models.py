@@ -8,13 +8,13 @@ Run once while you have internet, from the sway_pose_mvp directory:
   python prefetch_models.py
 
 This touches:
-  - Ultralytics YOLO (yolo11m.pt → models/ or hub cache)
-  - Hugging Face ViTPose base + large (HF cache, usually ~/.cache/huggingface)
+  - Ultralytics YOLO (yolo26l.pt → models/ or hub cache)
+  - Hugging Face ViTPose base + large + huge (HF cache, usually ~/.cache/huggingface)
   - BoxMOT OSNet Re-ID weights → models/osnet_x0_25_msmt17.pt (default tracker path)
 
-Fine-tuning YOLO11x on DanceTrack + CrowdHuman (optional): base weights `yolo11x.pt`
+Fine-tuning YOLO26l on DanceTrack + CrowdHuman (optional): base weights `yolo26l.pt`
 are pulled automatically by Ultralytics the first time you run
-`scripts/phase2_public_training/train_yolo11x.py` — no separate prefetch step for
+`scripts/phase2_public_training/train_yolo26l.py` — no separate prefetch step for
 that file. See `scripts/phase2_public_training/README.md` for the full workflow.
 
 After that, set SWAY_OFFLINE=1 when running without network (see README.md, Offline).
@@ -40,14 +40,14 @@ def main() -> None:
 
     print(f"Working directory: {root}\n")
 
-    print("[1/4] YOLO yolo11m.pt …")
+    print("[1/5] YOLO yolo26l.pt …")
     from ultralytics import YOLO
 
-    yolo_pt = root / "models" / "yolo11m.pt"
-    YOLO(str(yolo_pt) if yolo_pt.is_file() else "yolo11m.pt")
+    yolo_pt = root / "models" / "yolo26l.pt"
+    YOLO(str(yolo_pt) if yolo_pt.is_file() else "yolo26l.pt")
     print("      OK\n")
 
-    print("[2/4] BoxMOT OSNet Re-ID (osnet_x0_25_msmt17.pt) …")
+    print("[2/5] BoxMOT OSNet Re-ID (osnet_x0_25_msmt17.pt) …")
     osnet_dst = root / "models" / "osnet_x0_25_msmt17.pt"
     if not osnet_dst.is_file():
         osnet_dst.parent.mkdir(parents=True, exist_ok=True)
@@ -88,10 +88,11 @@ def main() -> None:
         (
             "usyd-community/vitpose-plus-base",
             "usyd-community/vitpose-plus-large",
+            "usyd-community/vitpose-plus-huge",
         ),
         start=3,
     ):
-        print(f"[{i}/4] ViTPose {mid} …")
+        print(f"[{i}/5] ViTPose {mid} …")
         est = PoseEstimator(device=device, model_name=mid)
         del est
         gc.collect()

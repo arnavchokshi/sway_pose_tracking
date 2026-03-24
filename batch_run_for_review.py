@@ -135,8 +135,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--pose-model",
-        choices=["base", "large"],
+        choices=["base", "large", "huge"],
         default="base",
+        help="Passed to main.py --pose-model (huge = ViTPose-H; needs VRAM).",
     )
     ap.add_argument(
         "--pose-stride",
