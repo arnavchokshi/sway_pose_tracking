@@ -12,6 +12,8 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
+from .torch_compat import torch_load_trusted
+
 INFINITY = 1e5
 
 # Training defaults from StrongSORT AFLink/config.py
@@ -171,7 +173,7 @@ class AFLink:
         self.thrS = thrS
         self.device = device or _default_device()
         self.model = PostLinker()
-        state = torch.load(path_AFLink, map_location="cpu")
+        state = torch_load_trusted(path_AFLink, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         self.model.load_state_dict(state, strict=False)

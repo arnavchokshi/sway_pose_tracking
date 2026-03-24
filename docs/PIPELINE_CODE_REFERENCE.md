@@ -103,8 +103,7 @@ Source: `sway/tracker.py` `run_tracking_before_post_stitch` ~L1189–1204, `_use
 
 1. If `SWAY_YOLO_WEIGHTS` set: filesystem `.pt` path, or alias token (e.g. `yolo26l` → `yolo26l.pt`), or raw hub string.
 2. Else scan `models/`, repo root, cwd for a **priority list** starting with `yolo26l.pt`, `yolo26l_dancetrack.pt`, …
-3. Else Core ML `yolo11l.mlpackage` / `yolo11m.mlpackage` if present.
-4. Else hub **`yolo26l.pt`** (unless offline env forbids).
+3. Else hub **`yolo26l.pt`** (unless offline env forbids).
 
 Source: `sway/tracker.py` ~L251–322.
 
@@ -173,7 +172,7 @@ Source: `sway/tracker.py` ~L866–877, `_run_tracking_botsort_pre_stitch` ~L1080
 **Order (code):**
 
 1. `load_tracking_runtime()` for stitch/coalescence params.
-2. `_apply_dormant_and_global`: `apply_dormant_merges` then, if `SWAY_GLOBAL_LINK` truthy, `maybe_global_stitch` (`sway/global_track_link.py`). **Neural AFLink** runs when `models/AFLink_epoch20.pth` exists (or `SWAY_AFLINK_WEIGHTS`); otherwise heuristic stitch. Set `SWAY_GLOBAL_AFLINK=0` to force heuristic even if weights exist. Prefetch step `[6/6]` in `prefetch_models.py` documents where to obtain weights.
+2. `_apply_dormant_and_global`: `apply_dormant_merges` then, if `SWAY_GLOBAL_LINK` truthy, `maybe_global_stitch` (`sway/global_track_link.py`). **Neural AFLink** runs when `models/AFLink_epoch20.pth` exists (or `SWAY_AFLINK_WEIGHTS`); otherwise heuristic stitch. Set `SWAY_GLOBAL_AFLINK=0` to force heuristic even if weights exist. Prefetch step `[6/6]` in `tools/prefetch_models.py` documents where to obtain weights.
 3. `stitch_fragmented_tracks` — max gap default **60** frames, radius **0.5×** bbox height, predicted radius frac **0.75**, pixel fallback **120**, short gap **20** frames.
 4. `coalescence_deduplicate` — IoU **0.70**, **8** consecutive frames (env-overridable).
 5. `merge_complementary_tracks`, `merge_coexisting_fragments`.

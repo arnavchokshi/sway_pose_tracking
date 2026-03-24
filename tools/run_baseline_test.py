@@ -4,7 +4,7 @@ Phase 2: Rigorous Testing Protocol — Baseline & Validation
 
 Run pipeline on test videos and log metrics for comparison.
 Usage:
-  python run_baseline_test.py [--baseline] [--videos VIDEO1 VIDEO2 ...]
+  python -m tools.run_baseline_test [--baseline] [--videos VIDEO1 VIDEO2 ...]
   --baseline: Establish baseline (run current pipeline, log metrics)
   (default): Run with fixes, compare to baseline
 
@@ -20,6 +20,10 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def find_videos(patterns: List[str]) -> List[Path]:
@@ -38,9 +42,8 @@ def find_videos(patterns: List[str]) -> List[Path]:
 
 def run_pipeline(video_path: Path, output_dir: Path, params: Optional[Path] = None) -> bool:
     """Run main pipeline, return success."""
-    script_dir = Path(__file__).resolve().parent
     cmd = [
-        sys.executable, str(script_dir / "main.py"),
+        sys.executable, str(REPO_ROOT / "main.py"),
         str(video_path),
         "--output-dir", str(output_dir),
     ]

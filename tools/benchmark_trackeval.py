@@ -12,7 +12,7 @@ Ground-truth YAML may include:
 
 Or pass paths explicitly:
 
-  python benchmark_trackeval.py --gt-mot benchmarks/gt.txt --json output/data.json
+  python -m tools.benchmark_trackeval --gt-mot benchmarks/gt.txt --json output/data.json
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ from pathlib import Path
 
 import yaml
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def main() -> None:
@@ -37,7 +39,7 @@ def main() -> None:
     parser.add_argument("--im-height", type=int, default=1080)
     args = parser.parse_args()
 
-    sys.path.insert(0, str(SCRIPT_DIR))
+    sys.path.insert(0, str(REPO_ROOT))
     from sway.mot_format import load_mot_lines_from_file
     from sway.mot_format import data_json_to_mot_lines
     from sway.trackeval_runner import run_trackeval_single_sequence

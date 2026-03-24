@@ -12,7 +12,7 @@ export default function App() {
       <LabProvider>
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: '100vh' }}>
           <NavBar />
-          <main style={{ flex: 1 }}>
+          <main className="main-content">
             <Routes>
               <Route path="/" element={<LabPage />} />
               <Route path="/config" element={<ConfigPage />} />

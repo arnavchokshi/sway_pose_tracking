@@ -42,7 +42,8 @@ export const WATCH_PHASE_ROWS: {
     file: '02_pre_pose_prune.mp4',
     id: 'pre_pose',
     title: 'Phase 4 · Pre-pose pruning',
-    blurb: 'Duration, kinetic, stage polygon, spatial outliers, audience, mirrors, bbox heuristics.',
+    blurb:
+      'Duration, kinetic, stage polygon, spatial outliers, audience, mirrors, bbox heuristics. Pruned tracks are drawn on this preview (re-run with phase previews to regenerate).',
   },
   {
     file: '03_pose.mp4',
@@ -54,13 +55,15 @@ export const WATCH_PHASE_ROWS: {
     file: '04_phases_6_7.mp4',
     id: 'collision',
     title: 'Phases 6–7 · Association & collision cleanup',
-    blurb: 'main.py [6/11] occlusion re-ID / crossover; [7/11] dedup + bbox–pose sanitize.',
+    blurb:
+      'main.py [6/11] occlusion re-ID / crossover; [7/11] dedup + bbox–pose sanitize. Dedup/sanitize boxes and labels are burned into this clip.',
   },
   {
     file: '05_post_pose_prune.mp4',
     id: 'post_pose',
     title: 'Phase 8 · Post-pose pruning',
-    blurb: 'Tier C skeleton quality, Tier B weighted vote (sync, mirror, edge, jitter, …).',
+    blurb:
+      'Tier C skeleton quality, Tier B weighted vote (sync, mirror, edge, jitter, …). Tier B/C prune boxes are burned into this preview.',
   },
 ]
 
@@ -99,6 +102,16 @@ export function parseBboxXyxy(e: PruneEntry): [number, number, number, number] |
   const m = e.bbox_xyxy_median
   if (Array.isArray(m) && m.length >= 4) {
     const q = m.map((x) => Number(x)) as [number, number, number, number]
+    if (q.every((n) => Number.isFinite(n))) return q
+  }
+  return null
+}
+
+/** Paired bbox for dedup: the track ID we kept (other_bbox_xyxy is that person's box). */
+export function parseOtherBboxXyxy(e: PruneEntry): [number, number, number, number] | null {
+  const b = e.other_bbox_xyxy
+  if (Array.isArray(b) && b.length >= 4) {
+    const q = b.map((x) => Number(x)) as [number, number, number, number]
     if (q.every((n) => Number.isFinite(n))) return q
   }
   return null

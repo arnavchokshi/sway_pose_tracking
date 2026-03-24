@@ -25,7 +25,7 @@ What to capture when reviewing pipeline outputs, **how to run offline (e.g. on a
 1. **Batch-run** all prepared videos into one folder:
    ```bash
    cd sway_pose_mvp
-   python batch_run_for_review.py --input-dir /path/to/your/videos --output-root output/flight_batch --pose-model base --skip-existing
+   python -m tools.batch_run_for_review --input-dir /path/to/your/videos --output-root output/flight_batch --pose-model base --skip-existing
    ```
 2. Open the review site (prefer **`serve_review.py`** as above, or generated `review/index.html`).
 3. **Review** each clip; the page **autosaves** in the browser.

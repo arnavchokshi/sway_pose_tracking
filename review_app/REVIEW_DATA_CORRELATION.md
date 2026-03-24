@@ -3,7 +3,7 @@
 Generated from every text field in each review record (except `updated_at`), plus `metadata`, `track_summaries`, per-frame **`tracks`** counts from `data.json`, and `prune_log.json`.
 
 - Review file: (local export JSONL, e.g. human review export)
-- Data root: `sway_pose_mvp/output/flight_batch` (relative to repo; batch output from `batch_run_for_review.py`)
+- Data root: `sway_pose_mvp/output/flight_batch` (relative to repo; batch output from `python -m tools.batch_run_for_review`)
 
 
 ---

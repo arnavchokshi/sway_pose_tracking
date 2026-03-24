@@ -8,9 +8,10 @@ import {
   defaultsFromSchema,
 } from '../configPresets'
 import { InlineFieldInput } from '../components/InlineFieldInput'
+import { ConfigFieldWrap, ConfigInfoFold } from '../components/ConfigFieldWrap'
 import { HYBRID_SAM_PHASE_ID, hideHybridSamPhase } from '../lib/labFieldVisibility'
 import { mainPyPhaseCaption } from '../lib/schemaStageCaption'
-import { Save, Copy } from 'lucide-react'
+import { ComplexityVisualizer } from '../components/ComplexityVisualizer'
 
 export function ConfigPage() {
   const [schema, setSchema] = useState<Schema | null>(null)
@@ -18,7 +19,6 @@ export function ConfigPage() {
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
   const [configName, setConfigName] = useState('My Config')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
-  const [showAdvanced, setShowAdvanced] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -63,13 +63,12 @@ export function ConfigPage() {
     if (!schema) return new Map<string, SchemaField[]>()
     const m = new Map<string, SchemaField[]>()
     for (const f of schema.fields) {
-      if (f.advanced && !showAdvanced) continue
       const arr = m.get(f.phase) || []
       arr.push(f)
       m.set(f.phase, arr)
     }
     return m
-  }, [schema, showAdvanced])
+  }, [schema])
 
   if (schemaError) {
     return (
@@ -113,7 +112,7 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
     activeStage?.id === HYBRID_SAM_PHASE_ID && hideHybridSamPhase(fieldsState.tracker_technology)
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', height: '100%' }}>
       {/* Header */}
       <div className="glass-panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 2rem' }}>
         <input 
@@ -133,30 +132,22 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
               {CONFIG_PRESET_LABELS[id]}
             </button>
           ))}
-          <button className="btn"><Copy size={16}/> Duplicate</button>
-          <button className="btn primary"><Save size={16}/> Save Config</button>
         </div>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem', flex: 1 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', flex: 1 }}>
         {/* Top: Flowchart */}
-        <div className="glass-panel" style={{ padding: '2rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <div>
-              <h2 style={{ margin: 0, fontSize: '1.2rem', color: '#fff' }}>Pipeline Flow</h2>
-              <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-                Phase labels match <code style={{ color: 'var(--halo-cyan)' }}>main.py</code> [1/11]…[11/11] and{' '}
-                <code style={{ color: 'var(--halo-cyan)' }}>docs/PIPELINE_CODE_REFERENCE.md</code>.
-              </p>
-            </div>
-            <label className="checkbox-label" style={{ background: 'rgba(0,0,0,0.3)', padding: '0.5rem 1rem', borderRadius: '8px' }}>
-              <input type="checkbox" checked={showAdvanced} onChange={e => setShowAdvanced(e.target.checked)} style={{ display: 'none' }}/>
-              <div className="checkbox-visual"></div>
-              Show Advanced Params
-            </label>
+        <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
+          <div style={{ marginBottom: '1rem' }}>
+            <h2 style={{ margin: 0, fontSize: '1.2rem', color: '#fff' }}>Pipeline Flow</h2>
+            <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+              Left to right is the order your video is processed. Numbers in the small caption align with the full pipeline
+              run log if you need to match a step in code.
+            </p>
           </div>
           
-          <div className="flowchart-board" style={{ position: 'relative', overflowX: 'auto', padding: '2rem 1rem', display: 'flex', alignItems: 'center', gap: '1.5rem', minHeight: 'auto', background: 'transparent' }}>
+          <div className="flowchart-board" style={{ position: 'relative', overflowX: 'auto', padding: '1rem 0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', minHeight: 'auto', background: 'transparent' }}>
+            <ComplexityVisualizer fieldsState={fieldsState} />
             {stages.map((stage, idx) => {
               const isActive = idx === activePhaseIndex
               const isDone = idx < activePhaseIndex
@@ -167,32 +158,31 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
                     onClick={() => setActivePhaseIndex(idx)}
                     className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
                     style={{
-                      border: isActive ? '2px solid var(--halo-cyan)' : '1px solid var(--glass-border)',
-                      background: isActive ? 'rgba(14, 165, 233, 0.15)' : 'rgba(15, 20, 30, 0.7)',
-                      padding: '1.2rem 1.5rem',
+                      padding: '1rem 1.2rem',
                       display: 'flex',
                       flexDirection: 'column',
                       alignItems: 'center',
-                      gap: '0.5rem',
-                      minWidth: '200px'
+                      gap: '0.35rem',
+                      minWidth: '180px'
                     }}
                   >
                     <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>{mainPyPhaseCaption(stage, idx)}</div>
                     <div style={{ fontWeight: 600, color: isActive ? '#fff' : 'var(--text-main)', fontSize: '1rem' }}>{stage.label}</div>
                   </div>
                   
-                  {/* Arrow to next node */}
+                  {/* Animated SVG Connector to next node */}
                   {idx < stages.length - 1 && (
-                    <div style={{ display: 'flex', alignItems: 'center', position: 'relative' }}>
-                      <div style={{ height: '2px', width: '30px', background: isDone ? 'var(--halo-cyan)' : 'var(--glass-border)' }}></div>
-                      <div style={{ 
-                        width: 0, height: 0, 
-                        borderTop: '6px solid transparent', 
-                        borderBottom: '6px solid transparent', 
-                        borderLeft: `8px solid ${isDone ? 'var(--halo-cyan)' : 'var(--glass-border)'}`,
-                        marginLeft: '-1px'
-                      }}></div>
-                    </div>
+                    <svg width="40" height="24" viewBox="0 0 40 24" style={{ overflow: 'visible', flexShrink: 0 }}>
+                      <path 
+                        d="M 0 12 C 15 12, 25 12, 34 12" 
+                        className={`flow-path ${isDone ? 'done' : ''} ${isActive ? 'active' : ''}`}
+                      />
+                      <polygon 
+                        points="32,7 40,12 32,17" 
+                        fill={isDone || isActive ? 'var(--halo-cyan)' : 'var(--glass-border)'} 
+                        style={{ transition: 'fill 0.5s' }}
+                      />
+                    </svg>
                   )}
                 </div>
               )
@@ -201,9 +191,12 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
         </div>
 
         {/* Bottom Active Params */}
-        <div className="glass-panel" style={{ padding: '2rem', flex: 1 }}>
-          <h2 style={{ marginTop: 0, marginBottom: '2rem', color: '#fff', fontSize: '1.5rem' }}>{activeStage?.label} Parameters</h2>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(350px, 1fr))', gap: '2rem' }}>
+        <div className="glass-panel" style={{ padding: '1.5rem 1.75rem 2rem', flex: 1 }}>
+          <h2 style={{ marginTop: 0, marginBottom: '1.5rem', color: '#fff', fontSize: '1.35rem', fontWeight: 600 }}>{activeStage?.label} — Parameters</h2>
+          <div 
+            key={activeStage?.id}
+            style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '1.25rem' }}
+          >
             {hybridSamHidden ? (
               <div
                 style={{
@@ -217,34 +210,32 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
                   lineHeight: 1.55,
                 }}
               >
-                <strong style={{ color: '#e2e8f0' }}>Hybrid SAM</strong> runs only on the{' '}
-                <strong style={{ color: '#e2e8f0' }}>BoxMOT</strong> path. With <strong style={{ color: '#e2e8f0' }}>BoT-SORT</strong>{' '}
-                selected, these settings are hidden (they would have no effect). Switch Tracker backend to BoxMOT to tune
-                the overlap refiner.
+                Overlap sharpening only runs with the <strong style={{ color: '#e2e8f0' }}>built-in tracker</strong>.{' '}
+                With the <strong style={{ color: '#e2e8f0' }}>alternate tracker</strong> selected, these options are hidden
+                because they would not apply. Switch back to tune overlap behavior.
               </div>
             ) : (
               <>
-                {activeFields.map((f) => (
-                  <div key={f.id} style={{ background: 'rgba(0,0,0,0.2)', padding: '1.2rem', borderRadius: '12px', border: '1px solid var(--glass-border)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-                      <label style={{ color: '#fff', fontWeight: 500 }}>{f.label}</label>
+                {activeFields.map((f, idx) =>
+                  f.type === 'info' ? (
+                    <div key={f.id} className="animate-slide-up" style={{ gridColumn: '1 / -1', animationDelay: `${idx * 0.04}s` }}>
+                      <ConfigInfoFold title={`ℹ ${f.label}`} body={f.description ?? ''} />
                     </div>
-                    {f.type !== 'info' && f.description && (
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '1rem', fontStyle: 'italic' }}>{f.description}</div>
-                    )}
-                    {f.type === 'info' ? (
-                      <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.55 }}>{f.description}</div>
-                    ) : (
-                      <InlineFieldInput
-                        f={f}
-                        value={fieldsState[f.id]}
-                        onChange={(v) => setFieldsState((prev) => ({ ...prev, [f.id]: v }))}
-                      />
-                    )}
-                  </div>
-                ))}
+                  ) : (
+                    <div key={f.id} className="animate-slide-up" style={{ animationDelay: `${idx * 0.04}s` }}>
+                      <ConfigFieldWrap field={f} value={fieldsState[f.id]}>
+                        <InlineFieldInput
+                          f={f}
+                          value={fieldsState[f.id]}
+                          onChange={(v) => setFieldsState((prev) => ({ ...prev, [f.id]: v }))}
+                          allFields={fieldsState}
+                        />
+                      </ConfigFieldWrap>
+                    </div>
+                  ),
+                )}
                 {activeFields.length === 0 && (
-                  <div style={{ color: 'var(--text-muted)' }}>No configurable parameters for this phase.</div>
+                  <div style={{ color: 'var(--text-muted)' }}>Nothing to change on this step.</div>
                 )}
               </>
             )}

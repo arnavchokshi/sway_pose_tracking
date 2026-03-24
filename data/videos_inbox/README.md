@@ -5,7 +5,7 @@ Drop source videos here (`.mp4`, `.mov`, `.m4v`, `.webm`).
 From `sway_pose_mvp/`:
 
 ```bash
-python batch_run_for_review.py --input-dir data/videos_inbox --output-root output/flight_batch --pose-model base --skip-existing
+python -m tools.batch_run_for_review --input-dir data/videos_inbox --output-root output/flight_batch --pose-model base --skip-existing
 ```
 
 If the machine sleeps or the process stops, run the same command again: clips that already have a finished `*_poses.mp4` are skipped; the rest continue from scratch for that file (no partial final MP4 is left on disk).

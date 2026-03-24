@@ -106,6 +106,8 @@ Primary flags:
   SWAY_HYBRID_SAM_OVERLAP=0          Disable hybrid refiner (default on).
   SWAY_HYBRID_SAM_IOU_TRIGGER=0.42   Max pairwise IoU threshold (default 0.42 in code).
   SWAY_HYBRID_SAM_MIN_DETS=2         Minimum person count to evaluate overlap.
+  SWAY_HYBRID_SAM_ROI_CROP=1         When 1 (default), SAM runs on a padded union crop of overlapped dancers only.
+  SWAY_HYBRID_SAM_ROI_PAD_FRAC=0.1   ROI margin as a fraction of union width/height.
   SWAY_HYBRID_SAM_WEIGHTS=sam2.1_b.pt  Ultralytics SAM checkpoint.
   SWAY_YOLO_WEIGHTS, SWAY_YOLO_CONF, SWAY_DETECT_SIZE, SWAY_YOLO_DETECTION_STRIDE
                                      Same as non-hybrid tracking.

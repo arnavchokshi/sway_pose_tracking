@@ -9,6 +9,7 @@ V3.0: circmean/circmedian Group Truth, cDTW (Sakoe-Chiba band=3), ripple->NaN.
 """
 
 from typing import Dict, List, Optional, Any, Tuple
+import warnings
 
 import numpy as np
 from scipy.stats import circmean
@@ -169,13 +170,15 @@ def _compute_shape_and_timing_cdtw(
     group_1d = np.nan_to_num(group_filled, nan=0.0).ravel()
 
     # pyts dtw expects 1D arrays (n_timestamps,)
-    dist, path = dtw(
-        track_1d,
-        group_1d,
-        method="sakoechiba",
-        options={"window_size": sakoe_chiba_band},
-        return_path=True,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=FutureWarning)
+        dist, path = dtw(
+            track_1d,
+            group_1d,
+            method="sakoechiba",
+            options={"window_size": sakoe_chiba_band},
+            return_path=True,
+        )
     if path is None or path.size == 0:
         return float("nan"), 0.0
 

@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -89,17 +89,45 @@ def _deviation_to_color(
     return COLOR_MAJOR_ERROR
 
 
+def _mean_pose_confidence(tid: int, poses: Optional[Dict[int, Dict]]) -> Optional[float]:
+    """Mean keypoint confidence for a track (scores array or keypoints[:, 2])."""
+    if not poses:
+        return None
+    key = int(tid)
+    if key not in poses:
+        return None
+    data = poses[key]
+    sc = data.get("scores")
+    if sc is not None:
+        arr = np.asarray(sc, dtype=np.float64)
+        if arr.size > 0:
+            return float(np.mean(arr))
+    kp = data.get("keypoints")
+    if kp is not None:
+        arr = np.asarray(kp, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[1] >= 3 and arr.shape[0] > 0:
+            return float(np.mean(arr[:, 2]))
+    return None
+
+
 def draw_boxes_only(
     frame: np.ndarray,
     boxes: List[tuple],
     track_ids: List[int],
+    poses: Optional[Dict[int, Dict]] = None,
 ) -> np.ndarray:
-    """Draw only bounding boxes and track ID labels (no skeletons)."""
+    """Draw only bounding boxes and track ID labels (no skeletons).
+
+    When ``poses`` is provided, each label includes mean keypoint confidence, e.g. ``ID:3 0.82``.
+    """
     out = frame.copy()
     for box, tid in zip(boxes, track_ids):
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(out, (x1, y1), (x2, y2), BOX_COLOR, 2)
         label = f"ID:{tid}"
+        mc = _mean_pose_confidence(int(tid), poses)
+        if mc is not None:
+            label = f"{label} {mc:.2f}"
         cv2.putText(out, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
                      0.6, TEXT_COLOR, 1, cv2.LINE_AA)
     return out
@@ -339,6 +367,136 @@ def draw_skeleton_only(
             x, y = int(keypoints[j, 0]), int(keypoints[j, 1])
             cv2.circle(out, (x, y), 4, KEYPOINT_COLOR, -1)
 
+    return out
+
+
+def _bgr_depth_shade(base: Tuple[int, int, int], z_edge: float, z_min: float, z_max: float) -> Tuple[int, int, int]:
+    """Scale BGR by depth so nearer joints (higher z in lifted coords) read slightly brighter."""
+    if not (math.isfinite(z_edge) and math.isfinite(z_min) and math.isfinite(z_max)):
+        return base
+    span = z_max - z_min
+    if span < 1e-9:
+        t = 0.5
+    else:
+        t = (z_edge - z_min) / span
+    t = max(0.0, min(1.0, t))
+    # Emphasize depth: low z dimmer, high z brighter (typical after per-track normalize)
+    bright = 0.58 + 0.42 * t
+    return tuple(max(0, min(255, int(c * bright))) for c in base)
+
+
+def draw_3d_registered_video_frame(
+    frame: np.ndarray,
+    interp: Dict[str, Any],
+) -> np.ndarray:
+    """
+    Video-registered 3D preview: joints stay at ViTPose (x, y) pixels — same layout as the
+    real dancers. MotionAGFormer ``z`` in ``keypoints_3d`` only modulates limb brightness
+    (depth cue). Same heatmap colors as ``draw_skeleton_only`` when scoring data is present.
+    """
+    out = frame.copy()
+    h, w = out.shape[:2]
+    poses = interp.get("poses") or {}
+    deviations = interp.get("deviations") or {}
+    shape_errors = interp.get("shape_errors") or {}
+    timing_errors = interp.get("timing_errors") or {}
+
+    any_k3 = False
+    for _tid, data in poses.items():
+        k3 = data.get("keypoints_3d")
+        if k3 is None:
+            continue
+        k3a = np.asarray(k3)
+        if k3a.ndim >= 2 and k3a.shape[0] >= 17:
+            any_k3 = True
+            break
+
+    if not any_k3:
+        cv2.putText(
+            out,
+            "No keypoints_3d — enable 3D lift (MotionAGFormer + weights)",
+            (16, max(40, h // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 220, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return out
+
+    for tid, data in poses.items():
+        keypoints = data["keypoints"]
+        scores = data.get("scores", np.ones(17))
+        if keypoints.shape[0] < 17:
+            continue
+        k3 = data.get("keypoints_3d")
+        zs: Optional[np.ndarray] = None
+        z_min, z_max = 0.0, 1.0
+        if k3 is not None:
+            k3a = np.asarray(k3, dtype=np.float64)
+            if k3a.shape[0] >= 17 and k3a.shape[1] >= 3:
+                zs = k3a[:17, 2]
+                zz = zs[np.isfinite(zs)]
+                if zz.size > 0:
+                    z_min = float(np.min(zz))
+                    z_max = float(np.max(zz))
+                    if z_max <= z_min:
+                        z_max = z_min + 1e-6
+
+        track_deviations = deviations.get(tid, {})
+        track_shape = shape_errors.get(tid, {})
+        track_timing = timing_errors.get(tid, {})
+
+        for (a, b) in COCO_SKELETON_EDGES:
+            if a >= keypoints.shape[0] or b >= keypoints.shape[0]:
+                continue
+            sa = float(scores[a]) if hasattr(scores, "__len__") else float(scores)
+            sb = float(scores[b]) if hasattr(scores, "__len__") else float(scores)
+            if sa < KEYPOINT_THRESHOLD or sb < KEYPOINT_THRESHOLD:
+                continue
+            x1, y1 = int(keypoints[a, 0]), int(keypoints[a, 1])
+            x2, y2 = int(keypoints[b, 0]), int(keypoints[b, 1])
+            edge = (a, b)
+            if edge in EDGE_TO_DEVIATION_KEY:
+                dev_key = EDGE_TO_DEVIATION_KEY[edge]
+                dev = track_deviations.get(dev_key)
+                base = dev_key.replace("_diff", "")
+                shape_key = f"{base}_shape"
+                timing_key = f"{base}_timing"
+                se = track_shape.get(shape_key)
+                te = track_timing.get(timing_key)
+                base_color = _deviation_to_color(dev, se, te, joint_base=base)
+            else:
+                base_color = COLOR_OCCLUDED
+            if zs is not None:
+                z_edge = 0.5 * (float(zs[a]) + float(zs[b]))
+                color = _bgr_depth_shade(base_color, z_edge, z_min, z_max)
+            else:
+                color = base_color
+            cv2.line(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+        for j in range(keypoints.shape[0]):
+            sc = float(scores[j]) if hasattr(scores, "__len__") else float(scores)
+            if sc < KEYPOINT_THRESHOLD:
+                continue
+            x, y = int(keypoints[j, 0]), int(keypoints[j, 1])
+            if zs is not None:
+                zj = float(zs[j])
+                color = _bgr_depth_shade(KEYPOINT_COLOR, zj, z_min, z_max)
+            else:
+                color = KEYPOINT_COLOR
+            cv2.circle(out, (x, y), 4, color, -1, cv2.LINE_AA)
+
+    cv2.putText(
+        out,
+        "3D lift: skeleton on video (x,y = pose; shade = depth z)",
+        (8, h - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (240, 240, 240),
+        1,
+        cv2.LINE_AA,
+    )
     return out
 
 
@@ -587,6 +745,28 @@ def _interpolate_frame_data(
             kpt_interp = kpt_lo + t * (kpt_hi - kpt_lo)
             sc_interp = np.maximum(sc_lo, sc_hi)  # keep higher confidence
             poses_out[tid] = {"keypoints": kpt_interp, "scores": sc_interp}
+            k3_lo = poses_lo[tid].get("keypoints_3d")
+            k3_hi = poses_hi[tid].get("keypoints_3d")
+            if k3_lo is not None and k3_hi is not None:
+                a = np.asarray(k3_lo, dtype=np.float64)
+                b = np.asarray(k3_hi, dtype=np.float64)
+                if a.shape == b.shape:
+                    poses_out[tid]["keypoints_3d"] = (a + t * (b - a)).astype(np.float32).tolist()
+            elif k3_lo is not None:
+                poses_out[tid]["keypoints_3d"] = k3_lo
+            elif k3_hi is not None:
+                poses_out[tid]["keypoints_3d"] = k3_hi
+            lift_lo = poses_lo[tid].get("lift_xyz")
+            lift_hi = poses_hi[tid].get("lift_xyz")
+            if lift_lo is not None and lift_hi is not None:
+                L0 = np.asarray(lift_lo, dtype=np.float64)
+                L1 = np.asarray(lift_hi, dtype=np.float64)
+                if L0.shape == L1.shape:
+                    poses_out[tid]["lift_xyz"] = (L0 + t * (L1 - L0)).astype(np.float32)
+            elif lift_lo is not None:
+                poses_out[tid]["lift_xyz"] = np.asarray(lift_lo, dtype=np.float32).copy()
+            elif lift_hi is not None:
+                poses_out[tid]["lift_xyz"] = np.asarray(lift_hi, dtype=np.float32).copy()
         elif tid in poses_lo:
             poses_out[tid] = poses_lo[tid]
         elif tid in poses_hi:
@@ -853,6 +1033,8 @@ def render_and_export(
     prune_entries: Optional[List[Dict[str, Any]]] = None,
     dropped_pose_overlay: Optional[List[Dict[str, Any]]] = None,
     pose_3d: Optional[Dict[str, Any]] = None,
+    lab_export_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    lift_depth_series: Optional[List[Tuple[int, np.ndarray]]] = None,
 ) -> Dict[str, str]:
     """
     Write JSON keypoint data and rendered MP4 videos.
@@ -865,7 +1047,9 @@ def render_and_export(
 
     Returns:
         Map of logical keys to output filenames (under ``output_dir``): full, track_ids,
-        skeleton, segmentation_style. Empty dict if there are no frames to render.
+        skeleton, segmentation_style, and ``3d`` (``*_3d.mp4``) when ``pose_3d`` is present:
+        same video frame with skeleton drawn at ViTPose (x,y); depth from lift modulates color.
+        Empty dict if there are no frames to render.
     """
     output_dir = Path(output_dir)
     base_name = video_path.stem
@@ -879,6 +1063,44 @@ def render_and_export(
         "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
         "left_knee", "right_knee",
     ]
+
+    cap_meta = cv2.VideoCapture(str(video_path))
+    vw = int(cap_meta.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+    vh = int(cap_meta.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+    cap_meta.release()
+
+    try:
+        from sway.pose_lift_3d import (
+            export_3d_for_viewer,
+            lift_savgol_enabled,
+            refresh_keypoints_3d_from_lift,
+            smooth_lift_xyz_for_export,
+            video_camera_from_pose_3d_camera,
+        )
+
+        if lift_savgol_enabled():
+            n_tr = smooth_lift_xyz_for_export(all_frame_data)
+            if n_tr > 0:
+                _vc = video_camera_from_pose_3d_camera(
+                    pose_3d.get("camera") if isinstance(pose_3d, dict) else None
+                )
+                refresh_keypoints_3d_from_lift(
+                    all_frame_data, vw, vh, lift_depth_series, video_camera=_vc
+                )
+                if pose_3d is not None and pose_3d.get("tracks"):
+                    tids_3d = sorted(int(k) for k in pose_3d["tracks"].keys())
+                    pose_3d = export_3d_for_viewer(
+                        all_frame_data,
+                        tids_3d,
+                        len(all_frame_data),
+                        float(processed_fps),
+                        vw,
+                        vh,
+                        video_camera=_vc,
+                    )
+                print(f"  [3D Lift] Savitzky-Golay smoothed lift_xyz for {n_tr} track(s) before export.")
+    except Exception as ex:
+        print(f"  [3D Lift] Export-time lift smoothing skipped: {ex}", flush=True)
 
     # Build JSON structure with joint angles and deviations per frame (at processed_fps)
     metadata: Dict[str, Any] = {
@@ -937,13 +1159,15 @@ def render_and_export(
     skeleton_part = output_dir / f"{base_name}_skeleton.part.mp4"
     seg_path = output_dir / f"{base_name}_sam_style.mp4"
     seg_part = output_dir / f"{base_name}_sam_style.part.mp4"
+    d3_path = output_dir / f"{base_name}_3d.mp4"
+    d3_part = output_dir / f"{base_name}_3d.part.mp4"
 
     variant_rows: List[Tuple[str, Path, Path, Any]] = [
         (
             "full",
             video_out_path,
             video_part_path,
-            lambda fr, itp: draw_frame(
+            lambda fr, itp, _fi=0: draw_frame(
                 fr,
                 itp["boxes"],
                 itp["track_ids"],
@@ -957,13 +1181,15 @@ def render_and_export(
             "track_ids",
             track_ids_path,
             track_ids_part,
-            lambda fr, itp: draw_boxes_only(fr, itp["boxes"], itp["track_ids"]),
+            lambda fr, itp, _fi=0: draw_boxes_only(
+                fr, itp["boxes"], itp["track_ids"], poses=itp.get("poses")
+            ),
         ),
         (
             "skeleton",
             skeleton_path,
             skeleton_part,
-            lambda fr, itp: draw_skeleton_only(
+            lambda fr, itp, _fi=0: draw_skeleton_only(
                 fr,
                 itp["boxes"],
                 itp["track_ids"],
@@ -977,7 +1203,7 @@ def render_and_export(
             "segmentation_style",
             seg_path,
             seg_part,
-            lambda fr, itp: draw_segmentation_style(
+            lambda fr, itp, _fi=0: draw_segmentation_style(
                 fr,
                 itp["boxes"],
                 itp["track_ids"],
@@ -986,6 +1212,15 @@ def render_and_export(
             ),
         ),
     ]
+    if pose_3d is not None:
+        variant_rows.append(
+            (
+                "3d",
+                d3_path,
+                d3_part,
+                lambda fr, itp, _fi=0: draw_3d_registered_video_frame(fr, itp),
+            ),
+        )
 
     for _, _, part_p, _ in variant_rows:
         if part_p.exists():
@@ -998,7 +1233,11 @@ def render_and_export(
     num_processed = len(all_frame_data)
 
     cap = cv2.VideoCapture(str(video_path))
+    total_native_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total_native_frames < 1:
+        total_native_frames = max(num_processed * 2, 1)
     orig_idx = 0
+    export_last_pct = -1
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -1013,8 +1252,26 @@ def render_and_export(
         interp = _interpolate_frame_data(fd_lo, fd_hi, t)
 
         for wr, (_, _, _, draw_fn) in zip(writers, variant_rows):
-            wr.write(draw_fn(frame, interp))
+            wr.write(draw_fn(frame, interp, orig_idx))
         orig_idx += 1
+        if lab_export_progress is not None and total_native_frames > 0:
+            pct = int(100 * orig_idx / total_native_frames)
+            pct = min(100, max(0, pct))
+            if (
+                orig_idx == 1
+                or orig_idx % 45 == 0
+                or pct >= export_last_pct + 5
+                or orig_idx >= total_native_frames
+            ):
+                lab_export_progress(
+                    {
+                        "step": "encode_mp4_variants",
+                        "frame": int(orig_idx),
+                        "total_frames": int(total_native_frames),
+                        "pct": int(pct),
+                    }
+                )
+                export_last_pct = pct
     cap.release()
     for wr in writers:
         wr.release()
@@ -1213,7 +1470,8 @@ def render_phase_clip(
 
         fd_lo = frame_data[idx_lo]
         fd_hi = frame_data[idx_hi]
-        interp = _interpolate_frame_data(fd_lo, fd_hi, t)
+        interp = dict(_interpolate_frame_data(fd_lo, fd_hi, t))
+        interp["frame_idx"] = int(orig_idx)
 
         annotated = draw_fn(frame, interp)
         if caption:

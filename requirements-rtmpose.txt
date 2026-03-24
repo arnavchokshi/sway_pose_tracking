@@ -1,0 +1,5 @@
+# Optional: RTMPose-L (--pose-model rtmpose / Lab "RTMPose-L").
+# MMCV wheels are platform-specific; see https://mmcv.readthedocs.io/en/latest/get_started/installation.html
+mmengine>=0.10.0
+mmcv>=2.0.0,<2.2.0
+mmpose>=1.3.0

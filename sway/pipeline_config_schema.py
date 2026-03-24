@@ -21,67 +21,67 @@ from typing import Any, Dict, List
 PIPELINE_STAGES: List[Dict[str, Any]] = [
     {
         "id": "detection",
-        "label": "Detection — YOLO & streaming",
-        "short": "YOLO",
+        "label": "Spotting people in the video",
+        "short": "Spot people",
         "main_phases": "1–2",
     },
     {
         "id": "tracking",
-        "label": "Tracking — BoxMOT / BoT-SORT",
-        "short": "Track",
+        "label": "Keeping the same label on each dancer",
+        "short": "Track IDs",
         "main_phases": "1–2",
     },
     {
         "id": "hybrid_sam",
-        "label": "Hybrid SAM (overlap refiner)",
-        "short": "SAM",
+        "label": "Sharper boxes when dancers touch or overlap",
+        "short": "Overlap",
         "main_phases": "1–2",
     },
     {
         "id": "phase3_stitch",
-        "label": "Post-track stitch & global link",
-        "short": "Stitch",
+        "label": "Merging broken IDs across the clip",
+        "short": "Merge IDs",
         "main_phases": "3",
     },
     {
         "id": "pre_pose_prune",
-        "label": "Pre-pose pruning",
-        "short": "Prune",
+        "label": "Removing obvious non-dancers early",
+        "short": "Early cuts",
         "main_phases": "4",
     },
     {
         "id": "pose",
-        "label": "Pose (ViTPose)",
-        "short": "Pose",
+        "label": "Estimating body pose (joints)",
+        "short": "Body pose",
         "main_phases": "5",
     },
     {
         "id": "reid_dedup",
-        "label": "Re-ID, crossover & collision cleanup",
-        "short": "Re-ID",
+        "label": "Fixing wrong IDs and duplicate outlines",
+        "short": "Fix IDs",
         "main_phases": "6–7",
     },
     {
         "id": "post_pose_prune",
-        "label": "Post-pose pruning",
-        "short": "Post-prune",
+        "label": "Dropping weak or fake skeletons",
+        "short": "Skeleton cleanup",
         "main_phases": "8",
     },
     {
         "id": "smooth",
-        "label": "Temporal smoothing",
-        "short": "Smooth",
+        "label": "Smoothing shaky joints over time",
+        "short": "Smoothing",
         "main_phases": "9",
     },
     {
         "id": "scoring",
-        "label": "Scoring",
-        "short": "Score",
+        "label": "Computing dance sync and shape scores",
+        "short": "Scoring",
         "main_phases": "10",
     },
     {
         "id": "export",
-        "label": "Export",
+        "label": "Saving your outputs",
         "short": "Export",
         "main_phases": "11",
     },
@@ -142,21 +142,22 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     _f(
         "info_detection_yolo",
         "detection",
-        "YOLO (Phase 1)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "Phase 1 in main.py: person detection. Lab default weights are COCO yolo26l (after prefetch). "
-            "For DanceTrack fine-tunes, copy best.pt to models/yolo26l_dancetrack.pt and select "
-            "yolo26l_dancetrack. YOLO11 L/X remain optional legacy fallbacks."
+            "The pipeline draws a box around each person it thinks is in the frame. "
+            "You pick how sharp that finder is (small / large / extra-large model). "
+            "If a model file is missing, it may download the first time you run. "
+            "Power users can point to a custom weights file via the environment."
         ),
     ),
     _f(
         "sway_yolo_weights",
         "detection",
-        "Detection model",
+        "How sharp the person finder is",
         "enum",
         "yolo26l",
         binding="env",
@@ -166,21 +167,20 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "yolo26l",
             "yolo26l_dancetrack",
             "yolo26x",
-            "yolo26x_dancetrack",
-            "yolov11l",
-            "yolov11x",
         ],
         tier=1,
         display="model_cards",
         description=(
-            "YOLO26 L/X are the primary detectors. DanceTrack fine-tunes need the matching .pt in models/ "
-            "(Lab shows a badge until the file exists). YOLO11 L/X stay as optional baselines."
+            "Smaller = faster run, may miss tiny or distant people. "
+            "Larger = slower, usually better on hard clips and finals footage. "
+            "DanceTrack is a YOLO26l fine-tune for group dance (needs models/yolo26l_dancetrack.pt). "
+            "The lab dims a card when that weight file is missing."
         ),
     ),
     _f(
         "sway_pretrack_nms_iou",
         "detection",
-        "Ghost box suppression (pre-track IoU NMS)",
+        "How aggressively to merge overlapping boxes",
         "float",
         0.50,
         binding="env",
@@ -190,88 +190,115 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=2,
         display="slider",
         description=(
-            "Lower = drop more overlapping duplicate boxes before the tracker (dense formations). "
-            "Higher = keep more raw YOLO boxes. Maps to classical IoU NMS in tracker.py."
+            "When two boxes sit on top of each other, one is thrown away before tracking. "
+            "Lower = merge more (good for tight formations, fewer double-counts). "
+            "Higher = keep more separate boxes (good if people stand close but are distinct)."
         ),
     ),
     _f(
         "sway_group_video",
         "detection",
-        "Group / crowd video mode",
+        "Crowd mode (many people on screen)",
         "bool",
         True,
         binding="env",
         key="SWAY_GROUP_VIDEO",
-        description="Higher YOLO resolution in crowded scenes. Matches main.py stack default (setdefault SWAY_GROUP_VIDEO=1).",
+        description=(
+            "On for dance lines and groups: looks at the frame in more detail so small bodies are less likely "
+            "to be missed. Slightly slower; turn off for solo or wide shots if you want maximum speed."
+        ),
         advanced=True,
         tier=3,
     ),
     _f(
         "sway_chunk_size",
         "detection",
-        "Streaming chunk size (frames)",
+        "Frames processed per memory chunk",
         "int",
         300,
         binding="env",
         key="SWAY_CHUNK_SIZE",
         min_=30,
         max_=2000,
+        tier=3,
+        display="slider",
+        description=(
+            "Long videos are processed in chunks so memory stays stable. "
+            "Only change this if you know you are hitting RAM limits or want to tune streaming."
+        ),
     ),
     _f(
         "sway_yolo_conf",
         "detection",
-        "Detection confidence",
+        "Minimum “I’m sure this is a person” score",
         "float",
         0.22,
         binding="env",
         key="SWAY_YOLO_CONF",
         min_=0.05,
         max_=0.95,
+        tier=2,
+        display="slider",
+        description=(
+            "Higher = fewer boxes, less junk, but you might miss dim or distant dancers. "
+            "Lower = more boxes, more risk of random objects being treated as people."
+        ),
     ),
     _f(
         "sway_detect_size",
         "detection",
-        "YOLO letterbox size (px)",
+        "Internal resize width for finding people (pixels)",
         "int",
         640,
         binding="env",
         key="SWAY_DETECT_SIZE",
         min_=320,
         max_=1920,
-        description="tracker.py: SWAY_DETECT_SIZE (default 640; group mode may raise effective size).",
+        description=(
+            "Larger = finer detail, slower. Crowd mode may bump this automatically. "
+            "Leave at default unless you are tuning speed vs. small-figure detection."
+        ),
         advanced=True,
+        tier=3,
+        display="slider",
     ),
     _f(
         "sway_yolo_detection_stride",
         "detection",
-        "YOLO detection stride",
+        "Run person-finding every Nth frame",
         "int",
         1,
         binding="env",
         key="SWAY_YOLO_DETECTION_STRIDE",
         min_=1,
         max_=8,
-        description="Run YOLO every N frames; tracker interpolates. SWAY_YOLO_DETECTION_STRIDE in tracker.py.",
+        description=(
+            "1 = every frame (best accuracy). "
+            "2+ = skip frames between runs; the tracker fills the gap—faster but can wobble on fast motion."
+        ),
         advanced=True,
+        tier=3,
+        display="slider",
     ),
     # --- tracking (main.py phase 2) ---
     _f(
         "info_tracking_backends",
         "tracking",
-        "Tracker backend (Phase 2)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "Phase 2 in main.py: association in the streaming pass (BoxMOT Deep OC-SORT default, or Ultralytics BoT-SORT). "
-            "Hybrid SAM refines boxes before the tracker on the BoxMOT path only. Phase 3 (global stitch) is the next Lab tab."
+            "After each frame knows where people are, this step decides “this box is still dancer 3.” "
+            "The default engine is tuned for dance; you can switch to another engine for comparison. "
+            "Overlap sharpening (next tab) only applies on the default path—not when using the alternate engine."
         ),
     ),
     _f(
         "tracker_technology",
         "tracking",
-        "Tracker backend",
+        "Which engine tracks IDs frame to frame",
         "enum",
         "BoxMOT",
         binding="none",
@@ -279,15 +306,16 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         choices=["BoxMOT", "BoT-SORT", "ByteTrack", "OC-SORT", "StrongSORT"],
         disabled_choices=["ByteTrack", "OC-SORT", "StrongSORT"],
         tier=1,
+        display="tracker_strip",
         description=(
-            "Wired today: BoxMOT (Deep OC-SORT) or Ultralytics BoT-SORT. ByteTrack / OC-SORT / StrongSORT are "
-            "planned — select them to see the label; runs are blocked until integrated."
+            "Today you can run the built-in tracker or the alternate one from the same family as YOLO. "
+            "The grayed-out names are placeholders for future work—you can’t run them yet."
         ),
     ),
     _f(
         "sway_boxmot_max_age",
         "tracking",
-        "Lost track memory (frames)",
+        "How long to remember someone who vanishes",
         "int",
         150,
         binding="env",
@@ -297,14 +325,15 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=2,
         display="slider",
         description=(
-            "How long the tracker keeps an ID after a dancer disappears. Raise for exit/re-entry; lower to avoid "
-            "wrong reattachments. ~150 ≈ 5s at 30fps."
+            "If a dancer walks behind someone or leaves the frame, the pipeline can keep their ID warm for this many frames. "
+            "Higher = better when people dip in and out; lower = less chance the wrong person inherits the ID later. "
+            "Rough guide: 150 frames ≈ 5 seconds at 30 fps."
         ),
     ),
     _f(
         "sway_boxmot_match_thresh",
         "tracking",
-        "Track assignment strictness (IoU gate)",
+        "How picky matching is between frames",
         "float",
         0.30,
         binding="env",
@@ -313,26 +342,29 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=0.50,
         tier=2,
         display="slider",
-        description="Lower → more merges; higher → more ID fragments (BoxMOT DeepOcSort iou_threshold).",
+        description=(
+            "Lower = easier to glue boxes together (fewer ID swaps, risk of merging two people). "
+            "Higher = stricter match (cleaner separation, more risk of a new ID when boxes jump)."
+        ),
     ),
     _f(
         "sway_boxmot_reid_on",
         "tracking",
-        "Appearance Re-ID (for distinct costumes)",
+        "Use clothing / body look to tell dancers apart",
         "bool",
         False,
         binding="env",
         key="SWAY_BOXMOT_REID_ON",
         tier=1,
         description=(
-            "Enable when dancers wear visually distinct outfits (BoxMOT appearance embeddings). "
-            "Disable for matching or uniform costumes."
+            "Turn on when outfits look different—helps after crosses or occlusions. "
+            "Turn off for identical costumes or uniforms so the pipeline doesn’t over-trust appearance."
         ),
     ),
     _f(
         "sway_boxmot_reid_model",
         "tracking",
-        "Re-ID backbone preset",
+        "Quality of the “who looks like who” model",
         "enum",
         "osnet_x0_25",
         binding="reid_model_preset",
@@ -342,65 +374,31 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         visible_when_value=True,
         advanced=True,
         tier=3,
-        description="Used when Re-ID is on and no custom Re-ID weights path is set.",
-    ),
-    _f(
-        "sway_boxmot_assoc_metric",
-        "tracking",
-        "Association distance metric",
-        "enum",
-        "IoU",
-        binding="env",
-        key="SWAY_BOXMOT_ASSOC_METRIC",
-        choices=["IoU", "GIoU", "DIoU"],
-        advanced=True,
-        tier=3,
         description=(
-            "BoxMOT association function for motion matching. (Library has no EIoU; DIoU is the closest "
-            "center-aware option.)"
+            "Larger preset = heavier and usually better at telling similar people apart. "
+            "Only matters when appearance matching above is on and you are not using a custom weights file."
         ),
-    ),
-    _f(
-        "sway_tracker_yaml",
-        "tracking",
-        "BoT-SORT YAML config path",
-        "string",
-        "",
-        binding="env",
-        key="SWAY_TRACKER_YAML",
-        description="Only used when BoxMOT is off.",
-        advanced=True,
-    ),
-    _f(
-        "sway_boxmot_reid_weights",
-        "tracking",
-        "BoxMOT Re-ID weights path",
-        "string",
-        "",
-        binding="env",
-        key="SWAY_BOXMOT_REID_WEIGHTS",
-        advanced=True,
     ),
     # --- hybrid_sam (runs inside the phase 1–2 pass; BoxMOT only) ---
     _f(
         "sway_hybrid_sam_overlap",
         "hybrid_sam",
-        "Hybrid SAM on heavy overlap",
+        "Refine boxes when people overlap",
         "bool",
         True,
         binding="env",
         key="SWAY_HYBRID_SAM_OVERLAP",
         tier=1,
         description=(
-            "BoxMOT path only: SAM2 segmentation tightens boxes when dancers overlap beyond the IoU trigger. "
-            "Adds roughly 15–20% runtime on typical videos when overlap is frequent. "
-            "With BoT-SORT, the Lab hides this phase (Ultralytics track() does not use the refiner)."
+            "When two dancers’ boxes sit heavily on top of each other, an extra segmentation pass tightens each box "
+            "so poses don’t bleed together. Expect roughly 15–20% longer runs on clips with lots of contact. "
+            "Only applies with the built-in tracker; the alternate engine path skips this step."
         ),
     ),
     _f(
         "sway_hybrid_sam_iou_trigger",
         "hybrid_sam",
-        "Hybrid SAM IoU trigger",
+        "How much overlap before the extra pass runs",
         "float",
         0.42,
         binding="env",
@@ -410,87 +408,75 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=2,
         display="slider",
         description=(
-            "SAM runs when any pair of person boxes exceeds this IoU. "
-            "Higher = fewer SAM calls (faster); lower = more overlap refinement."
+            "Higher = only very overlapped pairs get fixed (faster, less segmentation). "
+            "Lower = fix sooner (slower, cleaner lifts and partner work). "
+            "With ROI crop on, lower values are cheaper than full-frame SAM."
         ),
     ),
     _f(
-        "sway_hybrid_sam_min_dets",
+        "sway_hybrid_sam_roi_crop",
         "hybrid_sam",
-        "Hybrid SAM min person count",
-        "int",
-        2,
+        "Run SAM on overlap union crop (not full frame)",
+        "bool",
+        True,
         binding="env",
-        key="SWAY_HYBRID_SAM_MIN_DETS",
-        min_=2,
-        max_=30,
+        key="SWAY_HYBRID_SAM_ROI_CROP",
+        tier=2,
         advanced=True,
+        description=(
+            "When on, segmentation sees only a padded union of overlapped dancers — faster and "
+            "usually the same accuracy. Turn off to force legacy full-frame SAM (debug / A-B)."
+        ),
     ),
     _f(
-        "sway_hybrid_sam_weights",
+        "sway_hybrid_sam_roi_pad_frac",
         "hybrid_sam",
-        "Hybrid SAM checkpoint",
-        "string",
-        "sam2.1_b.pt",
-        binding="env",
-        key="SWAY_HYBRID_SAM_WEIGHTS",
-        advanced=True,
-    ),
-    _f(
-        "sway_hybrid_sam_mask_thresh",
-        "hybrid_sam",
-        "Hybrid SAM mask threshold",
+        "ROI margin around overlapped dancers",
         "float",
-        0.5,
+        0.10,
         binding="env",
-        key="SWAY_HYBRID_SAM_MASK_THRESH",
-        min_=0.05,
-        max_=0.99,
-        description="Binarize SAM masks at this probability (hybrid_sam_refiner.py).",
+        key="SWAY_HYBRID_SAM_ROI_PAD_FRAC",
+        min_=0.0,
+        max_=0.35,
         advanced=True,
-    ),
-    _f(
-        "sway_hybrid_sam_bbox_pad",
-        "hybrid_sam",
-        "Hybrid SAM bbox pad (px)",
-        "int",
-        2,
-        binding="env",
-        key="SWAY_HYBRID_SAM_BBOX_PAD",
-        min_=0,
-        max_=64,
-        advanced=True,
+        tier=3,
+        display="slider",
+        description="Extra padding around the union box, as a fraction of union width/height.",
     ),
     # --- phase3_stitch (main.py phase 3) ---
     _f(
         "info_phase3_stitch",
         "phase3_stitch",
-        "Post-track stitching (Phase 3)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [3/11]: dormant merges, fragment stitch, coalesce, then optional global long-range link "
-            "(maybe_global_stitch). Neural AFLink runs when weights exist unless forced to heuristic; see "
-            "models/AFLink_epoch20.pth or SWAY_AFLINK_WEIGHTS."
+            "Sometimes the tracker splits one dancer into two IDs or loses them for a stretch. "
+            "This pass tries to glue those pieces back together before body pose runs. "
+            "When the optional neural linker model is installed, it can make smarter long-range guesses; "
+            "otherwise simple rules are used."
         ),
     ),
     _f(
         "sway_global_link",
         "phase3_stitch",
-        "Global track link",
+        "Try to reconnect IDs across long gaps",
         "bool",
         True,
         binding="env",
         key="SWAY_GLOBAL_LINK",
         tier=2,
-        description="SWAY_GLOBAL_LINK: long-range stitch after dormant merges (global_track_link.py).",
+        description=(
+            "On: look across the whole video for “probably the same person” after shorter-range fixes. "
+            "Off: skip that pass—faster, but more duplicate IDs on messy footage."
+        ),
     ),
     _f(
         "sway_stitch_max_frame_gap",
         "phase3_stitch",
-        "Max gap to bridge between track fragments (frames)",
+        "Longest gap (frames) to bridge broken IDs",
         "int",
         60,
         binding="env",
@@ -500,131 +486,216 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=2,
         display="slider",
         description=(
-            "Fragment stitch horizon after post-track dormant logic. Raise for long absences; lower to avoid "
-            "wrong merges on short clips. Default 60 ≈ 2s @ 30fps."
+            "If someone disappears briefly, the pipeline can still merge old and new IDs if the gap is under this. "
+            "Raise for slow exits and re-entries; lower on short clips to avoid merging two different people. "
+            "About 60 frames ≈ 2 seconds at 30 fps."
         ),
-    ),
-    _f(
-        "sway_dormant_max_gap",
-        "phase3_stitch",
-        "Dormant track merge max gap (frames)",
-        "int",
-        150,
-        binding="env",
-        key="SWAY_DORMANT_MAX_GAP",
-        min_=90,
-        max_=300,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Upper gap (in frames) for dormant-style relinking before fragment stitch (dormant_tracks.py).",
     ),
     _f(
         "sway_global_aflink_mode",
         "phase3_stitch",
-        "Global link AFLink mode",
+        "How smart the long-range merge should be",
         "enum",
         "neural_if_available",
         binding="none",
         key="",
         choices=["neural_if_available", "force_heuristic"],
+        tier=2,
+        display="segmented",
         description=(
-            "neural_if_available: use AFLink when weights exist (default). "
-            "force_heuristic: set SWAY_GLOBAL_AFLINK=0 so heuristic stitch is always used."
+            "Use the learned linker when its weights are present (recommended). "
+            "Or always use simple geometry-based rules if you want predictable, lighter behavior."
         ),
-    ),
-    _f(
-        "sway_aflink_weights",
-        "phase3_stitch",
-        "AFLink weights path",
-        "string",
-        "",
-        binding="env",
-        key="SWAY_AFLINK_WEIGHTS",
-        description="Override path to AFLink_epoch20.pth (see global_track_link.resolve_aflink_weights).",
-        advanced=True,
     ),
     # --- pre_pose_prune (main.py phase 4, YAML) ---
     _f(
         "info_pre_pose_prune",
         "pre_pose_prune",
-        "Pre-pose pruning (Phase 4)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [4/11]: prune_tracks (duration + kinetic), stage polygon, spatial outliers, short tracks, "
-            "audience region, mirrors, bbox heuristics, etc. No alternate ‘heuristic mode’ switch — tune YAML keys."
+            "Before estimating joints, the pipeline drops tracks that are almost certainly not real dancers—"
+            "too short on screen, barely moving, stuck in the crowd edge, etc. "
+            "That saves time and keeps pose focused on people you care about. "
+            "Fine tuning is through the numbers below, not a single on/off switch."
         ),
     ),
     _f(
         "min_duration_ratio",
         "pre_pose_prune",
-        "Min duration ratio",
+        "Minimum fraction of the video a track must span",
         "float",
-        None,
+        0.20,
         binding="yaml",
         key="min_duration_ratio",
-        description="Optional override; omit for code default inside prune_tracks.",
+        description=(
+            "Baseline 0.20 matches the pipeline default. "
+            "Higher = only keep people visible for a larger share of the clip; lower = allow shorter appearances."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "kinetic_std_frac",
         "pre_pose_prune",
-        "Kinetic motion threshold (KINETIC_STD_FRAC)",
+        "How much motion counts as “alive”",
         "float",
-        None,
+        0.02,
         binding="yaml",
         key="KINETIC_STD_FRAC",
-        description="Optional YAML override for duration/kinetic gate (main.py passes to prune_tracks when set).",
+        min_=0.005,
+        max_=0.08,
+        description=(
+            "Baseline 0.02 matches the pipeline default (fraction of typical box height). "
+            "Raise if still objects are kept; lower if real dancers get cut as “not moving enough.”"
+        ),
         advanced=True,
+        display="slider",
+    ),
+    _f(
+        "spatial_outlier_std_factor",
+        "pre_pose_prune",
+        "Max allowed distance from group center (Std Devs)",
+        "float",
+        2.0,
+        binding="yaml",
+        key="SPATIAL_OUTLIER_STD_FACTOR",
+        min_=1.0,
+        max_=5.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Tracks further than this from the overall group are pruned as outliers. 2.0 = default.",
+    ),
+    _f(
+        "bbox_size_min_frac",
+        "pre_pose_prune",
+        "Minimum allowed bounding box size",
+        "float",
+        0.40,
+        binding="yaml",
+        key="BBOX_SIZE_MIN_FRAC",
+        min_=0.10,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Relative height against group median. Lower = keeps smaller boxes.",
+    ),
+    _f(
+        "bbox_size_max_frac",
+        "pre_pose_prune",
+        "Maximum allowed bounding box size",
+        "float",
+        2.00,
+        binding="yaml",
+        key="BBOX_SIZE_MAX_FRAC",
+        min_=1.0,
+        max_=4.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Relative height against group median. Higher = keeps larger boxes.",
+    ),
+    _f(
+        "short_track_min_frac",
+        "pre_pose_prune",
+        "Minimum track lifespan (fraction of video)",
+        "float",
+        0.15,
+        binding="yaml",
+        key="SHORT_TRACK_MIN_FRAC",
+        min_=0.0,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Any track shorter than this fraction of the video is removed as a ghost or passerby.",
+    ),
+    _f(
+        "audience_region_x_min_frac",
+        "pre_pose_prune",
+        "Audience Corner X Start",
+        "float",
+        0.75,
+        binding="yaml",
+        key="AUDIENCE_REGION_X_MIN_FRAC",
+        min_=0.0,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Left barrier for audience corner auto-delete (default 0.75 = right 25%).",
+    ),
+    _f(
+        "audience_region_y_min_frac",
+        "pre_pose_prune",
+        "Audience Corner Y Start",
+        "float",
+        0.70,
+        binding="yaml",
+        key="AUDIENCE_REGION_Y_MIN_FRAC",
+        min_=0.0,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Top barrier for audience corner auto-delete (default 0.70 = bottom 30%).",
     ),
     # --- pose (main.py phase 5) ---
     _f(
         "info_pose_models",
         "pose",
-        "Pose (Phase 5)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [5/11]: ViTPose+ on crops. POSE_VISIBILITY_THRESHOLD in params gates low-vis keypoints (main.py)."
+            "For each person box, the pipeline estimates where shoulders, hips, knees, etc. sit in the image. "
+            "That’s what you see as the skeleton overlay. "
+            "Dim joints can be ignored so random noise doesn’t score as movement."
         ),
     ),
     _f(
         "pose_model",
         "pose",
-        "ViTPose checkpoint size",
+        "Skeleton model size",
         "enum",
         "ViTPose-Base",
         binding="cli",
         key="pose_model",
-        choices=["ViTPose-Base", "ViTPose-Large", "ViTPose-Huge"],
+        choices=["ViTPose-Base", "ViTPose-Large", "ViTPose-Huge", "RTMPose-L"],
         tier=1,
-        description="Maps to --pose-model base|large|huge.",
+        display="model_cards",
+        description=(
+            "ViTPose+: larger = usually better on hard motion, slower. "
+            "RTMPose-L needs a separate MMPose install (see docs/PIPELINE_IMPROVEMENTS_ROADMAP.md) "
+            "and targets speed vs ViTPose-Base."
+        ),
     ),
     _f(
         "info_pose_alternates",
         "pose",
-        "Future pose backends (not wired)",
+        "Other pose engines",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "DWPose and HRNet are competitive alternatives worth wiring later. "
-            "YOLO-Pose / OpenPose / MediaPipe / PoseFormer are intentionally omitted from the Lab (unwired or "
-            "ill-suited to the crop-based ViTPose pipeline)."
+            "Sapiens / HMR / GNN tracking are roadmap experiments — not wired in the lab yet. "
+            "RTMPose-L is available when MMPose is installed locally."
         ),
     ),
     _f(
         "pose_stride",
         "pose",
-        "Pose stride",
+        "How often to run skeleton estimation",
         "enum",
         1,
         binding="cli",
@@ -632,104 +703,187 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         choices=[1, 2],
         tier=1,
         display="segmented",
-        description="1 = every frame; 2 = faster (gaps filled by interpolation downstream).",
+        description=(
+            "Every frame = smoothest overlays, slowest. "
+            "Every other frame = about twice as fast; missing frames are filled in later so playback still looks continuous."
+        ),
     ),
     _f(
         "pose_visibility_threshold",
         "pose",
-        "Pose visibility threshold",
+        "Ignore joints below this confidence",
         "float",
-        None,
+        0.30,
         binding="yaml",
         key="POSE_VISIBILITY_THRESHOLD",
-        description="Optional; main.py default 0.3 when omitted (params.get).",
+        description=(
+            "Baseline 0.30 matches the pipeline default. "
+            "Higher = fewer drawn joints in dark or blurry video; lower = show more joints (noisier)."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        tier=3,
+        display="slider",
     ),
     _f(
         "sway_3d_lift",
         "pose",
-        "3D pose lift (MotionAGFormer)",
+        "Add a simple depth view (3D) for angles and viewer",
         "bool",
         True,
         binding="env",
         key="SWAY_3D_LIFT",
         tier=2,
         description=(
-            "After temporal smoothing: lift 2D keypoints to 3D for pose_3d in data.json, "
-            "Three.js viewer, and hybrid angle scoring. Requires vendor/MotionAGFormer (or "
-            "SWAY_MOTIONAGFORMER_ROOT) and models/motionagformer-l-h36m.pth.tr."
+            "When on, joints get a third dimension so angled moves score more fairly and the 3D viewer has data. "
+            "Needs the optional lift model and its folder installed; turn off if you only want flat 2D overlays."
         ),
     ),
     # --- reid_dedup (main.py phases 6–7) ---
     _f(
         "info_reid_actual",
         "reid_dedup",
-        "Association & collision (Phases 6–7)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [6/11]: occlusion re-ID, crossover, acceleration audit. [7/11]: deduplicate_collocated_poses, "
-            "sanitize_pose_bbox_consistency. Phase preview 04_phases_6_7.mp4 covers both."
+            "Cleans up identity mistakes: when someone hides and reappears, when two dancers cross paths, "
+            "or when two skeletons sit on the same body. "
+            "You’ll see the effect in overlays and scores—fewer wild ID jumps and fewer double ghosts."
         ),
-    ),
-    _f(
-        "sway_reid_debug",
-        "reid_dedup",
-        "Re-ID debug logging",
-        "bool",
-        False,
-        binding="env",
-        key="SWAY_REID_DEBUG",
-        description="Verbose Re-ID / crossover traces (SWAY_REID_DEBUG=1).",
     ),
     _f(
         "reid_max_frame_gap",
         "reid_dedup",
-        "Re-ID max frame gap",
+        "Max frames apart to still consider “same person” after a gap",
         "int",
-        None,
+        90,
         binding="yaml",
         key="REID_MAX_FRAME_GAP",
-        description="Passed to apply_occlusion_reid when set (main.py).",
+        description=(
+            "Baseline 90 ≈ 3 s at 30 fps (pipeline default). "
+            "Larger = try harder to reconnect after long hides; smaller = fewer risky merges."
+        ),
         min_=1,
         max_=500,
         advanced=True,
+        display="slider",
     ),
     _f(
         "reid_min_oks",
         "reid_dedup",
-        "Re-ID min OKS",
+        "How similar poses must look to merge IDs",
         "float",
-        None,
+        0.35,
         binding="yaml",
         key="REID_MIN_OKS",
-        description="Passed to apply_occlusion_reid when set (main.py).",
+        description=(
+            "Baseline 0.35 matches the pipeline default (0–1 similarity). "
+            "Higher = merge only when poses almost match; lower = merge more aggressively."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
+    ),
+    _f(
+        "collision_kpt_dist_frac",
+        "reid_dedup",
+        "Max joint distance to trigger deduplication",
+        "float",
+        0.26,
+        binding="yaml",
+        key="COLLISION_KPT_DIST_FRAC",
+        min_=0.10,
+        max_=0.50,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Fraction of bbox height. Median joint distance below this deletes one of the tracks.",
+    ),
+    _f(
+        "collision_center_dist_frac",
+        "reid_dedup",
+        "Max bbox center distance for deduplication",
+        "float",
+        0.50,
+        binding="yaml",
+        key="COLLISION_CENTER_DIST_FRAC",
+        min_=0.10,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Bbox centers must also be this close (fraction of height) for duplicate pose deletion.",
+    ),
+    _f(
+        "dedup_torso_median_frac",
+        "reid_dedup",
+        "Max torso joint distance for deduplication",
+        "float",
+        0.24,
+        binding="yaml",
+        key="DEDUP_TORSO_MEDIAN_FRAC",
+        min_=0.10,
+        max_=0.50,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="Stricter distance check specifically across shoulders and hips to prevent merging partners.",
+    ),
+    _f(
+        "dedup_min_pair_oks",
+        "reid_dedup",
+        "Min similarity (OKS) to delete duplicate",
+        "float",
+        0.68,
+        binding="yaml",
+        key="DEDUP_MIN_PAIR_OKS",
+        min_=0.30,
+        max_=0.95,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="How similar two colliding poses must be before one is considered a phantom duplicate.",
+    ),
+    _f(
+        "dedup_antipartner_min_iou",
+        "reid_dedup",
+        "Min bbox overlap for deduplication",
+        "float",
+        0.12,
+        binding="yaml",
+        key="DEDUP_ANTIPARTNER_MIN_IOU",
+        min_=0.0,
+        max_=0.50,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="If IoU is lower than this, it assumes two separate people touching, bypassing deduplication.",
     ),
     # --- post_pose_prune (main.py phase 8) ---
     _f(
         "info_post_pose_tiers",
         "post_pose_prune",
-        "Post-pose pruning (Phase 8)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [8/11]: Tier C (ultra-low skeleton), Tier B weighted voting (sync, mirror, edge, jitter, …). "
-            "POST_PRUNE_MODE / REID_STRATEGY-style env switches are not wired — use YAML keys below."
+            "Now that skeletons exist, the pipeline removes tracks that still look wrong—"
+            "wobbly noise, mirror reflections, people who never really danced in sync, etc. "
+            "Trusted “real dancer” tracks get extra protection. "
+            "The sliders below decide how hard each red-flag rule pulls toward “delete this track.”"
         ),
     ),
     _f(
         "confirmed_human_min_span_frac",
         "post_pose_prune",
-        "Min video span for dancer protection",
+        "How much of the video someone must cover to be “protected”",
         "float",
         0.10,
         binding="yaml",
@@ -738,117 +892,158 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=0.25,
         tier=2,
         description=(
-            "Tier A confirmed-human whitelist: track temporal span must exceed this fraction of the video. "
-            "Lower protects late entrants; higher is stricter against short false positives."
+            "Long-running bodies are harder to auto-delete. "
+            "Lower = late joiners still count as protected; higher = only people who are on screen a lot get that safety net."
         ),
     ),
     _f(
         "tier_c_skeleton_mean",
         "post_pose_prune",
-        "Tier C skeleton mean (TIER_C_SKELETON_MEAN)",
+        "Cutoff for “this skeleton is basically empty”",
         "float",
-        None,
+        0.15,
         binding="yaml",
         key="TIER_C_SKELETON_MEAN",
+        min_=0.05,
+        max_=0.45,
+        description=(
+            "Baseline 0.15 matches the pipeline default (mean joint confidence). "
+            "Lower = drop weak skeletons sooner; higher = keep borderline bodies longer."
+        ),
         advanced=True,
+        display="slider",
     ),
     _f(
         "tier_c_low_frame_frac",
         "post_pose_prune",
-        "Tier C low-frame fraction (TIER_C_LOW_FRAME_FRAC)",
+        "How many weak frames before the harsh drop",
         "float",
-        None,
+        0.80,
         binding="yaml",
         key="TIER_C_LOW_FRAME_FRAC",
+        description=(
+            "Baseline 0.80 matches the pipeline default (share of weak frames needed to drop someone). "
+            "Higher = only remove if most frames look bad (more lenient). Lower = remove with fewer weak frames (stricter)."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "mean_confidence_min",
         "post_pose_prune",
-        "Mean keypoint confidence min",
+        "Average joint strength must stay above this",
         "float",
-        None,
+        0.45,
         binding="yaml",
         key="MEAN_CONFIDENCE_MIN",
-        description="Optional YAML override; pipeline default ~0.45 (main.py).",
+        min_=0.2,
+        max_=0.85,
+        description=(
+            "Baseline 0.45 matches the pipeline default. "
+            "Higher = prune mushy skeletons faster; lower = keep softer estimates."
+        ),
         advanced=True,
+        display="slider",
     ),
     _f(
         "edge_margin_frac",
         "post_pose_prune",
-        "Edge margin (EDGE_MARGIN_FRAC)",
+        "How deep the “edge of frame” band is",
         "float",
-        None,
+        0.15,
         binding="yaml",
         key="EDGE_MARGIN_FRAC",
-        description="Confirmed-human edge band + mirror heuristics; default 0.15 in main.py.",
+        description=(
+            "Baseline 0.15 matches the pipeline default. "
+            "Wider band = treat more of the border as “probably audience or mirror.”"
+        ),
         min_=0.0,
         max_=0.5,
         advanced=True,
+        display="slider",
     ),
     _f(
         "edge_presence_frac",
         "post_pose_prune",
-        "Edge presence (EDGE_PRESENCE_FRAC)",
+        "How often someone must hug the edge to count as “edge person”",
         "float",
-        None,
+        0.30,
         binding="yaml",
         key="EDGE_PRESENCE_FRAC",
+        description=(
+            "Baseline 0.30 matches the pipeline default. "
+            "Works with the edge band to flag people who mostly stand at the sides."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "min_lower_body_conf_yaml",
         "post_pose_prune",
-        "Min lower-body confidence",
+        "Legs and hips must be this confident",
         "float",
-        None,
+        0.30,
         binding="yaml",
         key="min_lower_body_conf",
-        description="Mirror / tier-B related; main.py default 0.3 when omitted.",
+        description=(
+            "Baseline 0.30 matches the pipeline default. "
+            "Helps catch mirror doubles and half-visible bodies; raise if legs look trustworthy."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "jitter_ratio_max",
         "post_pose_prune",
-        "Jitter ratio max (JITTER_RATIO_MAX)",
+        "Allowed fraction of “twitchy” frames",
         "float",
-        None,
+        0.10,
         binding="yaml",
         key="JITTER_RATIO_MAX",
+        description=(
+            "Baseline 0.10 matches the pipeline default. "
+            "Lower = stricter (noisy tracks drop sooner); higher = tolerate shaky video."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "sync_score_min",
         "post_pose_prune",
-        "SYNC_SCORE_MIN (Tier B)",
+        "Minimum “in sync with the group” score to look real",
         "float",
-        None,
+        0.10,
         binding="yaml",
         key="SYNC_SCORE_MIN",
-        description="Optional YAML override for sync-strength gate; code default 0.10.",
+        description=(
+            "Baseline 0.10 matches the pipeline default. "
+            "Raise if you want stricter “must look like the group”; lower if soloists get unfairly cut."
+        ),
         min_=0.0,
         max_=1.0,
         advanced=True,
+        display="slider",
     ),
     _f(
         "prune_threshold",
         "post_pose_prune",
-        "Prune vote aggressiveness (PRUNE_THRESHOLD)",
+        "Overall strictness of the cleanup vote",
         "float",
         0.65,
         binding="yaml",
         key="PRUNE_THRESHOLD",
         description=(
-            "Weighted Tier-B vote threshold. Higher = prune more aggressively when rules fire. "
-            "Lower = keep more tracks (risk retaining false positives)."
+            "Many small checks add up to a score. "
+            "Higher = easier to delete a track when something looks off. "
+            "Lower = keep more people even when a few checks complain (more junk may remain)."
         ),
         min_=0.40,
         max_=0.90,
@@ -858,7 +1053,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     _f(
         "pruning_w_low_sync",
         "post_pose_prune",
-        "Rule weight · low sync",
+        "How much “out of sync” counts against a track",
         "float",
         0.7,
         binding="yaml_pruning_weight",
@@ -867,11 +1062,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="Raise if random audience members keep scoring; lower if real soloists get cut.",
     ),
     _f(
         "pruning_w_smart_mirror",
         "post_pose_prune",
-        "Rule weight · smart mirrors",
+        "How hard to penalize likely mirror reflections",
         "float",
         0.9,
         binding="yaml_pruning_weight",
@@ -880,11 +1076,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="High for wall-to-wall mirrors; lower if you film intentional mirrored choreography.",
     ),
     _f(
         "pruning_w_completeness",
         "post_pose_prune",
-        "Rule weight · completeness audit",
+        "How much “missing body parts” counts against a track",
         "float",
         0.6,
         binding="yaml_pruning_weight",
@@ -893,11 +1090,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="Broken silhouettes (torso but no legs) look less like full dancers.",
     ),
     _f(
         "pruning_w_head_only",
         "post_pose_prune",
-        "Rule weight · head-only tracks",
+        "How much “only a head visible” counts against a track",
         "float",
         0.8,
         binding="yaml_pruning_weight",
@@ -906,11 +1104,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="Good for killing floating faces in the crowd; lower if your shot is honestly tight on faces.",
     ),
     _f(
         "pruning_w_low_conf",
         "post_pose_prune",
-        "Rule weight · low keypoint confidence",
+        "How much weak joints count against a track",
         "float",
         0.5,
         binding="yaml_pruning_weight",
@@ -919,11 +1118,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="Blurry or dark footage raises this if mushy skeletons should be dropped faster.",
     ),
     _f(
         "pruning_w_jittery",
         "post_pose_prune",
-        "Rule weight · jittery tracks",
+        "How much shaky motion counts against a track",
         "float",
         0.5,
         binding="yaml_pruning_weight",
@@ -932,105 +1132,117 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         max_=1.0,
         tier=2,
         display="pruning_weight",
+        description="TV noise or compression artifacts often look like jitter—tune if real dancers get unfairly cut.",
     ),
     # --- smooth (main.py phase 9) ---
     _f(
         "info_smooth_one_euro",
         "smooth",
-        "Smoothing (Phase 9)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [9/11]: One-Euro filter (PoseSmoother) plus optional temporal keypoint refine. "
-            "Extra smoothers (Savitzky–Golay, Gaussian, learned temporal models) are experimental / not in the Lab UI yet."
+            "Raw joints can wiggle frame to frame. "
+            "This pass steadies them so overlays and scores look human without killing real sharp hits. "
+            "Optional neighbor blending further softens noise using a few frames on either side."
         ),
     ),
     _f(
         "temporal_pose_refine",
         "smooth",
-        "Temporal keypoint refine (±N frames)",
+        "Blend each joint with nearby frames",
         "bool",
         True,
         binding="cli",
         key="temporal_pose_refine",
         tier=1,
         description=(
-            "Light confidence-weighted (x,y) blend over neighboring frames per track. "
-            "Radius sets the half-window N."
+            "Looks a few frames before/after and nudges shaky points toward a local average. "
+            "Turn off for fastest runs or when you want maximum raw responsiveness."
         ),
     ),
     _f(
         "temporal_pose_radius",
         "smooth",
-        "Temporal refine radius (frames)",
+        "How many frames on each side to blend",
         "int",
         2,
         binding="cli",
         key="temporal_pose_radius",
-        description="Half-window for temporal refine; main.py clamps to 0–8.",
+        description="Bigger window = smoother, slightly “heavier” motion; 0–8 allowed.",
         min_=0,
         max_=8,
         tier=1,
+        display="slider",
     ),
     _f(
         "smoother_min_cutoff",
         "smooth",
-        "One-Euro min_cutoff",
+        "Baseline smoothness (lower = more smoothing)",
         "float",
         1.0,
         binding="yaml",
         key="SMOOTHER_MIN_CUTOFF",
         min_=0.01,
         max_=10.0,
+        description="Small values drag joints more; large values stay closer to the raw estimate.",
         advanced=True,
+        display="slider",
     ),
     _f(
         "smoother_beta",
         "smooth",
-        "One-Euro beta",
+        "How quickly smoothing reacts to speed changes",
         "float",
         0.7,
         binding="yaml",
         key="SMOOTHER_BETA",
         min_=0.0,
         max_=5.0,
+        description="Higher = follow fast moves sooner; lower = calmer but can lag spikes.",
         advanced=True,
+        display="slider",
     ),
     # --- scoring (main.py phase 10) ---
     _f(
         "info_scoring_actual",
         "scoring",
-        "Scoring (Phase 10)",
+        "What this step does",
         "info",
         None,
         binding="none",
         key="",
         description=(
-            "main.py [10/11]: process_all_frames_scoring_vectorized (group circmean, cDTW, per-joint deviations). "
-            "Alternate scoring modes are not exposed as switches."
+            "Compares dancers to each other and to the group timing: who’s early/late, which limbs differ, "
+            "and rolls that into the numbers you see in exports. "
+            "There isn’t a separate “mode” switch here—the math is fixed for consistent results."
         ),
     ),
     # --- export (main.py phase 11) ---
     _f(
         "montage",
         "export",
-        "Stitch montage MP4",
+        "Also save one long “making of” video",
         "bool",
         False,
         binding="cli",
         key="montage",
+        description="Concatenates phase preview clips into a single montage file when enabled.",
     ),
     _f(
         "save_phase_previews",
         "export",
-        "Save phase preview clips",
+        "Save short clips after major steps",
         "bool",
         True,
         binding="cli",
         key="save_phase_previews",
-        description="Default on in Lab. When true, worker passes --save-phase-previews (phase_previews/*.mp4).",
+        description=(
+            "On by default in the lab: small MP4s per stage so you can scrub what changed without re-running everything. "
+            "Turn off to save disk and a little export time."
+        ),
     ),
 ]
 

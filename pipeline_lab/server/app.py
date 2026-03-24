@@ -10,7 +10,7 @@ Static UI (after `npm run build` in pipeline_lab/web): set PIPELINE_LAB_WEB_DIST
 Model reuse: each queued run starts a new ``main.py`` process, so YOLO/ViTPose are **loaded from disk
 into memory every run** (normal for this architecture). ViTPose tries the local Hugging Face cache first
 so cached weights do not trigger Hub traffic. For a fully air‑gapped machine after prefetch, run the API
-with ``SWAY_OFFLINE=1`` (see ``prefetch_models.py`` / README).
+with ``SWAY_OFFLINE=1`` (see ``python -m tools.prefetch_models`` / README).
 """
 
 from __future__ import annotations
@@ -64,11 +64,36 @@ if str(REPO_ROOT) not in sys.path:
 
 from sway.pipeline_config_schema import PIPELINE_PARAM_FIELDS, schema_payload  # noqa: E402
 
-# Lab UI enum labels -> main.py --pose-model (base|large|huge only)
+
+def _default_ui_fields() -> Dict[str, Any]:
+    """Schema defaults only (matches web ``defaultsFromSchema``)."""
+    out: Dict[str, Any] = {}
+    for f in PIPELINE_PARAM_FIELDS:
+        if f.get("type") == "info":
+            continue
+        d = f.get("default")
+        if d is None:
+            continue
+        if f.get("type") == "string" and d == "":
+            continue
+        out[f["id"]] = d
+    return out
+
+
+def _effective_ui_fields(stored: Any) -> Dict[str, Any]:
+    """Merge client overrides on top of schema defaults (drafts often send ``{}`` until Save)."""
+    base = _default_ui_fields()
+    if not isinstance(stored, dict):
+        return dict(base)
+    return {**base, **stored}
+
+
+# Lab UI enum labels -> main.py --pose-model (base|large|huge|rtmpose)
 _POSE_MODEL_CLI: Dict[str, str] = {
     "ViTPose-Base": "base",
     "ViTPose-Large": "large",
     "ViTPose-Huge": "huge",
+    "RTMPose-L": "rtmpose",
 }
 
 
@@ -259,7 +284,7 @@ def _execute_run(run_id: str) -> None:
     meta_path = run_dir / "request.json"
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
-    fields = meta.get("fields") or {}
+    fields = _effective_ui_fields(meta.get("fields"))
 
     params = _build_params_yaml(fields)
     params_path = run_dir / "params.yaml"
@@ -365,15 +390,20 @@ def models_status() -> Dict[str, Any]:
     """Which optional weight files exist under models/ (for Lab badges)."""
     md = REPO_ROOT / "models"
     names = (
+        "yolo26s.pt",
+        "yolo26l.pt",
         "yolo26l_dancetrack.pt",
-        "yolo26x_dancetrack.pt",
+        "yolo26x.pt",
         "osnet_x0_25_msmt17.pt",
         "osnet_x1_0_msmt17.pt",
         "motionagformer-l-h36m.pth.tr",
+        "27_243_45.2.bin",
     )
     out = {n: (md / n).is_file() for n in names}
     mag_root = REPO_ROOT / "vendor" / "MotionAGFormer"
     out["motionagformer_repo"] = (mag_root / "model" / "MotionAGFormer.py").is_file()
+    pfv2_root = REPO_ROOT / "vendor" / "PoseFormerV2"
+    out["poseformerv2_repo"] = (pfv2_root / "common" / "model_poseformer.py").is_file()
     return out
 
 
@@ -393,7 +423,7 @@ def _enqueue_run(
 ) -> None:
     meta = {
         "recipe_name": recipe_name,
-        "fields": fields,
+        "fields": _effective_ui_fields(fields),
         "video_stem": video_stem,
         **meta_extra,
     }
@@ -641,16 +671,95 @@ def delete_run(run_id: str) -> Response:
         run_dir.relative_to(base)
     except ValueError:
         raise HTTPException(403, "invalid path") from None
-    if not run_dir.is_dir():
+    
+    in_memory = False
+    with _run_lock:
+        st = _runs.get(run_id)
+        if st is not None:
+            in_memory = True
+            if _pipeline_subprocess_is_alive(st):
+                raise HTTPException(409, "cannot delete while the pipeline subprocess is still running — stop it first")
+
+    if not run_dir.is_dir() and not in_memory:
         raise HTTPException(404, "unknown run")
+
+    with _run_lock:
+        if run_id in _runs:
+            del _runs[run_id]
+
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return Response(status_code=204)
+
+
+@app.post("/api/runs/{run_id}/rerun")
+def rerun_run(run_id: str) -> JSONResponse:
+    """
+    Queue a new run that copies the source run's input video and pipeline fields from request.json.
+    """
+    base = RUNS_ROOT.resolve()
+    src = (RUNS_ROOT / run_id).resolve()
+    try:
+        src.relative_to(base)
+    except ValueError:
+        raise HTTPException(403, "invalid path") from None
+    if not src.is_dir():
+        raise HTTPException(404, "unknown run")
+    req_path = src / "request.json"
+    if not req_path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail="source run has no request.json (cannot copy configuration)",
+        )
     with _run_lock:
         st = _runs.get(run_id)
         if _pipeline_subprocess_is_alive(st):
-            raise HTTPException(409, "cannot delete while the pipeline subprocess is still running — stop it first")
-        if st is not None:
-            del _runs[run_id]
-    shutil.rmtree(run_dir, ignore_errors=True)
-    return Response(status_code=204)
+            raise HTTPException(
+                status_code=409,
+                detail="wait for this run to finish or stop it before rerunning",
+            )
+    try:
+        meta = json.loads(req_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"invalid request.json: {e}") from e
+
+    raw_fields = meta.get("fields")
+    fields: Dict[str, Any] = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+    try:
+        _validate_pipeline_fields(fields)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    vids = list(src.glob("input_video*"))
+    if not vids:
+        raise HTTPException(
+            status_code=400,
+            detail="source run has no input_video file",
+        )
+    video_src = vids[0]
+
+    new_id = str(uuid.uuid4())
+    new_dir = (RUNS_ROOT / new_id).resolve()
+    try:
+        new_dir.relative_to(base)
+    except ValueError:
+        raise HTTPException(403, "invalid path") from None
+    new_dir.mkdir(parents=True, exist_ok=True)
+    ext = video_src.suffix or ".mp4"
+    dest = new_dir / f"input_video{ext}"
+    shutil.copy2(video_src, dest)
+
+    recipe_name = str(meta.get("recipe_name") or "")
+    video_stem = str(meta.get("video_stem") or "").strip() or dest.stem
+
+    _enqueue_run(
+        new_id,
+        new_dir,
+        recipe_name,
+        fields,
+        video_stem,
+        {"rerun_of": run_id},
+    )
+    return JSONResponse({"run_id": new_id, "status": "queued", "rerun_of": run_id})
 
 
 @app.get("/api/runs/{run_id}")
@@ -710,6 +819,7 @@ def get_run_config(run_id: str) -> Dict[str, Any]:
         raise HTTPException(404, "request.json not found (run not queued yet)")
     with open(req_path, encoding="utf-8") as f:
         request_meta: Dict[str, Any] = json.load(f)
+    merged_fields = _effective_ui_fields(request_meta.get("fields"))
     params_yaml: Optional[Dict[str, Any]] = None
     py = run_dir / "params.yaml"
     if py.is_file():
@@ -722,7 +832,7 @@ def get_run_config(run_id: str) -> Dict[str, Any]:
     return {
         "recipe_name": request_meta.get("recipe_name") or "",
         "video_stem": request_meta.get("video_stem") or "",
-        "fields": request_meta.get("fields") or {},
+        "fields": merged_fields,
         "request_meta": request_meta,
         "params_yaml": params_yaml,
     }

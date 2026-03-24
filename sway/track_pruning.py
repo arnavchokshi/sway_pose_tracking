@@ -1403,6 +1403,7 @@ def compute_phase7_voting_prune_set(
     min_mean_conf: float = MEAN_CONFIDENCE_MIN,
     max_jitter: float = JITTER_RATIO_MAX,
     phase7_prune_log: Optional[list] = None,
+    phase8_log_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Set[int], Dict[int, Dict[str, Any]]]:
     """
     Tier B: run each Phase-7 rule without confirmed-human skips, map hit/miss to 0/1 scores,
@@ -1497,6 +1498,7 @@ def compute_phase7_voting_prune_set(
 
     if phase7_prune_log is not None:
         for tid in sorted(voted):
+            tel = telemetry.get(tid, {})
             info = get_pruned_track_info(
                 raw_tracks,
                 tid,
@@ -1504,11 +1506,80 @@ def compute_phase7_voting_prune_set(
                 frame_width,
                 frame_height,
                 total_frames=total_frames,
+                cause_config=tier_b_vote_cause_config(
+                    prune_threshold, pruning_weights, tel, phase8_log_context=phase8_log_context
+                ),
             )
-            info["tier_b_vote"] = telemetry.get(tid, {})
+            info["tier_b_vote"] = tel
             phase7_prune_log.append(info)
 
     return voted, telemetry
+
+
+def prune_cause_config(
+    filter_rule: str,
+    summary: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Structured reason for a prune/dedup row (prune_log.json + Watch UI)."""
+    out: Dict[str, Any] = {
+        "filter": filter_rule,
+        "summary": summary.strip(),
+    }
+    if params:
+        clean: Dict[str, Any] = {}
+        for k, v in params.items():
+            if v is None:
+                continue
+            if isinstance(v, (np.floating, np.integer)):
+                v = float(v) if isinstance(v, np.floating) else int(v)
+            if isinstance(v, float):
+                clean[k] = round(v, 6) if abs(v) < 1e5 else round(v, 2)
+            elif isinstance(v, (str, int, bool)):
+                clean[k] = v
+            elif isinstance(v, dict):
+                clean[k] = v
+            elif isinstance(v, list):
+                clean[k] = v
+        if clean:
+            out["params"] = clean
+    return out
+
+
+def tier_b_vote_cause_config(
+    prune_threshold: float,
+    pruning_weights: Dict[str, float],
+    telemetry_tid: Dict[str, Any],
+    phase8_log_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    hits = telemetry_tid.get("rule_hits") or {}
+    fired = [k for k, v in hits.items() if float(v) > 0.5]
+    short_fired = [k.replace("prune_", "").replace("_tracks", "") for k in fired]
+    wsum = float(telemetry_tid.get("weighted_sum", 0.0))
+    summary = (
+        f"Tier B weighted sum {wsum:.4f} > PRUNE_THRESHOLD {prune_threshold}; "
+        f"contributing rules: {', '.join(short_fired) or '—'}"
+    )
+    pw = {f"weight.{k}": round(float(v), 4) for k, v in pruning_weights.items() if float(v) != 0.0}
+    ctx: Dict[str, Any] = {}
+    if phase8_log_context:
+        for k, v in phase8_log_context.items():
+            if v is not None:
+                if isinstance(v, float):
+                    ctx[k] = round(v, 6)
+                else:
+                    ctx[k] = v
+    return prune_cause_config(
+        "phase7_voting",
+        summary,
+        {
+            "PRUNE_THRESHOLD": float(prune_threshold),
+            "weighted_sum": round(wsum, 4),
+            **pw,
+            "rules_fired": short_fired,
+            **ctx,
+        },
+    )
 
 
 def get_pruned_track_info(
@@ -1522,6 +1593,7 @@ def get_pruned_track_info(
     threshold: Optional[float] = None,
     actual_value: Optional[float] = None,
     exempt_reason: Optional[str] = None,
+    cause_config: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Return structured info for one pruned track (for JSON logging)."""
     entries = raw_tracks.get(tid, [])
@@ -1533,6 +1605,8 @@ def get_pruned_track_info(
             out["actual_value"] = actual_value
         if exempt_reason:
             out["reason"] = exempt_reason
+        if cause_config is not None:
+            out["cause_config"] = cause_config
         return out
     centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for _, b, _ in entries]
     med_cx = float(np.median([c[0] for c in centers]))
@@ -1573,6 +1647,8 @@ def get_pruned_track_info(
         info["reason"] = exempt_reason
     if frame_width > 0 and frame_height > 0:
         info["pos_pct"] = [round(100 * med_cx / frame_width, 1), round(100 * med_cy / frame_height, 1)]
+    if cause_config is not None:
+        info["cause_config"] = cause_config
     return info
 
 
@@ -1584,6 +1660,7 @@ def log_pruned_tracks(
     frame_height: int = 0,
     prune_log: Optional[list] = None,
     total_frames: int = 0,
+    cause_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Print per-track diagnostics for every pruned track so root-cause is visible in logs."""
     if not pruned_ids:
@@ -1601,6 +1678,7 @@ def log_pruned_tracks(
                     frame_height,
                     total_frames=total_frames,
                     decision="pruned",
+                    cause_config=cause_config,
                 )
             )
         if not entries:

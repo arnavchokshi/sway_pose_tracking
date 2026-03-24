@@ -6,13 +6,13 @@ Ground truth is defined in benchmarks/*_ground_truth.yaml.
 
 Usage:
   # Run pipeline, then verify output
-  python benchmark.py --ground-truth benchmarks/IMG_0256_ground_truth.yaml
+  python -m tools.benchmark --ground-truth benchmarks/IMG_0256_ground_truth.yaml
 
   # Verify existing data.json without re-running pipeline
-  python benchmark.py --ground-truth benchmarks/IMG_0256_ground_truth.yaml --json output/data.json
+  python -m tools.benchmark --ground-truth benchmarks/IMG_0256_ground_truth.yaml --json output/data.json
 
   # Run pipeline with custom output dir
-  python benchmark.py --ground-truth benchmarks/IMG_0256_ground_truth.yaml --output-dir output
+  python -m tools.benchmark --ground-truth benchmarks/IMG_0256_ground_truth.yaml --output-dir output
 
 Exit: 0 = all checks pass, 1 = one or more checks fail
 """
@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def load_ground_truth(path: Path) -> dict:
@@ -417,7 +421,7 @@ def main():
             "--output-dir",
             str(args.output_dir),
         ]
-        result = subprocess.run(cmd, cwd=Path(__file__).parent)
+        result = subprocess.run(cmd, cwd=REPO_ROOT)
         if result.returncode != 0:
             print(f"Pipeline failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(result.returncode)
@@ -445,9 +449,8 @@ def main():
     print()
     if args.trackeval:
         try:
-            root = Path(__file__).resolve().parent
-            if str(root) not in sys.path:
-                sys.path.insert(0, str(root))
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
             from sway.trackeval_runner import trackeval_from_ground_truth_yaml
 
             te = trackeval_from_ground_truth_yaml(gt, data)

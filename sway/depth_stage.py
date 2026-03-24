@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -115,6 +115,26 @@ def _contour_to_polygon_norm(contour: np.ndarray, w: int, h: int) -> List[Tuple[
     for x, y in pts:
         poly.append((float(np.clip(x / w, 0.0, 1.0)), float(np.clip(y / h, 0.0, 1.0))))
     return poly
+
+
+def collect_strided_depth_series(
+    indexed_frames: Iterable[Tuple[int, np.ndarray]],
+    stride_frames: int,
+) -> List[Tuple[int, np.ndarray]]:
+    """Run Depth Anything on every stride_frames-th frame; return (frame_idx, normalized depth H×W).
+
+    stride_frames must be >= 1. Skips frames when depth pipeline is unavailable.
+    """
+    if stride_frames < 1:
+        stride_frames = 1
+    out: List[Tuple[int, np.ndarray]] = []
+    for fi, fr in indexed_frames:
+        if int(fi) % stride_frames != 0:
+            continue
+        d = get_depth_array(fr)
+        if d is not None:
+            out.append((int(fi), d))
+    return out
 
 
 def get_depth_array(frame_bgr: np.ndarray) -> Optional[np.ndarray]:

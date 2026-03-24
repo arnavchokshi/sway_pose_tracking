@@ -5,8 +5,9 @@ Download and cache every weight the pipeline needs for offline (airplane) runs.
 Run once while you have internet, from the sway_pose_mvp directory:
 
   cd sway_pose_mvp
-  python prefetch_models.py
-  python prefetch_models.py --include-3d   # optional: MotionAGFormer-L + notes for repo clone
+  python -m tools.prefetch_models
+  python -m tools.prefetch_models --include-3d   # optional: MotionAGFormer-L + notes for repo clone
+  python -m tools.prefetch_models --include-poseformerv2   # optional: PoseFormerV2 243-frame H36M weights
 
 This touches:
   - Ultralytics YOLO (yolo26l.pt → models/ or hub cache)
@@ -31,10 +32,14 @@ import sys
 import urllib.request
 from pathlib import Path
 
-import _repo_path  # noqa: F401
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Google Drive file id for MotionAGFormer-L H36M (official README table).
 _MOTIONAGFORMER_L_H36M_GDRIVE_ID = "1WI8QSsD84wlXIdK1dLp6hPZq4FPozmVZ"
+# PoseFormerV2 README: 243 frames, 27 kept, MPJPE 45.2 mm (27_243_45.2.bin).
+_POSEFORMERV2_243_GDRIVE_ID = "14SpqPyq9yiblCzTH5CorymKCUsXapmkg"
 
 
 def prefetch_motionagformer_l(models_dir: Path) -> None:
@@ -66,8 +71,37 @@ def prefetch_motionagformer_l(models_dir: Path) -> None:
     print(f"  ✓ Saved {dst}")
 
 
+def prefetch_poseformerv2_243(models_dir: Path) -> None:
+    """Download PoseFormerV2 243-frame H36M checkpoint (official eval table)."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    dst = models_dir / "27_243_45.2.bin"
+    if dst.is_file() and dst.stat().st_size > 1_000_000:
+        print(f"  ✓ PoseFormerV2 243-frame checkpoint already at {dst}")
+        return
+    print("  Downloading PoseFormerV2 27_243_45.2.bin (Google Drive)…")
+    try:
+        import gdown
+
+        gdown.download(
+            f"https://drive.google.com/uc?id={_POSEFORMERV2_243_GDRIVE_ID}",
+            str(dst),
+            quiet=False,
+        )
+    except Exception as ex:
+        print(f"  PoseFormerV2 download failed ({ex}). Install gdown: pip install gdown")
+        print(
+            f"  Manual: save as\n    {dst}\n"
+            "  Link: https://github.com/QitaoZhao/PoseFormerV2#evaluation"
+        )
+        return
+    if not dst.is_file() or dst.stat().st_size < 1_000_000:
+        print("  Download incomplete — remove partial file and retry.")
+        return
+    print(f"  ✓ Saved {dst}")
+
+
 def main() -> None:
-    root = Path(__file__).resolve().parent
+    root = _REPO_ROOT
     os.chdir(root)
     if os.environ.get("SWAY_OFFLINE", "").lower() in ("1", "true", "yes"):
         print("Unset SWAY_OFFLINE for prefetch (needs network).", file=sys.stderr)
@@ -161,14 +195,28 @@ if __name__ == "__main__":
         action="store_true",
         help="Also download MotionAGFormer-L (3D lift). Requires gdown for Google Drive.",
     )
+    ap.add_argument(
+        "--include-poseformerv2",
+        action="store_true",
+        help="Also download PoseFormerV2 243-frame H36M checkpoint. Requires gdown.",
+    )
     ns = ap.parse_args()
     main()
     if ns.include_3d:
         print("\n[Optional] MotionAGFormer-L (3D pose lift) …")
-        prefetch_motionagformer_l(Path(__file__).resolve().parent / "models")
+        prefetch_motionagformer_l(_REPO_ROOT / "models")
         print(
             "Clone MotionAGFormer for imports:\n"
             "  git clone https://github.com/TaatiTeam/MotionAGFormer.git vendor/MotionAGFormer\n"
             "  pip install timm\n"
             "Or set SWAY_MOTIONAGFORMER_ROOT to your clone path."
+        )
+    if ns.include_poseformerv2:
+        print("\n[Optional] PoseFormerV2 (3D lift, SWAY_LIFT_BACKEND=poseformerv2) …")
+        prefetch_poseformerv2_243(_REPO_ROOT / "models")
+        print(
+            "Clone PoseFormerV2 for imports:\n"
+            "  git clone https://github.com/QitaoZhao/PoseFormerV2.git vendor/PoseFormerV2\n"
+            "  pip install einops torch-dct timm\n"
+            "Or set SWAY_POSEFORMERV2_ROOT. Weights are H36M-trained (not AMASS)."
         )

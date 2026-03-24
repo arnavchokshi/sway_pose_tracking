@@ -195,8 +195,13 @@ export function RunConfigModal({
                 <div style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>
                   Settings used for this run
                 </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '0.45rem', lineHeight: 1.45 }}>
+                  Effective parameters: schema defaults merged with what was queued for this run. Expand{' '}
+                  <span style={{ fontStyle: 'italic' }}>Raw request.json</span> below if the stored file still has an empty{' '}
+                  <span style={{ fontFamily: 'ui-monospace, monospace' }}>fields</span> object from an older Lab version.
+                </div>
                 {orderedRows.length === 0 ? (
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>No field overrides recorded.</div>
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>No tunable fields to show.</div>
                 ) : (
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
                     <tbody>

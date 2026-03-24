@@ -7,14 +7,26 @@ type RunDetail = {
   run_id: string
   recipe_name?: string
   status?: string
-  manifest?: { final_video_relpath?: string; view_variants?: Record<string, string> }
+  manifest?: {
+    final_video_relpath?: string
+    view_variants?: Record<string, string>
+    run_context_final?: {
+      fields?: Record<string, unknown>
+      track_summary?: Record<string, unknown>
+    }
+  }
 }
+
+import { WATCH_PHASE_ROWS } from '../lib/watchPrune'
+import { TrackQualitySummary } from '../components/RunMetrics'
 
 type Slot = {
   run_id: string
   label: string
   src: string | null
   error: string | null
+  fields?: Record<string, unknown>
+  trackSummary?: Record<string, unknown>
 }
 
 function useSyncedVideos() {
@@ -96,6 +108,7 @@ export function ComparePage() {
     .filter(Boolean)
 
   const [slots, setSlots] = useState<Slot[]>([])
+  const [viewMode, setViewMode] = useState<string>('final')
 
   useEffect(() => {
     if (runIds.length < 2) {
@@ -111,13 +124,19 @@ export function ComparePage() {
             return r.json() as Promise<RunDetail>
           })
           .then((data) => {
-            const rel = data.manifest?.view_variants?.full ?? data.manifest?.final_video_relpath
+            let rel = data.manifest?.view_variants?.full ?? data.manifest?.final_video_relpath
+            if (viewMode !== 'final') {
+              const phaseRow = WATCH_PHASE_ROWS.find(r => r.id === viewMode)
+              if (phaseRow) {
+                rel = `phase_previews/${phaseRow.file}`
+              }
+            }
             const src = rel ? `${API}/api/runs/${id}/file/output/${rel}` : null
             let error: string | null = null
             if (!rel) {
               error =
                 data.status === 'done'
-                  ? 'No output file in manifest.'
+                  ? `No output file found for ${viewMode} view.`
                   : 'Run not finished yet.'
             }
             return {
@@ -125,6 +144,8 @@ export function ComparePage() {
               label: data.recipe_name || id.slice(0, 8),
               src,
               error,
+              fields: data.manifest?.run_context_final?.fields,
+              trackSummary: data.manifest?.run_context_final?.track_summary,
             } satisfies Slot
           })
           .catch(() => ({
@@ -140,7 +161,7 @@ export function ComparePage() {
     return () => {
       cancelled = true
     }
-  }, [raw])
+  }, [raw, viewMode])
 
   const { refs, scrubbing, playing, duration, current, syncTime, onMeta, togglePlay, onTimeUpdateMaster, setPlaying } =
     useSyncedVideos()
@@ -162,11 +183,94 @@ export function ComparePage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-      <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
-        <h1 style={{ fontSize: '1.75rem', margin: 0 }}>Compare</h1>
-        <p className="sub" style={{ marginBottom: 0 }}>
-          One playhead scrubs and plays every output together.
-        </p>
+      <div 
+        className="glass-panel" 
+        style={{ 
+          padding: '1rem 1.5rem', 
+          position: 'sticky', 
+          top: '4.5rem', 
+          zIndex: 40, 
+          background: 'rgba(20, 24, 34, 0.85)' 
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1.5rem' }}>
+          <div>
+            <h1 style={{ fontSize: '1.5rem', margin: 0 }}>Compare</h1>
+            <p className="sub" style={{ margin: 0, fontSize: '0.9rem' }}>
+              One playhead scrubs and plays every output together.
+            </p>
+            <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>View:</span>
+              <select
+                value={viewMode}
+                onChange={(e) => setViewMode(e.target.value)}
+                style={{
+                  background: 'rgba(0,0,0,0.4)',
+                  color: '#fff',
+                  border: '1px solid var(--glass-border)',
+                  borderRadius: 6,
+                  padding: '0.35rem 0.5rem',
+                  fontSize: '0.85rem',
+                  outline: 'none',
+                }}
+              >
+                <option value="final">Final render (Full)</option>
+                {WATCH_PHASE_ROWS.map(r => (
+                  <option key={r.id} value={r.id}>Phase: {r.title}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', flex: 1, minWidth: 320 }}>
+            <button type="button" className="btn" onClick={() => syncTime(0)} aria-label="Seek start" style={{ padding: '0.5rem' }}>
+              <SkipBack size={18} />
+            </button>
+            <button type="button" className="btn primary" onClick={togglePlay} disabled={!ready} style={{ padding: '0.5rem 1rem' }}>
+              {playing ? <Pause size={18} /> : <Play size={18} />}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => syncTime(duration - 0.05)}
+              disabled={duration <= 0}
+              aria-label="Seek end"
+              style={{ padding: '0.5rem' }}
+            >
+              <SkipForward size={18} />
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={duration > 0 ? duration : 1}
+              step={0.01}
+              value={duration > 0 ? Math.min(current, duration) : 0}
+              disabled={!ready || duration <= 0}
+              onMouseDown={() => {
+                scrubbing.current = true
+              }}
+              onMouseUp={() => {
+                scrubbing.current = false
+              }}
+              onTouchStart={() => {
+                scrubbing.current = true
+              }}
+              onTouchEnd={() => {
+                scrubbing.current = false
+              }}
+              onChange={(e) => syncTime(parseFloat(e.target.value))}
+              style={{ flex: 1, minWidth: 120, accentColor: 'var(--halo-cyan)' }}
+            />
+            <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', minWidth: '80px', textAlign: 'right' }}>
+              {formatTime(current)} / {formatTime(duration)}
+            </span>
+          </div>
+        </div>
+        {!ready && (
+          <p style={{ margin: '0.75rem 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+            Waiting for all runs to finish and produce output video…
+          </p>
+        )}
       </div>
 
       <div
@@ -217,55 +321,66 @@ export function ComparePage() {
         ))}
       </div>
 
-      <div className="glass-panel" style={{ padding: '1rem 1.5rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <button type="button" className="btn" onClick={() => syncTime(0)} aria-label="Seek start">
-            <SkipBack size={18} />
-          </button>
-          <button type="button" className="btn primary" onClick={togglePlay} disabled={!ready}>
-            {playing ? <Pause size={18} /> : <Play size={18} />}
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => syncTime(duration - 0.05)}
-            disabled={duration <= 0}
-            aria-label="Seek end"
-          >
-            <SkipForward size={18} />
-          </button>
-          <input
-            type="range"
-            min={0}
-            max={duration > 0 ? duration : 1}
-            step={0.01}
-            value={duration > 0 ? Math.min(current, duration) : 0}
-            disabled={!ready || duration <= 0}
-            onMouseDown={() => {
-              scrubbing.current = true
-            }}
-            onMouseUp={() => {
-              scrubbing.current = false
-            }}
-            onTouchStart={() => {
-              scrubbing.current = true
-            }}
-            onTouchEnd={() => {
-              scrubbing.current = false
-            }}
-            onChange={(e) => syncTime(parseFloat(e.target.value))}
-            style={{ flex: 1, minWidth: 120, accentColor: 'var(--halo-cyan)' }}
-          />
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
-            {formatTime(current)} / {formatTime(duration)}
-          </span>
+      {slots.length > 0 && (
+        <div style={{ marginTop: '2rem' }}>
+          <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', color: '#fff' }}>Performance Metrics</h2>
+          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${slots.length}, minmax(320px, 1fr))`, gap: '1rem' }}>
+            {slots.map(s => (
+              <div key={s.run_id} className="glass-panel" style={{ padding: '1.25rem' }}>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '0.5rem' }}>
+                  {s.label}
+                </div>
+                <TrackQualitySummary summary={s.trackSummary || {}} />
+              </div>
+            ))}
+          </div>
+
+          <h2 style={{ fontSize: '1.25rem', margin: '2.5rem 0 1rem', color: '#fff' }}>Configuration Differences</h2>
+          <div className="glass-panel" style={{ padding: '1.25rem', overflowX: 'auto' }}>
+            {(() => {
+              const allKeys = Array.from(new Set(slots.flatMap(s => Object.keys(s.fields || {}))))
+              const diffKeys = allKeys.filter(k => {
+                const vals = new Set(slots.map(s => JSON.stringify((s.fields || {})[k])))
+                return vals.size > 1
+              }).sort()
+
+              if (diffKeys.length === 0) {
+                return <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>No configuration differences found between these runs.</div>
+              }
+
+              return (
+                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: 'var(--halo-cyan)', width: '25%' }}>Parameter</th>
+                      {slots.map(s => (
+                        <th key={s.run_id} style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: '#f8fafc' }}>
+                          {s.label}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diffKeys.map(k => (
+                      <tr key={k} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                        <td style={{ padding: '0.75rem', color: 'var(--text-muted)', fontFamily: 'ui-monospace, monospace' }}>{k}</td>
+                        {slots.map(s => {
+                          const val = (s.fields || {})[k]
+                          return (
+                            <td key={s.run_id} style={{ padding: '0.75rem', color: '#fff', fontFamily: 'ui-monospace, monospace' }}>
+                              {val !== undefined ? JSON.stringify(val) : <span style={{ color: '#ef4444' }}>Missing</span>}
+                            </td>
+                          )
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )
+            })()}
+          </div>
         </div>
-        {!ready && (
-          <p style={{ margin: '0.75rem 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            Waiting for all runs to finish and produce output video…
-          </p>
-        )}
-      </div>
+      )}
     </div>
   )
 }

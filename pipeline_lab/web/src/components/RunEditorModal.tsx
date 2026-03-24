@@ -14,6 +14,7 @@ import { HYBRID_SAM_PHASE_ID, hideHybridSamPhase } from '../lib/labFieldVisibili
 import { effectiveFieldTier, isSchemaFieldVisible, tier1FieldSortKey } from '../lib/labFieldMeta'
 import { mainPyPhaseCaption } from '../lib/schemaStageCaption'
 import { InlineFieldInput } from './InlineFieldInput'
+import { ConfigFieldWrap, ConfigInfoFold } from './ConfigFieldWrap'
 import { X, Zap, Scale, Trophy } from 'lucide-react'
 
 const PRESET_ICONS: Record<ConfigPresetId, typeof Zap> = {
@@ -22,26 +23,8 @@ const PRESET_ICONS: Record<ConfigPresetId, typeof Zap> = {
   maximum_accuracy: Trophy,
 }
 
-function fieldShell(f: SchemaField, inner: ReactNode, opts?: { noDescription?: boolean }) {
-  return (
-    <div
-      key={f.id}
-      style={{
-        background: 'rgba(0,0,0,0.2)',
-        padding: '1rem',
-        borderRadius: 12,
-        border: '1px solid var(--glass-border)',
-      }}
-    >
-      <div style={{ color: '#fff', fontWeight: 500, marginBottom: '0.35rem' }}>{f.label}</div>
-      {!opts?.noDescription && f.type !== 'info' && f.description && (
-        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.75rem', lineHeight: 1.45 }}>
-          {f.description}
-        </div>
-      )}
-      {inner}
-    </div>
-  )
+function fieldShell(f: SchemaField, inner: ReactNode) {
+  return <ConfigFieldWrap field={f}>{inner}</ConfigFieldWrap>
 }
 
 export function RunEditorModal({
@@ -60,7 +43,6 @@ export function RunEditorModal({
   const [recipeName, setRecipeName] = useState('')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
-  const [showAdvanced, setShowAdvanced] = useState(false)
   const [modelsStatus, setModelsStatus] = useState<Record<string, boolean> | null>(null)
 
   useEffect(() => {
@@ -145,6 +127,7 @@ export function RunEditorModal({
       value={fieldsState[f.id]}
       onChange={(v) => setFieldsState((prev) => ({ ...prev, [f.id]: v }))}
       modelsStatus={modelsStatus}
+      allFields={fieldsState}
     />
   )
 
@@ -211,8 +194,8 @@ export function RunEditorModal({
 
         <div style={{ padding: '1rem 1.25rem', overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-            Primary controls stay visible; expand <strong style={{ color: '#e2e8f0' }}>Tune</strong> per phase for
-            thresholds; enable <strong style={{ color: '#e2e8f0' }}>Advanced</strong> for paths and env-style overrides.
+            Big choices up top; open <strong style={{ color: '#e2e8f0' }}>Tune</strong> on each step for sliders.{' '}
+            File paths and expert overrides sit under <strong style={{ color: '#e2e8f0' }}>Advanced</strong> on the same step.
           </div>
 
           <div>
@@ -255,42 +238,34 @@ export function RunEditorModal({
 
           <div>
             <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-              Main settings
+              Main choices
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.85rem' }}>
               {tier1Fields.map((f) => fieldShell(f, renderFieldInput(f)))}
               {temporalRefineField && temporalRadiusField && visible(temporalRefineField) && (
-                <div
-                  style={{
-                    background: 'rgba(0,0,0,0.2)',
-                    padding: '1rem',
-                    borderRadius: 12,
-                    border: '1px solid var(--glass-border)',
-                    gridColumn: '1 / -1',
-                  }}
-                >
-                  <div style={{ color: '#fff', fontWeight: 500, marginBottom: '0.35rem' }}>Temporal pose refine</div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.75rem', lineHeight: 1.45 }}>
-                    {temporalRefineField.description}
-                  </div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '1rem' }}>
-                    <label className="checkbox-label" style={{ gap: '0.5rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={Boolean(fieldsState.temporal_pose_refine ?? temporalRefineField.default)}
-                        onChange={(e) => setFieldsState((p) => ({ ...p, temporal_pose_refine: e.target.checked }))}
-                        style={{ display: 'none' }}
-                      />
-                      <div className="checkbox-visual" style={{ width: 14, height: 14 }} />
-                      <span style={{ fontSize: '0.88rem', color: '#e2e8f0' }}>Enable refine</span>
-                    </label>
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <ConfigFieldWrap field={temporalRefineField}>
+                    <InlineFieldInput
+                      f={temporalRefineField}
+                      value={fieldsState.temporal_pose_refine}
+                      onChange={(v) => setFieldsState((p) => ({ ...p, temporal_pose_refine: v }))}
+                      allFields={fieldsState}
+                    />
                     {Boolean(fieldsState.temporal_pose_refine ?? temporalRefineField.default) && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Radius</span>
+                      <div
+                        style={{
+                          marginTop: '0.85rem',
+                          paddingTop: '0.85rem',
+                          borderTop: '1px solid rgba(148,163,184,0.2)',
+                        }}
+                      >
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: 8 }}>
+                          {temporalRadiusField.label}
+                        </div>
                         {renderFieldInput(temporalRadiusField)}
                       </div>
                     )}
-                  </div>
+                  </ConfigFieldWrap>
                 </div>
               )}
               {poseModelField &&
@@ -308,27 +283,34 @@ export function RunEditorModal({
                       lineHeight: 1.45,
                     }}
                   >
-                    AthletePose3D-style fine-tunes on athletic movement improve extreme poses — large/huge ViTPose
-                    checkpoints are the closest analogue in this build.
+                    Large / huge skeleton models handle wild angles and speed better—closer to what pro sports research
+                    uses—but need more time and GPU memory.
+                  </div>
+                )}
+              {poseModelField &&
+                visible(poseModelField) &&
+                fieldsState.pose_model === 'RTMPose-L' && (
+                  <div
+                    style={{
+                      gridColumn: '1 / -1',
+                      fontSize: '0.78rem',
+                      color: '#67e8f9',
+                      padding: '0.5rem 0.75rem',
+                      borderRadius: 10,
+                      border: '1px solid rgba(34, 211, 238, 0.35)',
+                      background: 'rgba(6, 78, 95, 0.2)',
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    RTMPose-L runs through MMPose (not bundled). Install mmengine, mmcv, and mmpose locally, then compare
+                    speed vs ViTPose-Base on the same clip. See docs/PIPELINE_IMPROVEMENTS_ROADMAP.md.
                   </div>
                 )}
             </div>
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
-            <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-              Phase flow · {mainPyPhaseCaption(activeStage, activePhaseIndex)}
-            </span>
-            <label className="checkbox-label" style={{ background: 'rgba(0,0,0,0.3)', padding: '0.4rem 0.8rem', borderRadius: 8 }}>
-              <input
-                type="checkbox"
-                checked={showAdvanced}
-                onChange={(e) => setShowAdvanced(e.target.checked)}
-                style={{ display: 'none' }}
-              />
-              <div className="checkbox-visual" />
-              Advanced params
-            </label>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+            Phase flow · {mainPyPhaseCaption(activeStage, activePhaseIndex)}
           </div>
 
           <div className="flowchart-board" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
@@ -384,15 +366,14 @@ export function RunEditorModal({
                   lineHeight: 1.55,
                 }}
               >
-                <strong style={{ color: '#e2e8f0' }}>Hybrid SAM</strong> runs only on the{' '}
-                <strong style={{ color: '#e2e8f0' }}>BoxMOT</strong> path. Switch tracker to BoxMOT to tune overlap
-                refinement.
+                Overlap sharpening only runs with the <strong style={{ color: '#e2e8f0' }}>built-in tracker</strong>.{' '}
+                Switch back from the alternate engine to change these options.
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                 <details open style={{ borderRadius: 12, border: '1px solid var(--glass-border)', padding: '0.65rem 0.85rem', background: 'rgba(0,0,0,0.15)' }}>
                   <summary style={{ cursor: 'pointer', fontWeight: 600, color: '#e2e8f0', listStyle: 'none' }}>
-                    ⚙ Tune · {activeStage?.short ?? 'phase'}
+                    ⚙ Sliders · {activeStage?.short ?? 'phase'}
                   </summary>
                   <div style={{ marginTop: '0.85rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.85rem' }}>
                     {tuneFieldsForPhase(activeStage?.id ?? '').map((f) => fieldShell(f, renderFieldInput(f)))}
@@ -407,7 +388,7 @@ export function RunEditorModal({
                         }}
                       >
                         <summary style={{ cursor: 'pointer', fontWeight: 600, color: '#cbd5e1', fontSize: '0.88rem' }}>
-                          Tier B rule weights (PRUNING_WEIGHTS)
+                          How strongly each “looks fake” rule counts
                         </summary>
                         <div
                           style={{
@@ -417,21 +398,23 @@ export function RunEditorModal({
                             gap: '0.65rem',
                           }}
                         >
-                          {pruningWeightFields.map((f) => fieldShell(f, renderFieldInput(f), { noDescription: true }))}
+                          {pruningWeightFields.map((f) => fieldShell(f, renderFieldInput(f)))}
                         </div>
                       </details>
                     )}
                     {tuneFieldsForPhase(activeStage?.id ?? '').length === 0 &&
                       !(activeStage?.id === 'post_pose_prune' && pruningWeightFields.length > 0) && (
-                        <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No tune sliders in this phase.</div>
+                        <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                          Nothing to slide on this step—defaults are fine unless you open Expert below.
+                        </div>
                       )}
                   </div>
                 </details>
 
-                {showAdvanced && advancedFieldsForPhase(activeStage?.id ?? '').length > 0 && (
+                {advancedFieldsForPhase(activeStage?.id ?? '').length > 0 && (
                   <div>
                     <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '0.5rem' }}>
-                      Advanced · {activeStage?.short}
+                      Expert / paths · {activeStage?.short}
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.85rem' }}>
                       {advancedFieldsForPhase(activeStage?.id ?? '').map((f) => fieldShell(f, renderFieldInput(f)))}
@@ -442,21 +425,7 @@ export function RunEditorModal({
                 {schema.fields
                   .filter((f) => f.phase === activeStage?.id && f.type === 'info')
                   .map((f) => (
-                    <div
-                      key={f.id}
-                      style={{
-                        padding: '0.85rem 1rem',
-                        borderRadius: 12,
-                        border: '1px solid var(--glass-border)',
-                        background: 'rgba(0,0,0,0.18)',
-                        fontSize: '0.78rem',
-                        color: 'var(--text-muted)',
-                        lineHeight: 1.55,
-                      }}
-                    >
-                      <div style={{ fontWeight: 600, color: '#cbd5e1', marginBottom: '0.35rem' }}>{f.label}</div>
-                      {f.description}
-                    </div>
+                    <ConfigInfoFold key={f.id} title={`ℹ ${f.label}`} body={f.description ?? ''} />
                   ))}
               </div>
             )}

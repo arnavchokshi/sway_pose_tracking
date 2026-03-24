@@ -77,10 +77,6 @@ def default_finetuned_weights() -> Path | None:
         REPO_ROOT / "runs" / "detect" / "yolo26l_dancetrack_only" / "weights" / "best.pt",
         REPO_ROOT / "runs" / "detect" / "yolo26l_dancetrack" / "weights" / "best.pt",
         REPO_ROOT / "runs" / "detect" / "yolo26l_crowdhuman_ft" / "weights" / "best.pt",
-        REPO_ROOT / "models" / "yolo11x_dancetrack.pt",
-        REPO_ROOT / "runs" / "detect" / "yolo11x_dancetrack_only" / "weights" / "best.pt",
-        REPO_ROOT / "runs" / "detect" / "yolo11x_dancetrack" / "weights" / "best.pt",
-        REPO_ROOT / "runs" / "detect" / "yolo11x_crowdhuman_ft" / "weights" / "best.pt",
     )
     for p in candidates:
         if p.is_file():

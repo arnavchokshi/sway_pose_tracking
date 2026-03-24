@@ -12,6 +12,11 @@ SAM2 → BoxMOT ID handoff (verified contract):
     row by greedy IoU (tracker may reorder rows), then attaches ``per_det_masks[j]`` so
     the mask follows the person, not the row index.
 
+ROI crop (default on): when overlap triggers SAM, inference runs on the union of all
+boxes that participate in a high-IoU pair (plus margin), not the full frame — then masks
+are pasted back to full resolution for box tightening. Set ``SWAY_HYBRID_SAM_ROI_CROP=0``
+to use the legacy full-frame path.
+
 Data contract (same as BoxMOT / tracker):
   dets: float32 array shape (N, 6) — columns [x1, y1, x2, y2, conf, cls].
 
@@ -21,6 +26,8 @@ Default on; set SWAY_HYBRID_SAM_OVERLAP=0 to disable. Optional env:
   SWAY_HYBRID_SAM_WEIGHTS         — Ultralytics SAM checkpoint (default sam2.1_b.pt)
   SWAY_HYBRID_SAM_MASK_THRESH     — binarize masks at this prob (default 0.5)
   SWAY_HYBRID_SAM_BBOX_PAD        — pixel pad on mask-derived boxes (default 2)
+  SWAY_HYBRID_SAM_ROI_CROP        — 1 = ROI union crop for SAM (default 1)
+  SWAY_HYBRID_SAM_ROI_PAD_FRAC    — expand ROI union by this fraction of its size (default 0.1)
 """
 
 from __future__ import annotations
@@ -28,7 +35,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import cv2
+import numpy as np
 
 
 def resolve_hybrid_sam_weights(spec: str) -> str:
@@ -48,9 +58,6 @@ def resolve_hybrid_sam_weights(spec: str) -> str:
         if cand.is_file():
             return str(cand.resolve())
     return spec
-
-import cv2
-import numpy as np
 
 
 def load_hybrid_sam_config() -> Dict[str, Any]:
@@ -77,6 +84,8 @@ def load_hybrid_sam_config() -> Dict[str, Any]:
         ),
         "mask_thresh": _f("SWAY_HYBRID_SAM_MASK_THRESH", 0.5),
         "bbox_pad": _i("SWAY_HYBRID_SAM_BBOX_PAD", 2),
+        "roi_crop": _truthy("SWAY_HYBRID_SAM_ROI_CROP", True),
+        "roi_pad_frac": _f("SWAY_HYBRID_SAM_ROI_PAD_FRAC", 0.1),
     }
 
 
@@ -105,6 +114,44 @@ def max_pairwise_iou(xyxy: np.ndarray) -> float:
         for j in range(i + 1, n):
             m = max(m, _iou_xyxy(xyxy[i], xyxy[j]))
     return m
+
+
+def overlap_cluster_indices(xyxy: np.ndarray, iou_trigger: float) -> Set[int]:
+    """Indices that appear in any pair with IoU >= iou_trigger."""
+    n = int(xyxy.shape[0])
+    involved: Set[int] = set()
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _iou_xyxy(xyxy[i], xyxy[j]) >= float(iou_trigger):
+                involved.add(i)
+                involved.add(j)
+    return involved
+
+
+def union_xyxy_with_pad(
+    xyxy: np.ndarray,
+    indices: List[int],
+    frame_h: int,
+    frame_w: int,
+    pad_frac: float,
+) -> Tuple[int, int, int, int]:
+    """Integer ROI (x1,y1,x2,y2) clipped to the frame; pad_frac expands the union."""
+    sub = xyxy[indices].astype(np.float64)
+    u_x1, u_y1 = float(sub[:, 0].min()), float(sub[:, 1].min())
+    u_x2, u_y2 = float(sub[:, 2].max()), float(sub[:, 3].max())
+    bw = max(1.0, u_x2 - u_x1)
+    bh = max(1.0, u_y2 - u_y1)
+    px = float(pad_frac) * bw
+    py = float(pad_frac) * bh
+    cx1 = max(0, int(np.floor(u_x1 - px)))
+    cy1 = max(0, int(np.floor(u_y1 - py)))
+    cx2 = min(frame_w, int(np.ceil(u_x2 + px)))
+    cy2 = min(frame_h, int(np.ceil(u_y2 + py)))
+    if cx2 <= cx1:
+        cx2 = min(frame_w, cx1 + 1)
+    if cy2 <= cy1:
+        cy2 = min(frame_h, cy1 + 1)
+    return cx1, cy1, cx2, cy2
 
 
 def overlap_stats(xyxy: np.ndarray, cfg: Dict[str, Any]) -> Tuple[float, bool]:
@@ -170,6 +217,119 @@ def blend_sam_masks_for_tracks(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _xyxy_to_crop_space(
+    xyxy: np.ndarray,
+    cx1: int,
+    cy1: int,
+    cw: int,
+    ch: int,
+) -> np.ndarray:
+    """Shift boxes into crop coordinates and clamp to valid pixels."""
+    b = xyxy.astype(np.float32).copy()
+    b[:, [0, 2]] -= float(cx1)
+    b[:, [1, 3]] -= float(cy1)
+    b[:, 0] = np.clip(b[:, 0], 0.0, max(0.0, float(cw - 1)))
+    b[:, 1] = np.clip(b[:, 1], 0.0, max(0.0, float(ch - 1)))
+    b[:, 2] = np.clip(b[:, 2], 0.0, float(cw))
+    b[:, 3] = np.clip(b[:, 3], 0.0, float(ch))
+    # ensure positive area where possible
+    for i in range(b.shape[0]):
+        if b[i, 2] <= b[i, 0]:
+            b[i, 2] = min(float(cw), b[i, 0] + 1.0)
+        if b[i, 3] <= b[i, 1]:
+            b[i, 3] = min(float(ch), b[i, 1] + 1.0)
+    return b
+
+
+def _sam_predict_masks(
+    sam: Any,
+    frame_bgr: np.ndarray,
+    boxes_xyxy: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Run Ultralytics SAM on frame_bgr with boxes_xyxy (N,4) in the same pixel space as frame_bgr.
+    Returns float masks stacked (N, H, W) matching frame_bgr shape, or None on failure.
+    """
+    h, w = frame_bgr.shape[:2]
+    try:
+        import torch
+
+        with torch.inference_mode():
+            res = sam.predict(frame_bgr, bboxes=boxes_xyxy, verbose=False)
+        r0 = res[0] if isinstance(res, list) else res
+    except Exception:
+        return None
+    if r0.masks is None or r0.masks.data is None:
+        return None
+    masks = r0.masks.data.detach().cpu().numpy()
+    n = int(masks.shape[0])
+    out = np.zeros((n, h, w), dtype=np.float32)
+    for i in range(n):
+        m = masks[i]
+        if m.shape[0] != h or m.shape[1] != w:
+            m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        out[i] = m
+    return out
+
+
+def _apply_sam_masks_to_dets(
+    dets: np.ndarray,
+    masks_hw: np.ndarray,
+    det_indices: List[int],
+    full_h: int,
+    full_w: int,
+    mask_thresh: float,
+    bbox_pad: int,
+    *,
+    roi: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[np.ndarray, List[Optional[np.ndarray]]]:
+    """
+    Tighten boxes and build per-det mask crops in full-image coordinates.
+    masks_hw: (K, Hm, Wm); det_indices maps row k -> global det index.
+    If roi is set, masks are defined on the ROI; they are embedded into full-frame space first.
+    """
+    out = dets.copy()
+    nd = int(len(dets))
+    per_det_masks: List[Optional[np.ndarray]] = [None] * nd
+    thr = float(mask_thresh)
+    for k, gi in enumerate(det_indices):
+        if k >= masks_hw.shape[0]:
+            break
+        m = masks_hw[k]
+        if roi is not None:
+            rcx1, rcy1, rcx2, rcy2 = roi
+            ch, cw = rcy2 - rcy1, rcx2 - rcx1
+            if m.shape[0] != ch or m.shape[1] != cw:
+                m = cv2.resize(m.astype(np.float32), (cw, ch), interpolation=cv2.INTER_LINEAR)
+            full_m = np.zeros((full_h, full_w), dtype=np.float32)
+            full_m[rcy1:rcy2, rcx1:rcx2] = np.maximum(
+                full_m[rcy1:rcy2, rcx1:rcx2], m.astype(np.float32)
+            )
+            m_work = full_m
+        else:
+            m_work = m
+            if m_work.shape[0] != full_h or m_work.shape[1] != full_w:
+                m_work = cv2.resize(
+                    m_work.astype(np.float32), (full_w, full_h), interpolation=cv2.INTER_LINEAR
+                )
+        tight = _mask_to_xyxy(m_work, full_h, full_w, mask_thresh, bbox_pad)
+        if tight is not None:
+            out[gi, :4] = tight
+            x1, y1, x2, y2 = (
+                int(round(tight[0])),
+                int(round(tight[1])),
+                int(round(tight[2])),
+                int(round(tight[3])),
+            )
+            x1 = max(0, min(full_w - 1, x1))
+            y1 = max(0, min(full_h - 1, y1))
+            x2 = max(0, min(full_w, x2))
+            y2 = max(0, min(full_h, y2))
+            if x2 > x1 and y2 > y1:
+                per_det_masks[gi] = (m_work[y1:y2, x1:x2] > thr).astype(bool)
+    return out.astype(np.float32), per_det_masks
+
+
 @dataclass
 class HybridSamRefiner:
     """Lazy-loads SAM; refines BoxMOT-format dets when overlap is high."""
@@ -203,6 +363,8 @@ class HybridSamRefiner:
             "max_iou": 0.0,
             "n_in": int(len(dets)),
             "n_out": int(len(dets)),
+            "roi_crop": False,
+            "roi_box": None,
         }
         if dets.size == 0 or dets.shape[0] == 0:
             return dets, meta
@@ -221,42 +383,59 @@ class HybridSamRefiner:
         self.sam_calls += 1
         self.frames_sam_used += 1
 
-        try:
-            import torch
-
-            with torch.inference_mode():
-                res = sam.predict(frame_bgr, bboxes=xyxy, verbose=False)
-            r0 = res[0] if isinstance(res, list) else res
-        except Exception:
-            return dets, meta
-
-        if r0.masks is None or r0.masks.data is None:
-            return dets, meta
-
-        masks = r0.masks.data.detach().cpu().numpy()
-        out = dets.copy()
-        per_det_masks: List[Optional[np.ndarray]] = [None] * nd
-        n = min(len(dets), masks.shape[0])
         thr = float(self.cfg["mask_thresh"])
-        for i in range(n):
-            m = masks[i]
-            if m.shape[0] != h or m.shape[1] != w:
-                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-            tight = _mask_to_xyxy(m, h, w, self.cfg["mask_thresh"], self.cfg["bbox_pad"])
-            if tight is not None:
-                out[i, :4] = tight
-                x1, y1, x2, y2 = (int(round(tight[0])), int(round(tight[1])), int(round(tight[2])), int(round(tight[3])))
-                x1 = max(0, min(w - 1, x1))
-                y1 = max(0, min(h - 1, y1))
-                x2 = max(0, min(w, x2))
-                y2 = max(0, min(h, y2))
-                if x2 > x1 and y2 > y1:
-                    per_det_masks[i] = (m[y1:y2, x1:x2] > thr).astype(bool)
+        pad = int(self.cfg["bbox_pad"])
+        use_roi = bool(self.cfg.get("roi_crop", True))
+        involved = sorted(overlap_cluster_indices(xyxy, float(self.cfg["iou_trigger"])))
+        if not involved:
+            involved = list(range(nd))
 
+        if use_roi and involved:
+            meta["roi_crop"] = True
+            roi = union_xyxy_with_pad(
+                xyxy,
+                involved,
+                h,
+                w,
+                float(self.cfg.get("roi_pad_frac", 0.1)),
+            )
+            meta["roi_box"] = list(roi)
+            rcx1, rcy1, rcx2, rcy2 = roi
+            crop = frame_bgr[rcy1:rcy2, rcx1:rcx2]
+            ch, cw = crop.shape[:2]
+            sub = xyxy[involved]
+            boxes_crop = _xyxy_to_crop_space(sub, rcx1, rcy1, cw, ch)
+            masks = _sam_predict_masks(sam, crop, boxes_crop)
+            if masks is None:
+                return dets, meta
+            out, per_det_masks = _apply_sam_masks_to_dets(
+                dets,
+                masks,
+                involved,
+                h,
+                w,
+                thr,
+                pad,
+                roi=roi,
+            )
+            meta["used_sam"] = True
+            meta["n_out"] = int(len(out))
+            meta["per_det_masks"] = per_det_masks
+            return out, meta
+
+        # Full-frame SAM (legacy or when everyone is in the overlap cluster)
+        masks = _sam_predict_masks(sam, frame_bgr, xyxy)
+        if masks is None:
+            return dets, meta
+
+        all_idx = list(range(min(nd, masks.shape[0])))
+        out, per_det_masks = _apply_sam_masks_to_dets(
+            dets, masks, all_idx, h, w, thr, pad, roi=None
+        )
         meta["used_sam"] = True
         meta["n_out"] = int(len(out))
         meta["per_det_masks"] = per_det_masks
-        return out.astype(np.float32), meta
+        return out, meta
 
     def summary(self) -> Dict[str, Any]:
         return {

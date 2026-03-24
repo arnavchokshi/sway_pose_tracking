@@ -7,11 +7,11 @@ Run from repo root or sway_pose_mvp/; pipeline cwd is always sway_pose_mvp.
 
 Example:
   cd sway_pose_mvp
-  python batch_run_for_review.py --input-dir input --output-root output/review_batch \\
+  python -m tools.batch_run_for_review --input-dir input --output-root output/review_batch \\
       --pose-model base --skip-existing
 
 Large batch queue (default inbox layout):
-  python batch_run_for_review.py --input-dir data/videos_inbox --output-root output/flight_batch \\
+  python -m tools.batch_run_for_review --input-dir data/videos_inbox --output-root output/flight_batch \\
       --pose-model base --skip-existing
 
 Afterwards open the review UI — for reliable video scrubbing offline, prefer:
@@ -39,8 +39,8 @@ from typing import Any, Dict, List, Optional
 VIDEO_GLOBS = ("*.mp4", "*.MP4", "*.mov", "*.MOV", "*.m4v", "*.M4V", "*.webm", "*.WEBM")
 
 
-def _script_dir() -> Path:
-    return Path(__file__).resolve().parent
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
 def discover_videos(input_dir: Path) -> List[Path]:
@@ -102,14 +102,14 @@ def write_manifest(
 
 
 def generate_review_site(output_root: Path) -> None:
-    gen = _script_dir() / "review_app" / "generate_review_index.py"
+    gen = _repo_root() / "review_app" / "generate_review_index.py"
     if not gen.exists():
         print("Warning: generate_review_index.py missing; skip review site.")
         return
     subprocess.run(
         [sys.executable, str(gen), str(output_root.resolve())],
         check=False,
-        cwd=str(_script_dir()),
+        cwd=str(_repo_root()),
     )
 
 
@@ -168,7 +168,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if str(os.environ.get("SWAY_OFFLINE", "")).lower() in ("1", "true", "yes"):
-        print("SWAY_OFFLINE=1 — using local model files only (run prefetch_models.py while online if needed).")
+        print("SWAY_OFFLINE=1 — using local model files only (run python -m tools.prefetch_models while online if needed).")
 
     input_dir = args.input_dir.expanduser().resolve()
     if not input_dir.is_dir():
@@ -183,7 +183,7 @@ def main() -> None:
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    cwd = _script_dir()
+    cwd = _repo_root()
     extra: List[str] = ["--pose-model", args.pose_model, "--pose-stride", str(args.pose_stride)]
     if args.params:
         extra.extend(["--params", str(args.params.resolve())])

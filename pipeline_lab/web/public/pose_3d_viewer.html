@@ -11,12 +11,12 @@
     #scene-view { flex: 1; position: relative; min-width: 0; }
     #individual-view { width: 340px; border-left: 1px solid #333; position: relative; flex-shrink: 0; }
     canvas { display: block; width: 100%; height: 100%; }
-    .controls { position: absolute; bottom: 16px; left: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .controls { position: absolute; bottom: 16px; left: 16px; z-index: 2; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     button { background: #222; color: #fff; border: 1px solid #444;
              padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
     button:hover { background: #333; }
     button.active { border-color: #6366f1; color: #818cf8; }
-    #timeline { position: absolute; bottom: 56px; left: 16px; right: 16px; }
+    #timeline { position: absolute; bottom: 56px; left: 16px; right: 16px; z-index: 2; }
     #timeline input { width: 100%; accent-color: #6366f1; }
     #dancer-list { padding: 12px; overflow-y: auto; height: calc(100% - 320px); }
     .dancer-btn { display: block; width: 100%; text-align: left; background: #1a1a1a;
@@ -28,6 +28,14 @@
     #err { padding: 2rem; color: #fca5a5; max-width: 40rem; line-height: 1.5; }
     a { color: #818cf8; }
   </style>
+  <!-- OrbitControls (and other three/examples/jsm files) import the bare specifier "three". -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+    }
+  }
+  </script>
 </head>
 <body>
 <div id="err" style="display:none"></div>
@@ -55,7 +63,7 @@
 </div>
 
 <script type="module">
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+import * as THREE from 'three';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
 
 const params = new URLSearchParams(location.search);
@@ -90,8 +98,11 @@ try {
 document.getElementById('container').style.display = 'flex';
 document.getElementById('err').style.display = 'none';
 
-const { fps, total_frames, bones, tracks } = POSE_DATA;
+const { fps: fpsRaw, total_frames, bones, tracks, camera: poseCamera } = POSE_DATA;
+const fps = Number(fpsRaw) || 30;
 const trackIds = Object.keys(tracks || {}).map((k) => parseInt(k, 10)).filter((n) => !Number.isNaN(n));
+/** v2 export: unified world XYZ (Y-up) from pinhole + depth + lift; no fake side-by-side spread. */
+const useWorldXYZ = Number(POSE_DATA.version) >= 2 && poseCamera && poseCamera.fx;
 
 const DANCER_COLORS = [
   0x6366f1, 0xf43f5e, 0x10b981, 0xf59e0b,
@@ -134,8 +145,9 @@ function createDancerSkeleton(color) {
   const jointMat = new THREE.MeshStandardMaterial({ color });
   const boneMat = new THREE.LineBasicMaterial({ color });
 
+  const jr = useWorldXYZ ? 0.055 : 0.025;
   const joints = Array.from({ length: 17 }, () => {
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), jointMat);
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(jr, 8, 8), jointMat);
     group.add(mesh);
     return mesh;
   });
@@ -188,6 +200,22 @@ function updateSkeleton(skel, kpts3d) {
   }
   skel.group.visible = true;
 
+  if (useWorldXYZ) {
+    skel.joints.forEach((joint, i) => {
+      const kp = kpts3d[i];
+      joint.position.set(Number(kp[0]), Number(kp[1]), Number(kp[2] ?? 0));
+    });
+    skel.boneLines.forEach(({ line, a, b }) => {
+      const posA = skel.joints[a].position;
+      const posB = skel.joints[b].position;
+      const positions = line.geometry.attributes.position;
+      positions.setXYZ(0, posA.x, posA.y, posA.z);
+      positions.setXYZ(1, posB.x, posB.y, posB.z);
+      positions.needsUpdate = true;
+    });
+    return;
+  }
+
   const hipMid = [
     (kpts3d[11][0] + kpts3d[12][0]) / 2,
     (kpts3d[11][1] + kpts3d[12][1]) / 2,
@@ -196,14 +224,31 @@ function updateSkeleton(skel, kpts3d) {
   const ankleY = Math.max(kpts3d[15][1], kpts3d[16][1]);
   const noseY = kpts3d[0][1];
   const rawHeight = Math.abs(ankleY - noseY) || 1.0;
+  /** Maps pixel XY deltas to ~meters in scene (same as body height → ~1.8 units). */
   const scale = 1.8 / rawHeight;
+  /**
+   * keypoints_3d from the pipeline is [pixel_x, pixel_y, model_z]. Applying `scale` to z
+   * crushes real depth (~0.1–1m) relative to XY. Center z on the hips and scale so the
+   * joint-to-joint depth range matches the horizontal extent of the skeleton in scene units.
+   */
+  let xyExtent = 0.01;
+  let zExtent = 1e-6;
+  for (let i = 0; i < 17; i++) {
+    const kp = kpts3d[i];
+    const sx = (kp[0] - hipMid[0]) * scale;
+    const sy = -(kp[1] - hipMid[1]) * scale;
+    xyExtent = Math.max(xyExtent, Math.hypot(sx, sy));
+    zExtent = Math.max(zExtent, Math.abs((kp[2] ?? 0) - hipMid[2]));
+  }
+  const zScale = zExtent < 1e-7 ? 0 : (xyExtent / zExtent) * 0.9;
 
   skel.joints.forEach((joint, i) => {
     const kp = kpts3d[i];
+    const z = kp[2] ?? 0;
     joint.position.set(
       (kp[0] - hipMid[0]) * scale,
       -(kp[1] - hipMid[1]) * scale,
-      kp[2] * scale * 0.5,
+      (z - hipMid[2]) * zScale,
     );
   });
 
@@ -222,7 +267,13 @@ function updateAllScene(frameIdx) {
     const skel = allSceneSkeletons[tid];
     const kpts = getKptsAtFrame(tid, frameIdx);
     updateSkeleton(skel, kpts);
-    skel.group.position.x = (i - (trackIds.length - 1) / 2) * 2.5;
+    if (useWorldXYZ) {
+      skel.group.position.set(0, 0, 0);
+    } else {
+      skel.group.position.x = (i - (trackIds.length - 1) / 2) * 2.5;
+      skel.group.position.y = 0;
+      skel.group.position.z = 0;
+    }
   });
 }
 
@@ -250,11 +301,21 @@ trackIds.forEach((tid, i) => {
 });
 
 const scrubber = document.getElementById('scrubber');
-const tf = Math.max(1, Math.floor(total_frames || 1));
+const tf = Math.max(1, Math.floor(Number(total_frames) || 1));
 scrubber.max = tf - 1;
-let currentFrame = 0;
+/** Continuous playhead (fractional frames) so playback advances under requestAnimationFrame. */
+let playhead = 0;
 let playing = false;
 let lastTime = null;
+
+function frameIndex() {
+  return Math.min(tf - 1, Math.max(0, Math.floor(playhead)));
+}
+
+function setFrameLabel(fi) {
+  document.getElementById('frame-label').textContent =
+    `Frame ${fi} / ${(fi / fps).toFixed(2)}s`;
+}
 
 document.getElementById('btn-play').addEventListener('click', function () {
   playing = !playing;
@@ -269,10 +330,10 @@ document.getElementById('btn-reset-cam').addEventListener('click', () => {
 });
 
 scrubber.addEventListener('input', () => {
-  currentFrame = parseInt(scrubber.value, 10);
-  document.getElementById('frame-label').textContent =
-    `Frame ${currentFrame} / ${(currentFrame / (fps || 30)).toFixed(2)}s`;
+  playhead = parseInt(scrubber.value, 10);
+  setFrameLabel(frameIndex());
 });
+setFrameLabel(0);
 
 function resize() {
   const wAll = canvasAll.parentElement.clientWidth;
@@ -297,16 +358,16 @@ function animate(timestamp) {
   if (playing) {
     if (lastTime === null) lastTime = timestamp;
     const elapsed = timestamp - lastTime;
-    const frameDelta = (elapsed / 1000) * (fps || 30);
-    currentFrame = Math.floor(currentFrame + frameDelta) % tf;
     lastTime = timestamp;
-    scrubber.value = String(currentFrame);
-    document.getElementById('frame-label').textContent =
-      `Frame ${currentFrame} / ${(currentFrame / (fps || 30)).toFixed(2)}s`;
+    playhead += (elapsed / 1000) * fps;
+    while (playhead >= tf) playhead -= tf;
+    scrubber.value = String(frameIndex());
+    setFrameLabel(frameIndex());
   }
 
-  updateAllScene(currentFrame);
-  updateIndividualScene(currentFrame);
+  const fi = frameIndex();
+  updateAllScene(fi);
+  updateIndividualScene(fi);
 
   controlsAll.update();
   controlsInd.update();

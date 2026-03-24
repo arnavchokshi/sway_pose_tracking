@@ -18,7 +18,7 @@ export type SchemaField = {
   tier?: number
   visible_when_field?: string
   visible_when_value?: unknown
-  /** UI hint: slider | segmented | model_cards | pruning_weight */
+  /** UI hint: slider | segmented | model_cards | pruning_weight | tracker_strip */
   display?: string
   disabled_choices?: (string | number)[]
 }

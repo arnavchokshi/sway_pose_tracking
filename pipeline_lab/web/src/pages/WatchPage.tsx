@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { API } from '../types'
 import type { ProgressLine } from '../types'
@@ -14,22 +15,28 @@ import {
   formatTimecode,
   humanRule,
   parseBboxXyxy,
+  parseOtherBboxXyxy,
   pruneEntriesForWatchPhase,
   pruneEntryKey,
   pruneEntryRule,
   pruneEntryVisibleAtFrame,
-  pruneOverlayStyle,
   sortPruneEntriesForUi,
 } from '../lib/watchPrune'
-import { ArrowLeft, Box, Clapperboard, Film, Search } from 'lucide-react'
+import { ArrowLeft, Box, Clapperboard, Film, RotateCw, Search, Gauge } from 'lucide-react'
+import { TrackQualitySummary, RunConfigDisplay } from '../components/RunMetrics'
 
 type RunDetail = {
   run_id: string
   recipe_name?: string
   status?: string
+  subprocess_alive?: boolean
   manifest?: {
     final_video_relpath?: string
     view_variants?: Record<string, string>
+    run_context_final?: {
+      track_summary?: Record<string, unknown>
+      fields?: Record<string, unknown>
+    }
   }
 }
 
@@ -77,6 +84,68 @@ function videoContainContentRect(video: HTMLVideoElement): {
     h: dh,
     scale,
   }
+}
+
+function formatCauseParamValue(v: unknown): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) return JSON.stringify(v)
+  if (typeof v === 'object') return JSON.stringify(v)
+  return String(v)
+}
+
+function CauseConfigBlock({ e }: { e: PruneEntry }) {
+  const cc = e.cause_config as
+    | { filter?: string; summary?: string; params?: Record<string, unknown> }
+    | undefined
+  if (!cc || typeof cc !== 'object') return null
+  const paramEntries =
+    cc.params && typeof cc.params === 'object' ? Object.entries(cc.params) : []
+  if (!cc.summary && !cc.filter && paramEntries.length === 0) return null
+  return (
+    <div
+      style={{
+        marginTop: '0.35rem',
+        padding: '0.45rem 0.55rem',
+        borderRadius: 8,
+        background: 'rgba(30, 41, 59, 0.55)',
+        border: '1px solid rgba(148, 163, 184, 0.2)',
+        fontSize: '0.7rem',
+        lineHeight: 1.45,
+        color: '#cbd5e1',
+      }}
+      onClick={(ev) => ev.stopPropagation()}
+    >
+      <div style={{ fontWeight: 600, color: '#93c5fd', marginBottom: '0.2rem' }}>Filter / configuration</div>
+      {cc.filter != null && cc.filter !== '' && (
+        <div>
+          <span style={{ color: 'var(--text-muted)' }}>id </span>
+          {cc.filter}
+        </div>
+      )}
+      {cc.summary != null && cc.summary !== '' && (
+        <div style={{ marginTop: '0.15rem' }}>{cc.summary}</div>
+      )}
+      {paramEntries.length > 0 && (
+        <div
+          style={{
+            marginTop: '0.25rem',
+            fontFamily: 'ui-monospace, monospace',
+            fontSize: '0.65rem',
+            color: '#e2e8f0',
+            wordBreak: 'break-word',
+          }}
+        >
+          {paramEntries.map(([k, v]) => (
+            <div key={k}>
+              {k}: {formatCauseParamValue(v)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function TierBBlock({ e }: { e: PruneEntry }) {
@@ -148,6 +217,10 @@ function PruneEventCard({
   const seekFrame = frameIdx ?? (fr && fr.length >= 1 ? fr[0] : null)
 
   const bboxStr = formatBbox(e)
+  const otherBboxStr =
+    rule === 'deduplicate_collocated_poses' ? formatBbox({ ...e, bbox_xyxy: e.other_bbox_xyxy } as PruneEntry) : null
+  const keptTid =
+    rule === 'deduplicate_collocated_poses' && e.kept_track_id != null ? String(e.kept_track_id) : null
   const title = humanRule(rule)
   const canHighlight = rule !== 'phase6_summary' && parseBboxXyxy(e) != null
 
@@ -191,14 +264,76 @@ function PruneEventCard({
         </span>
       </div>
       <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '0.2rem' }}>{title}</div>
+      <CauseConfigBlock e={e} />
+      {keptTid != null && (
+        <div style={{ fontSize: '0.74rem', color: '#86efac', marginTop: '0.25rem', lineHeight: 1.45 }}>
+          Same frame: kept track <span style={{ fontWeight: 700 }}>{keptTid}</span> (this row is the duplicate that was
+          removed).
+        </div>
+      )}
       {String(e.decision ?? '') && (
         <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '0.15rem' }}>
           Decision: {String(e.decision)}
         </div>
       )}
+      {rule === 'deduplicate_collocated_poses' &&
+        (typeof e.bbox_iou === 'number' ||
+          typeof e.median_kpt_dist_px === 'number' ||
+          typeof e.median_dist_over_bbox_h === 'number') && (
+          <div
+            style={{
+              fontSize: '0.68rem',
+              color: 'var(--text-muted)',
+              marginTop: '0.2rem',
+              lineHeight: 1.45,
+              fontFamily: 'ui-monospace, monospace',
+            }}
+          >
+            {typeof e.bbox_iou === 'number' && <div>BBox IoU {Number(e.bbox_iou).toFixed(3)}</div>}
+            {typeof e.median_kpt_dist_px === 'number' && typeof e.median_dist_over_bbox_h === 'number' && (
+              <div>
+                Median kpt distance {Number(e.median_kpt_dist_px).toFixed(1)} px (
+                {(Number(e.median_dist_over_bbox_h) * 100).toFixed(1)}% of bbox height)
+              </div>
+            )}
+            {typeof e.torso_median_dist_px === 'number' &&
+              typeof e.torso_median_over_bbox_h === 'number' && (
+                <div>
+                  Torso (shldr+hip) median {Number(e.torso_median_dist_px).toFixed(1)} px (
+                  {(Number(e.torso_median_over_bbox_h) * 100).toFixed(1)}% of bbox height)
+                </div>
+              )}
+            {typeof e.dedup_pair_oks === 'number' && (
+              <div>Pairwise OKS {Number(e.dedup_pair_oks).toFixed(3)}</div>
+            )}
+            {typeof e.mean_kpt_conf_suppressed === 'number' && typeof e.mean_kpt_conf_kept === 'number' && (
+              <div>
+                Mean kpt conf — suppressed {Number(e.mean_kpt_conf_suppressed).toFixed(3)}, kept{' '}
+                {Number(e.mean_kpt_conf_kept).toFixed(3)}
+              </div>
+            )}
+            {typeof e.tie_break === 'string' && (
+              <div>
+                Why kept:{' '}
+                {e.tie_break === 'longer_track_history'
+                  ? 'longer track history'
+                  : e.tie_break === 'higher_mean_kpt_conf'
+                    ? 'higher mean keypoint confidence'
+                    : e.tie_break === 'lower_track_id_tiebreak'
+                      ? 'lower track ID (equal frame counts — avoids ghost winning then pruned)'
+                      : String(e.tie_break)}
+              </div>
+            )}
+          </div>
+        )}
       {bboxStr && (
-        <div style={{ fontSize: '0.7rem', color: '#a5b4fc', marginTop: '0.25rem', fontFamily: 'ui-monospace, monospace' }}>
-          Bbox xyxy {bboxStr}
+        <div style={{ fontSize: '0.7rem', color: '#fdba74', marginTop: '0.25rem', fontFamily: 'ui-monospace, monospace' }}>
+          Suppressed bbox xyxy {bboxStr}
+        </div>
+      )}
+      {otherBboxStr && (
+        <div style={{ fontSize: '0.7rem', color: '#86efac', marginTop: '0.15rem', fontFamily: 'ui-monospace, monospace' }}>
+          Kept (other ID) bbox xyxy {otherBboxStr}
         </div>
       )}
       {e.n_frames != null && rule !== 'deduplicate_collocated_poses' && rule !== 'sanitize_pose_bbox_consistency' && (
@@ -218,7 +353,9 @@ function PruneEventCard({
       )}
       {canHighlight && (
         <div style={{ fontSize: '0.65rem', color: selected ? '#7dd3fc' : '#64748b', marginTop: '0.25rem' }}>
-          {selected ? 'Highlight on video (this stage) — click again to clear' : 'Click to show bbox overlay on video'}
+          {selected
+            ? 'Focus zoom on this region — click again to clear'
+            : 'Also click to focus-zoom (boxes are baked into the phase preview video)'}
         </div>
       )}
     </button>
@@ -230,18 +367,19 @@ export function WatchPage() {
   const nav = useNavigate()
   const videoRef = useRef<HTMLVideoElement>(null)
   const videoWrapRef = useRef<HTMLDivElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
   const [run, setRun] = useState<RunDetail | null>(null)
   const [progress, setProgress] = useState<ProgressLine[]>([])
   const [title, setTitle] = useState('')
   const [err, setErr] = useState<string | null>(null)
-  const [mode, setMode] = useState<'phase' | 'final'>('phase')
+  const [mode, setMode] = useState<'phase' | 'final' | 'metrics'>('phase')
   const [phasePick, setPhasePick] = useState(0)
   const [finalKey, setFinalKey] = useState<string>('full')
   const [pruneLog, setPruneLog] = useState<PruneLogPayload | null>(null)
   const [pruneLogErr, setPruneLogErr] = useState<string | null>(null)
   const [pruneQuery, setPruneQuery] = useState('')
   const [selectedPruneKey, setSelectedPruneKey] = useState<string | null>(null)
+  const [videoFocusStyle, setVideoFocusStyle] = useState<CSSProperties>({})
+  const [rerunning, setRerunning] = useState(false)
   const initialModeSet = useRef(false)
 
   useEffect(() => {
@@ -352,7 +490,11 @@ export function WatchPage() {
   const isDone = run?.status === 'done'
   const activePhase = phaseTabs[phasePick]
   const activeSrc =
-    mode === 'phase' ? activePhase?.src ?? null : finalVariants.find((v) => v.key === finalKey)?.src ?? finalVariants[0]?.src ?? null
+    mode === 'phase'
+      ? activePhase?.src ?? null
+      : mode === 'final'
+        ? finalVariants.find((v) => v.key === finalKey)?.src ?? finalVariants[0]?.src ?? null
+        : null
 
   const nativeFps = pruneLog?.native_fps && pruneLog.native_fps > 0 ? pruneLog.native_fps : 30
 
@@ -368,9 +510,11 @@ export function WatchPage() {
     (frame: number) => {
       const el = videoRef.current
       if (!el || !nativeFps) return
+      const wasPlaying = !el.paused
       const t = Math.max(0, frame / nativeFps)
       el.currentTime = t
-      void el.play().catch(() => {})
+      if (wasPlaying) void el.play().catch(() => {})
+      else el.pause()
     },
     [nativeFps],
   )
@@ -432,77 +576,59 @@ export function WatchPage() {
     if (!stillVisible) setSelectedPruneKey(null)
   }, [filteredPrune, selectedPruneKey])
 
-  const redrawPruneOverlay = useCallback(() => {
+  const updatePruneFocusZoom = useCallback(() => {
     const video = videoRef.current
-    const canvas = canvasRef.current
-    const wrap = videoWrapRef.current
-    const ctx = canvas?.getContext('2d')
-    if (!canvas || !ctx || !wrap) return
-
-    const dpr = window.devicePixelRatio || 1
-    const cw = Math.max(1, Math.floor(wrap.clientWidth))
-    const ch = Math.max(1, Math.floor(wrap.clientHeight))
-    canvas.width = Math.floor(cw * dpr)
-    canvas.height = Math.floor(ch * dpr)
-    canvas.style.width = `${cw}px`
-    canvas.style.height = `${ch}px`
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, cw, ch)
-
-    if (mode !== 'phase' || !highlightedPruneEntry || !video) return
-
+    if (!video || mode !== 'phase' || !highlightedPruneEntry) {
+      setVideoFocusStyle({})
+      return
+    }
     const frame = video.currentTime * nativeFps
-    if (!pruneEntryVisibleAtFrame(highlightedPruneEntry, frame)) return
-
-    const bbox = parseBboxXyxy(highlightedPruneEntry)
-    if (!bbox) return
-
-    const content = videoContainContentRect(video)
-    if (!content) return
-
-    const [x1, y1, x2, y2] = bbox
-    const px1 = content.left + x1 * content.scale
-    const py1 = content.top + y1 * content.scale
-    const px2 = content.left + x2 * content.scale
-    const py2 = content.top + y2 * content.scale
-
+    if (!pruneEntryVisibleAtFrame(highlightedPruneEntry, frame)) {
+      setVideoFocusStyle({})
+      return
+    }
+    const main = parseBboxXyxy(highlightedPruneEntry)
+    if (!main) {
+      setVideoFocusStyle({})
+      return
+    }
     const rule = pruneEntryRule(highlightedPruneEntry)
-    const { stroke, fill, label } = pruneOverlayStyle(rule)
-
-    const w = px2 - px1
-    const h = py2 - py1
-    if (w < 2 || h < 2) return
-
-    ctx.fillStyle = fill
-    ctx.fillRect(px1, py1, w, h)
-    ctx.strokeStyle = stroke
-    ctx.lineWidth = 3
-    ctx.strokeRect(px1, py1, w, h)
-
-    ctx.font = '600 13px system-ui, sans-serif'
-    const tid = highlightedPruneEntry.track_id != null ? ` id ${highlightedPruneEntry.track_id}` : ''
-    const cap = `${label}${tid}`
-    const pad = 6
-    const tw = Math.min(ctx.measureText(cap).width + pad * 2, cw - px1 - 4)
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.88)'
-    ctx.fillRect(px1, Math.max(0, py1 - 26), tw, 22)
-    ctx.fillStyle = '#f8fafc'
-    ctx.fillText(cap, px1 + pad, Math.max(14, py1 - 10))
+    const other = rule === 'deduplicate_collocated_poses' ? parseOtherBboxXyxy(highlightedPruneEntry) : null
+    let cx = (main[0] + main[2]) / 2
+    let cy = (main[1] + main[3]) / 2
+    if (other) {
+      cx = (cx + (other[0] + other[2]) / 2) / 2
+      cy = (cy + (other[1] + other[3]) / 2) / 2
+    }
+    const content = videoContainContentRect(video)
+    if (!content || video.clientWidth < 8 || video.clientHeight < 8) {
+      setVideoFocusStyle({})
+      return
+    }
+    const px = content.left + cx * content.scale
+    const py = content.top + cy * content.scale
+    const ox = (100 * px) / video.clientWidth
+    const oy = (100 * py) / video.clientHeight
+    setVideoFocusStyle({
+      transform: 'scale(1.14)',
+      transformOrigin: `${ox}% ${oy}%`,
+      transition: 'transform 0.35s ease-out',
+    })
   }, [mode, highlightedPruneEntry, nativeFps])
 
   useEffect(() => {
-    redrawPruneOverlay()
-  }, [redrawPruneOverlay, activeSrc, highlightedPruneEntry])
+    updatePruneFocusZoom()
+  }, [updatePruneFocusZoom, highlightedPruneEntry, activeSrc])
 
   useEffect(() => {
     const video = videoRef.current
     const wrap = videoWrapRef.current
     if (!video || !wrap) return
-    const onFrame = () => redrawPruneOverlay()
+    const onFrame = () => updatePruneFocusZoom()
     video.addEventListener('timeupdate', onFrame)
     video.addEventListener('loadedmetadata', onFrame)
     video.addEventListener('seeked', onFrame)
-    const ro = new ResizeObserver(() => redrawPruneOverlay())
+    const ro = new ResizeObserver(() => updatePruneFocusZoom())
     ro.observe(wrap)
     return () => {
       video.removeEventListener('timeupdate', onFrame)
@@ -510,7 +636,36 @@ export function WatchPage() {
       video.removeEventListener('seeked', onFrame)
       ro.disconnect()
     }
-  }, [redrawPruneOverlay, activeSrc])
+  }, [updatePruneFocusZoom, activeSrc])
+
+  const onRerun = useCallback(async () => {
+    if (!id) return
+    const live = run?.status === 'running' && run.subprocess_alive === true
+    if (live) {
+      window.alert('Wait for this run to finish or stop it from the Pipeline Lab before rerunning.')
+      return
+    }
+    setRerunning(true)
+    try {
+      const r = await fetch(`${API}/api/runs/${id}/rerun`, { method: 'POST' })
+      const text = await r.text()
+      if (!r.ok) {
+        let msg = `Rerun failed (HTTP ${r.status})`
+        try {
+          const j = JSON.parse(text) as { detail?: string }
+          if (typeof j.detail === 'string') msg = j.detail
+        } catch {
+          if (text.trim()) msg = text.slice(0, 280)
+        }
+        window.alert(msg)
+        return
+      }
+      const j = JSON.parse(text) as { run_id: string }
+      nav('/', { state: { appendSessionRunIds: [j.run_id] } })
+    } finally {
+      setRerunning(false)
+    }
+  }, [id, nav, run?.status, run?.subprocess_alive])
 
   const runSummary = useMemo(() => {
     if (!pruneLog) return null
@@ -552,7 +707,30 @@ export function WatchPage() {
             </div>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
+          {id && (
+            <button
+              type="button"
+              className="btn"
+              disabled={
+                rerunning ||
+                (run?.status === 'running' && run.subprocess_alive === true) ||
+                !run
+              }
+              title="Queue a new run with the same video and settings"
+              onClick={() => void onRerun()}
+            >
+              <RotateCw size={16} className={rerunning ? 'sway-spin' : undefined} aria-hidden />
+              {rerunning ? ' Queuing…' : ' Rerun'}
+            </button>
+          )}
+          <button
+            type="button"
+            className={`btn ${mode === 'metrics' ? 'primary' : ''}`}
+            onClick={() => setMode('metrics')}
+          >
+            <Gauge size={16} /> Metrics & Config
+          </button>
           <button
             type="button"
             className={`btn ${mode === 'phase' ? 'primary' : ''}`}
@@ -598,7 +776,8 @@ export function WatchPage() {
           </div>
           {activePhase && (
             <p style={{ margin: '0.6rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5, maxWidth: 720 }}>
-              {activePhase.blurb} Full-length clip, no title card. Prune details → right panel.
+              {activePhase.blurb} Full-length clip, no title card. Event list → right; pruned regions are drawn in the video itself
+              for pre-pose, collision, and post-pose stages (re-run with phase previews enabled if clips look old).
             </p>
           )}
         </div>
@@ -631,10 +810,25 @@ export function WatchPage() {
         </div>
       )}
 
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns,
+      {!err && run && mode === 'metrics' && (
+        <div className="glass-panel" style={{ padding: '1.25rem' }}>
+          <h2 style={{ fontSize: '1.1rem', margin: '0 0 1rem', color: '#fff' }}>Run Metrics & Config</h2>
+          
+          <div style={{ marginBottom: '2rem' }}>
+            <TrackQualitySummary summary={run.manifest?.run_context_final?.track_summary || {}} />
+          </div>
+          
+          <div>
+            <RunConfigDisplay fields={run.manifest?.run_context_final?.fields} />
+          </div>
+        </div>
+      )}
+
+      {mode !== 'metrics' && (
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns,
           gap: '0.75rem',
           alignItems: 'start',
         }}
@@ -645,7 +839,7 @@ export function WatchPage() {
             <>
               <div
                 ref={videoWrapRef}
-                style={{ position: 'relative', width: '100%', lineHeight: 0 }}
+                style={{ position: 'relative', width: '100%', lineHeight: 0, overflow: 'hidden' }}
               >
                 <video
                   ref={videoRef}
@@ -659,18 +853,7 @@ export function WatchPage() {
                     display: 'block',
                     margin: '0 auto',
                     objectFit: 'contain',
-                  }}
-                />
-                <canvas
-                  ref={canvasRef}
-                  aria-hidden
-                  style={{
-                    position: 'absolute',
-                    left: 0,
-                    top: 0,
-                    width: '100%',
-                    height: '100%',
-                    pointerEvents: 'none',
+                    ...videoFocusStyle,
                   }}
                 />
               </div>
@@ -691,7 +874,7 @@ export function WatchPage() {
                       alignItems: 'center',
                     }}
                   >
-                    <span style={{ fontWeight: 600, color: '#94a3b8' }}>Prune overlay</span>
+                    <span style={{ fontWeight: 600, color: '#94a3b8' }}>Phase preview</span>
                     {WATCH_OVERLAY_LEGEND.map((row) => (
                       <span key={row.label} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <span
@@ -706,6 +889,9 @@ export function WatchPage() {
                         {row.label}
                       </span>
                     ))}
+                    <span style={{ flex: '1 1 100%', fontSize: '0.68rem', opacity: 0.9 }}>
+                      Legend matches tags drawn in the MP4. Click an event to seek and mild zoom on that region.
+                    </span>
                   </div>
                 )}
             </>
@@ -866,6 +1052,7 @@ export function WatchPage() {
           </aside>
         )}
       </div>
+      )}
 
       <style>{`
         @media (max-width: 960px) {

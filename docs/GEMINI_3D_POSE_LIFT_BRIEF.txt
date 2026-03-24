@@ -1,0 +1,189 @@
+================================================================================
+SWAY / SWAY_POSE_MVP — HOW “3D” POSES ARE PRODUCED (FOR REFINEMENT)
+================================================================================
+
+This project does NOT generate textured mesh human models. It estimates 2D poses
+with ViTPose, then “lifts” each tracked person to a 17-joint 3D skeleton using
+MotionAGFormer (H36M-trained). Outputs are skeleton keypoints over time, plus
+JSON for a browser Three.js viewer.
+
+Primary implementation: sway/pose_lift_3d.py
+Orchestration: main.py (after temporal smoothing, before scoring export)
+
+
+--------------------------------------------------------------------------------
+1) INPUT: 2D POSES PER FRAME
+--------------------------------------------------------------------------------
+
+- Detector + tracker produce bounding boxes and track IDs per frame.
+- ViTPose estimates COCO-17 keypoints per person: (x, y) in image pixels and
+  usually a confidence/score in the third channel (shape [17, 3]).
+- Per-frame structure: all_frame_data[i] has frame_idx, poses[track_id] with
+  "keypoints" array.
+
+
+--------------------------------------------------------------------------------
+2) BUILD A DENSE SEQUENCE PER TRACK (FOR THE LIFT MODEL)
+--------------------------------------------------------------------------------
+
+Function: _build_keypoint_sequence_3ch(...)
+
+- For one track_id, collect keypoints only on frames where that track exists.
+- Require at least ~10 observed frames; else skip lifting for that track.
+- Build a dense array seq of shape (T, 17, 3) for T = total_frames:
+  - Channels: [pixel_x, pixel_y, confidence]
+  - Missing frames (default SWAY_LIFT_GAP_MODE=hold_zero): hold last known (x,y)
+    per joint and set confidence to 0.0 so the model sees gaps without linear
+    motion through the body. Legacy: SWAY_LIFT_GAP_MODE=linear_interp restores
+    the old np.interp behavior.
+
+This dense clip is what MotionAGFormer consumes as a temporal sequence.
+
+
+--------------------------------------------------------------------------------
+3) MOTIONAGFORMER INFERENCE
+--------------------------------------------------------------------------------
+
+Model: MotionAGFormer (TaatiTeam/MotionAGFormer), loaded from vendor clone or
+SWAY_MOTIONAGFORMER_ROOT. Weights: models/motionagformer-l-h36m.pth.tr (or .pth),
+overridable via SWAY_MOTIONAGFORMER_WEIGHTS.
+
+Preprocessing (_infer_full_sequence):
+- Input batch: (1, T, 17, 3) with x,y in pixels, z-channel = confidence.
+- Long sequences are processed in windows of up to 243 frames; shorter clips are
+  edge-padded to 243 (repeat last frame).
+- Normalize screen coordinates: _normalize_screen_coordinates maps x,y using
+  image width/height into a fixed range (see code; y uses aspect h/w).
+- Test-time flip augmentation: run model on original + left-right flipped 2D,
+  average the two outputs (mirrors MotionAGFormer demo practice).
+
+Postprocessing per frame (_postprocess_pose3d_frame):
+- Model output is treated as root-relative H36M-style 3D.
+- Nose joint (index 0) zeroed.
+- Rotate by a fixed H36M “demo” camera quaternion (_H36M_DEMO_QUAT).
+- Shift z so min z is 0, then scale so max coordinate magnitude is 1 (normalize
+  the pose into a canonical numeric range).
+
+Output: pred_3d with shape (T, 17, 3) float32 — we call this model-space 3D
+after the above normalization steps.
+
+
+--------------------------------------------------------------------------------
+4) OPTIONAL DEPTH REFINEMENT (AugLift-STYLE) + TEMPORAL DEPTH
+--------------------------------------------------------------------------------
+
+Depth Anything V2 (sway/depth_stage.py): get_depth_array per frame; optional
+collect_strided_depth_series(..., stride) samples every Nth frame (default N ≈
+output_fps ≈ 1s). SWAY_DEPTH_DYNAMIC=0 falls back to a single first-frame map.
+
+For each output frame t, depth maps at keyframes are linearly blended (per pixel,
+resized to video resolution), then _apply_auglift blends pred z with sampled
+depth (screen-normalized 2D → pixel via inverse of _normalize_screen_coordinates).
+
+- depth_z = (depth_val - 0.5) * 2; refined_z = (1 - blend) * pred_z + blend * depth_z.
+- Blend weight: SWAY_AUGLIFT_BLEND (default 0.3).
+
+This only adjusts the z component of pred_3d after inference.
+
+
+--------------------------------------------------------------------------------
+5) WHAT GETS STORED ON EACH POSE DICT
+--------------------------------------------------------------------------------
+
+After lift_poses_to_3d:
+
+- lift_xyz: copy of pred_3d[fidx] — (17, 3) postprocessed model space (unchanged;
+  used by scoring and angle helpers).
+
+- keypoints_3d (SWAY_UNIFIED_3D_EXPORT=1, default): 17×[X,Y,Z] in a single
+  right-handed world frame (Y up, Z depth along the pinhole “into scene” axis):
+  mid-hip pixel + temporally interpolated normalized depth → Z_root via
+  SWAY_DEPTH_Z_NEAR / SWAY_DEPTH_Z_FAR; pinhole un-project with fx,fy,cx,cy
+  (SWAY_PINHOLE_FOV_DEG ~70 or SWAY_FX/FY); pelvis translation + scaled
+  (lift_xyz relative to hip in lift space) for limbs. Optional SWAY_DEFAULT_ROOT_Z
+  when depth is missing. Not guaranteed metric without calibration.
+
+- keypoints_3d (SWAY_UNIFIED_3D_EXPORT=0): legacy [pixel_x, pixel_y, z_lift].
+
+- root_xyz: pelvis/world anchor per frame when unified export is on (also in
+  pose_3d JSON tracks when present).
+
+2D overlay video (*_3d.mp4) still draws from ViTPose "keypoints" (x,y); shading
+can use keypoints_3d[:,2] (legacy z or world Z depending on mode).
+
+
+--------------------------------------------------------------------------------
+6) JSON EXPORT FOR THE WEB VIEWER (pose_3d)
+--------------------------------------------------------------------------------
+
+Function: export_3d_for_viewer(..., frame_width, frame_height) → metadata.pose_3d
+
+- version: 2 when unified export on — includes "camera": width, height, fx, fy,
+  cx, cy, fov_deg, units, convention. version 1 for legacy export.
+- fps, total_frames, keypoint_names, bones
+- tracks: { "<id>": { "frames", "keypoints_3d", optional "root_xyz" } }
+
+If keypoints_3d is missing for a frame (lift skipped), export falls back to 2D
+keypoints with z=0.
+
+FastAPI: GET /api/runs/{run_id}/pose_3d returns this blob for pose_3d_viewer.html.
+
+
+--------------------------------------------------------------------------------
+7) BROWSER VIEWER (Three.js)
+--------------------------------------------------------------------------------
+
+File: pipeline_lab/web/public/pose_3d_viewer.html
+
+- If version >= 2 and camera is present: plot keypoints_3d as world XYZ
+  directly (no fake side-by-side x-offset for multiple dancers).
+- Legacy v1: old pixel-mix scaling + horizontal spread.
+
+
+--------------------------------------------------------------------------------
+8) TOGGLES / DEPENDENCIES
+--------------------------------------------------------------------------------
+
+- SWAY_3D_LIFT=0 or CLI --no-pose-3d-lift: skip lifting; no pose_3d blob (or
+  empty / fallback behavior depending on path).
+- SWAY_UNIFIED_3D_EXPORT: 1 (default) unified XYZ export; 0 legacy.
+- SWAY_DEPTH_DYNAMIC: 1 (default) strided depth series; 0 first-frame-only.
+- SWAY_DEPTH_STRIDE_FRAMES: override stride (default ≈ round(output_fps)).
+- SWAY_LIFT_GAP_MODE: hold_zero (default) | linear_interp
+- SWAY_PINHOLE_FOV_DEG, SWAY_FX, SWAY_FY, SWAY_DEPTH_Z_NEAR, SWAY_DEPTH_Z_FAR,
+  SWAY_DEFAULT_ROOT_Z, SWAY_LIFT_WORLD_SCALE, SWAY_AUGLIFT_BLEND
+- MotionAGFormer: repo on path, timm, checkpoint; SWAY_MOTIONAGFORMER_*.
+- PoseFormerV2: SWAY_LIFT_BACKEND=poseformerv2, vendor clone, SWAY_POSEFORMERV2_*.
+- Layer count (MAG) auto-detected from weights (16 vs 26) or SWAY_MOTIONAGFORMER_N_LAYERS.
+
+
+--------------------------------------------------------------------------------
+9) LIFTER BACKENDS (SWAY_LIFT_BACKEND) AND AMASS REALITY CHECK
+--------------------------------------------------------------------------------
+
+- motionagformer (default): MotionAGFormer repo, timm, COCO-17 + confidence.
+- poseformerv2: PoseFormerV2 repo, einops + torch-dct + timm; COCO→H36M 2D
+  (upstream demo), then COCO-ordered lift_xyz; 2D only. Weights e.g.
+  models/27_243_45.2.bin (python -m tools.prefetch_models --include-poseformerv2).
+
+Public MotionAGFormer / PoseFormerV2 / MixSTE checkpoints are overwhelmingly
+H36M or MPI-INF—not AMASS. Architecture swap alone does not inject dance mocap
+priors; AMASS/AIST++ needs custom training or a third-party checkpoint.
+
+
+--------------------------------------------------------------------------------
+10) REMAINING REFINEMENT TARGETS
+--------------------------------------------------------------------------------
+
+- _postprocess_pose3d_frame: fixed H36M demo quaternion + min-z + global scale
+  may discard absolute scale and real-world orientation.
+
+- Monocular depth is relative (per-frame min–max); Z_cam is a tunable bridge,
+  not true metric depth without scale calibration.
+
+- hold_zero + confidence: MotionAGFormer may not treat the third channel as a
+  strict attention mask; validate on occluded-limb clips.
+
+================================================================================
+END OF BRIEF
+================================================================================

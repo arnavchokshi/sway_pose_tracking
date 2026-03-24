@@ -4,7 +4,7 @@ Sweep driver: Run pipeline repeatedly with different parameter sets, validate ag
 
 Fully autonomous — no input required. Just run from sway_pose_mvp/:
 
-  python run_sweep.py
+  python -m tools.run_sweep
 
 Uses benchmarks/sweep_config.yaml and IMG_0256 ground truth by default.
 On each failure, appends param sets from suggested_next_params (--adaptive, default).
@@ -21,11 +21,14 @@ from pathlib import Path
 
 import yaml
 
-# Run from script directory so relative paths in config work
-SCRIPT_DIR = Path(__file__).resolve().parent
-os.chdir(SCRIPT_DIR)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from benchmark import (
+# Run from repo root so benchmarks/ and output/ paths in config work
+os.chdir(REPO_ROOT)
+
+from tools.benchmark import (
     load_ground_truth,
     compute_benchmark_metrics,
     run_checks,
@@ -34,6 +37,12 @@ from benchmark import (
 
 # Defaults for tunable params (from track_pruning, crossover) — used for effective_params log
 PARAM_DEFAULTS = {
+    "COLLISION_KPT_DIST_FRAC": 0.26,
+    "COLLISION_CENTER_DIST_FRAC": 0.5,
+    "DEDUP_ANTIPARTNER_MIN_IOU": 0.12,
+    "DEDUP_KPT_TIGHT_FRAC": 0.2,
+    "DEDUP_TORSO_MEDIAN_FRAC": 0.24,
+    "DEDUP_MIN_PAIR_OKS": 0.68,
     "min_duration_ratio": 0.20,
     "KINETIC_STD_FRAC": 0.05,
     "SYNC_SCORE_MIN": 0.10,

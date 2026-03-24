@@ -7,7 +7,7 @@ For **many** large flight clips, use **`data/videos_inbox/`** instead (see `data
 Then from `sway_pose_mvp/`:
 
 ```bash
-python batch_run_for_review.py --input-dir input --output-root output/review_batch --skip-existing
+python -m tools.batch_run_for_review --input-dir input --output-root output/review_batch --skip-existing
 ```
 
 Or process a single file:

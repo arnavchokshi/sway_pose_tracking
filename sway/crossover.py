@@ -31,6 +31,8 @@ from typing import Dict, List, Tuple, Any, Optional, Set
 
 import numpy as np
 
+from .track_pruning import prune_cause_config
+
 _log = logging.getLogger(__name__)
 
 # V3.8: Optional appearance cost for crossover (red vs blue during occlusion)
@@ -76,9 +78,18 @@ CVM_MAX_DISPLACEMENT_FRAC = 0.3
 CVM_OVERLAP_FREEZE_IOU = 0.85
 
 # V3.4: Keypoint collision dedup thresholds
-# V3.5: Relaxed from 0.2/0.3 to catch nearby phantoms (e.g. 67px apart at bbox_h=165px)
-COLLISION_KPT_DIST_FRAC = 0.35
+# V3.10: Tighter default median joint gate (was 0.35) to reduce partner false merges.
+COLLISION_KPT_DIST_FRAC = 0.26
 COLLISION_CENTER_DIST_FRAC = 0.5
+# If bbox IoU is below this and joints are not extremely tight, skip dedup (two separate people).
+DEDUP_ANTIPARTNER_MIN_IOU = 0.12
+# Median joint distance below this * bbox_h counts as "extremely tight" (antipartner bypass).
+DEDUP_KPT_TIGHT_FRAC = 0.20
+# Stricter median distance on shoulders+hips only (COCO 5,6,11,12) / bbox_h.
+DEDUP_TORSO_MEDIAN_FRAC = 0.24
+# Minimum symmetric OKS between the two poses (mean bbox area as scale); size-normalized.
+DEDUP_MIN_PAIR_OKS = 0.68
+DEDUP_TORSO_KPT_IDX = np.array([5, 6, 11, 12], dtype=np.int64)
 
 # Phase 5.5: Collision State (Locked Identity) — suspend ID decisions during overlap
 COLLISION_ENTRY_IOU = 0.6       # IoU > this for N consecutive frames → enter collision
@@ -339,6 +350,14 @@ def sanitize_pose_bbox_consistency(
             }
             if _box is not None:
                 _row["bbox_xyxy"] = [round(_box[0], 1), round(_box[1], 1), round(_box[2], 1), round(_box[3], 1)]
+            _row["cause_config"] = prune_cause_config(
+                "sanitize_pose_bbox_consistency",
+                (
+                    "Phase 7 bbox–pose sanitize: head (or tight) keypoints farther than "
+                    "KPT_BBOX_MAX_OFFSET_FRAC×bbox diagonal from box center → pose removed or limb conf zeroed."
+                ),
+                {"KPT_BBOX_MAX_OFFSET_FRAC": float(max_offset_frac)},
+            )
             phase6_log.append(_row)
         if tid in poses:
             del poses[tid]
@@ -372,6 +391,10 @@ def deduplicate_collocated_poses(
     frame_data: Dict[str, Any],
     kpt_dist_frac: float = COLLISION_KPT_DIST_FRAC,
     center_dist_frac: float = COLLISION_CENTER_DIST_FRAC,
+    dedup_antipartner_min_iou: float = DEDUP_ANTIPARTNER_MIN_IOU,
+    dedup_kpt_tight_frac: float = DEDUP_KPT_TIGHT_FRAC,
+    dedup_torso_median_frac: float = DEDUP_TORSO_MEDIAN_FRAC,
+    dedup_min_pair_oks: float = DEDUP_MIN_PAIR_OKS,
     protected_tids: Optional[Set[int]] = None,
     track_frame_count: Optional[Dict[int, int]] = None,
     phase6_log: Optional[list] = None,
@@ -380,6 +403,7 @@ def deduplicate_collocated_poses(
     V3.4: Remove duplicate pose overlays on the same physical person.
     Uses median keypoint distance (robust to hallucinated outlier keypoints) and
     requires bbox centers to also be close (protects legitimate partner work).
+    V3.10: Tighter default joint frac, antipartner IoU gate, torso median gate, min pairwise OKS.
     Suppresses the lower-confidence track. V3.7: protected_tids are never suppressed
     (e.g. late entrants — real people, not duplicates). Modifies frame_data in-place.
     """
@@ -391,6 +415,71 @@ def deduplicate_collocated_poses(
         return
 
     to_suppress = set()
+    suppress_meta: Dict[int, Dict[str, Any]] = {}
+
+    def _suppress_when_equal_global_counts(t_a: int, t_b: int) -> Tuple[int, str]:
+        """When two tracks appear on the same number of frames, keep the lower ID.
+
+        Duplicate / split boxes on one dancer often match the real track's frame count;
+        mean ViTPose conf can favor the ghost for a stretch. Suppressing the stable low ID
+        then losing the ghost in Phase 8 global prune leaves empty frames for that person.
+        """
+        return (t_a if t_a > t_b else t_b), "lower_track_id_tiebreak"
+
+    def _store_dedup_meta(
+        suppressed: int,
+        tid_a: int,
+        tid_b: int,
+        tie_break: str,
+        i: int,
+        j: int,
+    ) -> None:
+        kept = tid_b if suppressed == tid_a else tid_a
+        conf_sup = conf_a if suppressed == tid_a else conf_b
+        conf_kept = conf_b if suppressed == tid_a else conf_a
+        if suppressed == tid_a:
+            box_sup = boxes[i]
+            box_kept = boxes[j]
+        else:
+            box_sup = boxes[j]
+            box_kept = boxes[i]
+        suppress_meta[suppressed] = {
+            "kept_track_id": int(kept),
+            "other_bbox_xyxy": [
+                round(float(box_kept[0]), 1),
+                round(float(box_kept[1]), 1),
+                round(float(box_kept[2]), 1),
+                round(float(box_kept[3]), 1),
+            ],
+            "median_kpt_dist_px": round(float(median_dist), 2),
+            "median_dist_over_bbox_h": round(float(median_dist / bbox_h), 4),
+            "bbox_iou": round(float(iou), 4),
+            "mean_kpt_conf_suppressed": round(float(conf_sup), 4),
+            "mean_kpt_conf_kept": round(float(conf_kept), 4),
+            "tie_break": tie_break,
+            "torso_median_dist_px": round(float(torso_median_dist), 2),
+            "torso_median_over_bbox_h": round(float(torso_median_dist / bbox_h), 4),
+            "dedup_pair_oks": round(float(pair_oks), 4),
+            "cause_config": prune_cause_config(
+                "deduplicate_collocated_poses",
+                (
+                    "Phase 7 collocated dedup: median keypoint distance vs COLLISION_KPT_DIST_FRAC×h, "
+                    "torso median vs DEDUP_TORSO_MEDIAN_FRAC×h, pairwise OKS ≥ DEDUP_MIN_PAIR_OKS, "
+                    "antipartner IoU gate, bbox-center rule; depth containment >0.7 skips pair. "
+                    "tie_break selects kept ID."
+                ),
+                {
+                    "COLLISION_KPT_DIST_FRAC": float(kpt_dist_frac),
+                    "COLLISION_CENTER_DIST_FRAC": float(center_dist_frac),
+                    "DEDUP_ANTIPARTNER_MIN_IOU": float(dedup_antipartner_min_iou),
+                    "DEDUP_KPT_TIGHT_FRAC": float(dedup_kpt_tight_frac),
+                    "DEDUP_TORSO_MEDIAN_FRAC": float(dedup_torso_median_frac),
+                    "DEDUP_MIN_PAIR_OKS": float(dedup_min_pair_oks),
+                    "tie_break": tie_break,
+                },
+            ),
+        }
+
     for i, tid_a in enumerate(track_ids):
         if tid_a in to_suppress or tid_a not in poses:
             continue
@@ -421,11 +510,25 @@ def deduplicate_collocated_poses(
             if median_dist > kpt_dist_frac * bbox_h:
                 continue
 
+            # Antipartner: low box overlap + only moderately close joints → two people, not duplicate.
+            kpt_tight = median_dist < dedup_kpt_tight_frac * bbox_h
+            if iou < dedup_antipartner_min_iou and not kpt_tight:
+                continue
+
+            torso_median_dist = float(np.median(per_kpt_dist[DEDUP_TORSO_KPT_IDX]))
+            if torso_median_dist > dedup_torso_median_frac * bbox_h:
+                continue
+
+            area_a = max((box_a[2] - box_a[0]) * (box_a[3] - box_a[1]), 1.0)
+            area_b = max((box_b[2] - box_b[0]) * (box_b[3] - box_b[1]), 1.0)
+            pair_oks = _compute_oks(kpts_a, kpts_b, 0.5 * (area_a + area_b))
+            if pair_oks < dedup_min_pair_oks:
+                continue
+
             center_a = np.array([(boxes[i][0]+boxes[i][2])/2, (boxes[i][1]+boxes[i][3])/2])
             center_b = np.array([(boxes[j][0]+boxes[j][2])/2, (boxes[j][1]+boxes[j][3])/2])
             center_dist = float(np.linalg.norm(center_a - center_b))
             # When keypoints are very close, allow dedup even if bbox centers differ (tracker ID switch)
-            kpt_tight = median_dist < 0.2 * bbox_h
             if not kpt_tight and center_dist > center_dist_frac * bbox_h:
                 continue
 
@@ -459,8 +562,10 @@ def deduplicate_collocated_poses(
                 count_b = track_frame_count.get(tid_b, 0)
                 if count_a != count_b:
                     suppressed = tid_b if count_a >= count_b else tid_a
+                    _tb = "longer_track_history"
                 else:
-                    suppressed = tid_b if conf_a >= conf_b else tid_a
+                    suppressed, _tb = _suppress_when_equal_global_counts(tid_a, tid_b)
+                _store_dedup_meta(suppressed, tid_a, tid_b, _tb, i, j)
                 to_suppress.add(suppressed)
             else:
                 if track_frame_count:
@@ -468,11 +573,16 @@ def deduplicate_collocated_poses(
                     count_b = track_frame_count.get(tid_b, 0)
                     if count_a != count_b:
                         suppressed = tid_b if count_a >= count_b else tid_a
+                        _tb = "longer_track_history"
                     else:
-                        # Tie (including both 0): fall back to confidence
-                        suppressed = tid_b if conf_a >= conf_b else tid_a
+                        suppressed, _tb = _suppress_when_equal_global_counts(tid_a, tid_b)
                 else:
-                    suppressed = tid_b if conf_a >= conf_b else tid_a
+                    if abs(conf_a - conf_b) < 1e-5:
+                        suppressed, _tb = _suppress_when_equal_global_counts(tid_a, tid_b)
+                    else:
+                        suppressed = tid_b if conf_a >= conf_b else tid_a
+                        _tb = "higher_mean_kpt_conf"
+                _store_dedup_meta(suppressed, tid_a, tid_b, _tb, i, j)
                 to_suppress.add(suppressed)
 
     fj = int(frame_data.get("frame_idx", -1))
@@ -503,6 +613,7 @@ def deduplicate_collocated_poses(
             }
             if _box is not None:
                 _row["bbox_xyxy"] = [round(_box[0], 1), round(_box[1], 1), round(_box[2], 1), round(_box[3], 1)]
+            _row.update(suppress_meta.get(tid, {}))
             phase6_log.append(_row)
         if tid in poses:
             del poses[tid]

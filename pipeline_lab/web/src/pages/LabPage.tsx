@@ -7,15 +7,16 @@ import {
   type ComponentType,
   type CSSProperties,
 } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { API } from '../types'
 import type { Schema, RunInfo, ProgressLine } from '../types'
 import { safeJsonPreview } from '../lib/jsonPreview'
+import { isProbableVideoFile, VIDEO_ACCEPT_ATTR } from '../lib/videoFile'
 import { useLab } from '../context/LabContext'
 import { RunEditorModal } from '../components/RunEditorModal'
 import { RunConfigModal } from '../components/RunConfigModal'
+import { TrackQualitySummary } from '../components/RunMetrics'
 import {
-  Film,
   Play,
   Plus,
   Pencil,
@@ -32,6 +33,8 @@ import {
   Settings2,
   StopCircle,
   Unplug,
+  RotateCw,
+  Upload,
 } from 'lucide-react'
 function formatShortId(runId: string) {
   return runId.length > 12 ? `${runId.slice(0, 8)}…` : runId
@@ -138,74 +141,6 @@ function latestRunningRow(lines: ProgressLine[]) {
   return null
 }
 
-function TrackQualitySummary({ summary }: { summary: Record<string, unknown> }) {
-  const count = typeof summary.track_count === 'number' ? summary.track_count : null
-  const med = typeof summary.median_track_observations === 'number' ? summary.median_track_observations : null
-  const mean = typeof summary.mean_track_observations === 'number' ? summary.mean_track_observations : null
-  const jumps = typeof summary.internal_timeline_jumps === 'number' ? summary.internal_timeline_jumps : null
-  const note = typeof summary.note === 'string' ? summary.note : null
-  const cards: { label: string; value: string; hint: string }[] = [
-    {
-      label: 'Track count',
-      value: count != null ? String(count) : '—',
-      hint: 'Unique IDs after post-track stitch (before pruning).',
-    },
-    {
-      label: 'Median track length',
-      value: med != null ? `${med.toFixed(1)} obs` : '—',
-      hint: 'Frames with a detection per track (median).',
-    },
-    {
-      label: 'Mean track length',
-      value: mean != null ? `${mean.toFixed(1)} obs` : '—',
-      hint: 'Average observations per track.',
-    },
-    {
-      label: 'Timeline jumps (heuristic)',
-      value: jumps != null ? String(jumps) : '—',
-      hint: 'Large gaps inside a track — rough proxy for fragmentation (not MOT IDSW).',
-    },
-    {
-      label: 'IDF1 / HOTA',
-      value: '—',
-      hint: 'Require MOT ground truth. Use benchmark_trackeval.py or run_trackeval_boxmot_ablation.py.',
-    },
-    {
-      label: 'IDSW',
-      value: '—',
-      hint: 'Identity switches need GT. The jump count above is a no-GT heuristic only.',
-    },
-  ]
-  return (
-    <div style={{ marginTop: '0.5rem' }}>
-      <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '0.45rem' }}>
-        Tracking quality (no ground truth)
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '0.5rem' }}>
-        {cards.map((c) => (
-          <div
-            key={c.label}
-            style={{
-              padding: '0.55rem 0.65rem',
-              borderRadius: 10,
-              background: 'rgba(15, 23, 42, 0.65)',
-              border: '1px solid rgba(148, 163, 184, 0.25)',
-            }}
-            title={c.hint}
-          >
-            <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-              {c.label}
-            </div>
-            <div style={{ fontSize: '1rem', fontWeight: 700, color: '#f8fafc', marginTop: '0.2rem' }}>{c.value}</div>
-          </div>
-        ))}
-      </div>
-      {note && (
-        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.5rem', lineHeight: 1.45 }}>{note}</div>
-      )}
-    </div>
-  )
-}
 
 function RunPipelineDetail({
   runStatus,
@@ -224,7 +159,15 @@ function RunPipelineDetail({
   const timeline = useMemo(() => buildPhaseTimeline(progressLines), [progressLines])
   const live = latestRunningRow(progressLines)
   const ex = live?.extra as Record<string, unknown> | undefined
-  const pct = typeof ex?.pct === 'number' ? ex.pct : null
+  const pct = useMemo(() => {
+    if (typeof ex?.pct === 'number' && Number.isFinite(ex.pct)) return Math.round(ex.pct)
+    const f = ex?.frame
+    const tf = ex?.total_frames
+    if (typeof f === 'number' && typeof tf === 'number' && tf > 0 && Number.isFinite(f)) {
+      return Math.min(100, Math.max(0, Math.round((100 * f) / tf)))
+    }
+    return null
+  }, [ex])
   const lastDone = useMemo(() => {
     const done = progressLines.filter(isCompletedProgressRow)
     return done.length ? done[done.length - 1] : null
@@ -397,17 +340,34 @@ function RunPipelineDetail({
                 </div>
               )}
               <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginTop: '0.45rem', lineHeight: 1.45 }}>
-                {typeof ex?.frame === 'number' && typeof ex?.total_frames === 'number' && (
+                {(typeof ex?.frame === 'number' ||
+                  typeof ex?.yolo_passes === 'number' ||
+                  typeof ex?.pose_pass === 'number' ||
+                  typeof ex?.tracks === 'number') && (
                   <div>
-                    Frame {ex.frame} / {ex.total_frames}
+                    {typeof ex.frame === 'number' && (
+                      <>
+                        Frame {ex.frame}
+                        {typeof ex.total_frames === 'number' ? ` / ${ex.total_frames}` : ''}
+                      </>
+                    )}
+                    {typeof ex.yolo_passes === 'number' && ` · yolo passes ${ex.yolo_passes}`}
                     {typeof ex.pose_pass === 'number' && ` · pose passes ${ex.pose_pass}`}
                     {typeof ex.tracks === 'number' && ` · tracks ${ex.tracks}`}
                   </div>
                 )}
-                {typeof ex?.wall_s_in_phase === 'number' && <div>Time in this phase: {ex.wall_s_in_phase}s</div>}
-                {!ex?.frame && pct == null && (
-                  <div>Live heartbeat for this phase — open the console below for full main.py logs.</div>
+                {typeof ex?.step === 'string' && ex.step.trim() !== '' && (
+                  <div style={{ marginTop: '0.2rem' }}>Step: {ex.step}</div>
                 )}
+                {typeof ex?.wall_s_in_phase === 'number' && <div>Time in this phase: {ex.wall_s_in_phase}s</div>}
+                {typeof ex?.frame !== 'number' &&
+                  typeof ex?.yolo_passes !== 'number' &&
+                  typeof ex?.pose_pass !== 'number' &&
+                  pct == null &&
+                  !(typeof ex?.step === 'string' && ex.step.trim() !== '') &&
+                  typeof ex?.wall_s_in_phase !== 'number' && (
+                    <div>Live heartbeat for this phase — open the console below for full main.py logs.</div>
+                  )}
               </div>
             </>
           ) : (
@@ -458,6 +418,7 @@ function RunPipelineDetail({
 
 export function LabPage() {
   const nav = useNavigate()
+  const location = useLocation()
   const {
     videoFile,
     videoLabel,
@@ -470,24 +431,38 @@ export function LabPage() {
     sessionRunIds,
     setSessionRunIds,
     clearDrafts,
-    clearSession,
     labHydrated,
   } = useLab()
 
   const [schema, setSchema] = useState<Schema | null>(null)
   const [schemaError, setSchemaError] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [dragOver, setDragOver] = useState(false)
+
   const [batchError, setBatchError] = useState<string | null>(null)
   const [starting, setStarting] = useState(false)
   const [configRunId, setConfigRunId] = useState<string | null>(null)
-  const fileRef = useRef<HTMLInputElement>(null)
 
   const [runRows, setRunRows] = useState<RunInfo[]>([])
   const [progressByRun, setProgressByRun] = useState<Record<string, ProgressLine[]>>({})
   const [logByRun, setLogByRun] = useState<Record<string, string[]>>({})
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null)
+  const [rerunningRunId, setRerunningRunId] = useState<string | null>(null)
+  const dropDepthRef = useRef(0)
+  const [dropActive, setDropActive] = useState(false)
+
+  const applyVideoFile = useCallback(
+    (file?: File) => {
+      if (!file) return
+      if (!isProbableVideoFile(file)) {
+        window.alert('Please use a video file (MP4, MOV, WebM, MKV, AVI, or M4V).')
+        return
+      }
+      setVideo(file)
+    },
+    [setVideo],
+  )
+
   const editingDraft = useMemo(
     () => drafts.find((d) => d.clientId === editingId) ?? null,
     [drafts, editingId],
@@ -518,13 +493,34 @@ export function LabPage() {
     addDraft()
   }, [labHydrated, videoFile, schema, drafts.length, sessionRunIds.length, addDraft])
 
+  useEffect(() => {
+    const st = location.state as { appendSessionRunIds?: string[] } | null | undefined
+    const extra = st?.appendSessionRunIds
+    if (!extra?.length) return
+    setSessionRunIds((prev) => {
+      const seen = new Set(prev)
+      const out = [...prev]
+      for (const rid of extra) {
+        if (!seen.has(rid)) {
+          seen.add(rid)
+          out.push(rid)
+        }
+      }
+      return out
+    })
+    nav('.', { replace: true, state: {} })
+  }, [location.state, nav, setSessionRunIds])
+
   const refreshSessionRuns = useCallback(() => {
     if (sessionRunIds.length === 0) return
     Promise.all(
       sessionRunIds.map((id) =>
         Promise.all([
           fetch(`${API}/api/runs/${id}`)
-            .then((r) => (r.ok ? r.json() : null))
+            .then((r) => {
+              if (r.status === 404) return { __missing: true }
+              return r.ok ? r.json() : null
+            })
             .catch(() => null),
           fetch(`${API}/api/runs/${id}/progress`)
             .then((r) => (r.ok ? r.json() : []))
@@ -545,7 +541,14 @@ export function LabPage() {
       const rows: RunInfo[] = []
       const pm: Record<string, ProgressLine[]> = {}
       const lm: Record<string, string[]> = {}
+      const missingIds: string[] = []
+      
       for (const { id, row, prog, lines } of results) {
+        const rowData = row as Record<string, unknown> | null
+        if (rowData?.__missing) {
+          missingIds.push(id)
+          continue
+        }
         if (row) rows.push(row as RunInfo)
         pm[id] = prog
         lm[id] = lines
@@ -553,6 +556,10 @@ export function LabPage() {
       setRunRows(rows)
       setProgressByRun(pm)
       setLogByRun(lm)
+      
+      if (missingIds.length > 0) {
+        setSessionRunIds((prev) => prev.filter((id) => !missingIds.includes(id)))
+      }
     })
   }, [sessionRunIds])
 
@@ -594,6 +601,33 @@ export function LabPage() {
       }
     },
     [refreshSessionRuns],
+  )
+
+  const rerunSessionRun = useCallback(
+    async (runId: string) => {
+      setRerunningRunId(runId)
+      try {
+        const r = await fetch(`${API}/api/runs/${runId}/rerun`, { method: 'POST' })
+        const text = await r.text()
+        if (!r.ok) {
+          let msg = `Rerun failed (HTTP ${r.status})`
+          try {
+            const j = JSON.parse(text) as { detail?: unknown }
+            if (typeof j.detail === 'string') msg = j.detail
+          } catch {
+            if (text.trim()) msg = text.slice(0, 280)
+          }
+          window.alert(msg)
+          return
+        }
+        const j = JSON.parse(text) as { run_id: string }
+        setSessionRunIds((prev) => [...prev, j.run_id])
+        await refreshSessionRuns()
+      } finally {
+        setRerunningRunId(null)
+      }
+    },
+    [refreshSessionRuns, setSessionRunIds],
   )
 
   const deleteSessionRun = useCallback(
@@ -643,21 +677,7 @@ export function LabPage() {
     [runRows, setSessionRunIds],
   )
 
-  const onPickFile = (f: File | undefined) => {
-    if (!f) return
-    const okType = f.type.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v)$/i.test(f.name)
-    if (!okType) return
-    if (videoFile || drafts.length || sessionRunIds.length) {
-      if (
-        !window.confirm(
-          'Replace the current video? This clears drafts and the current batch in the UI.',
-        )
-      )
-        return
-    }
-    setVideo(f)
-    setBatchError(null)
-  }
+
 
   const startAll = () => {
     if (!videoFile || !schema || drafts.length === 0 || starting) return
@@ -790,92 +810,63 @@ export function LabPage() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-      <div className="glass-panel" style={{ padding: '1.5rem 2rem' }}>
-        <h1 style={{ fontSize: '2rem', margin: 0 }}>Pipeline lab</h1>
-        <p className="sub" style={{ marginBottom: 0 }}>
-          Choose one video, configure one or more runs on it, then start them together. When they finish, watch each
-          output or compare with a single playhead.
-        </p>
-      </div>
-
-      {/* Step 1: video */}
-      <div className="glass-panel" style={{ padding: '1.5rem' }}>
-        <h2 style={{ margin: '0 0 1rem', fontSize: '1.15rem', color: '#fff' }}>1. Video</h2>
-        {!videoFile ? (
-          <div
-            className={`hero-upload ${dragOver ? 'dragover' : ''}`}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
+      {/* Step 1: no video yet — empty Lab was rendering nothing here before */}
+      {!videoFile && (
+        <div className="glass-panel" style={{ padding: '1.5rem' }}>
+          <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>1. Add a source video</h2>
+          <p style={{ margin: '0.5rem 0 0', fontSize: '0.92rem', color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 640 }}>
+            One clip is shared across every run in a batch. Use the bar above or drop a file here, then configure runs and
+            start the pipeline.
+          </p>
+          <input
+            id="sway-lab-video-input"
+            type="file"
+            accept={VIDEO_ACCEPT_ATTR}
+            className="sr-only-file-input"
+            onChange={(e) => {
+              applyVideoFile(e.target.files?.[0])
+              e.target.value = ''
+            }}
+          />
+          <label
+            htmlFor="sway-lab-video-input"
+            className={`hero-upload ${dropActive ? 'dragover' : ''}`}
+            style={{ marginTop: '1.25rem', display: 'flex' }}
+            onDragEnter={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              dropDepthRef.current += 1
+              setDropActive(true)
+            }}
             onDragOver={(e) => {
               e.preventDefault()
-              setDragOver(true)
+              e.stopPropagation()
+              e.dataTransfer.dropEffect = 'copy'
             }}
-            onDragLeave={() => setDragOver(false)}
+            onDragLeave={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              dropDepthRef.current = Math.max(0, dropDepthRef.current - 1)
+              if (dropDepthRef.current === 0) setDropActive(false)
+            }}
             onDrop={(e) => {
               e.preventDefault()
-              setDragOver(false)
-              onPickFile(e.dataTransfer.files?.[0])
-            }}
-            onClick={() => fileRef.current?.click()}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                fileRef.current?.click()
-              }
+              e.stopPropagation()
+              dropDepthRef.current = 0
+              setDropActive(false)
+              applyVideoFile(e.dataTransfer.files?.[0])
             }}
           >
-            <div className="file-icon" aria-hidden>
-              <Film size={40} style={{ opacity: 0.9 }} />
-            </div>
-            <h2>Drop a video here</h2>
-            <p>or click to browse. All runs you add will use this file.</p>
-            <button type="button" className="btn primary" onClick={(e) => e.stopPropagation()}>
+            <Upload size={44} strokeWidth={1.25} style={{ color: 'var(--halo-cyan)', marginBottom: '0.35rem' }} aria-hidden />
+            <h2 style={{ fontSize: '1.35rem' }}>Drop a video here</h2>
+            <p>or click to browse — MP4, MOV, WebM, MKV, AVI, M4V</p>
+            <span className="btn primary" style={{ pointerEvents: 'none' }}>
               Choose file
-            </button>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v"
-              style={{ display: 'none' }}
-              onChange={(e) => onPickFile(e.target.files?.[0])}
-            />
-          </div>
-        ) : (
-          <div
-            style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '1rem',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-              <Film size={22} color="var(--halo-cyan)" />
-              <div>
-                <div style={{ fontWeight: 600, color: '#fff' }}>{videoLabel}</div>
-                <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Shared by every run in this batch</div>
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <button type="button" className="btn" onClick={() => fileRef.current?.click()}>
-                Change video
-              </button>
-              <input
-                ref={fileRef}
-                type="file"
-                accept="video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v"
-                style={{ display: 'none' }}
-                onChange={(e) => onPickFile(e.target.files?.[0])}
-              />
-              <button type="button" className="btn" onClick={() => clearSession()}>
-                Clear session
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
+            </span>
+          </label>
+        </div>
+      )}
 
       {/* Step 2: drafts */}
       {videoFile && sessionRunIds.length === 0 && (
@@ -940,7 +931,6 @@ export function LabPage() {
           </div>
         </div>
       )}
-
       {/* Step 3: active / completed batch */}
       {sessionRunIds.length > 0 && (
         <div className="glass-panel" style={{ padding: '1.5rem' }}>
@@ -1188,6 +1178,32 @@ export function LabPage() {
                     <button
                       type="button"
                       className="btn"
+                      disabled={
+                        subprocessLive || rerunningRunId === run.run_id || deletingRunId === run.run_id
+                      }
+                      title={
+                        subprocessLive
+                          ? 'Wait until this run finishes or stop it'
+                          : 'Queue a new run with the same video and settings (new run id)'
+                      }
+                      style={{
+                        padding: '0.4rem 0.65rem',
+                        fontSize: '0.76rem',
+                        color: '#7dd3fc',
+                        borderColor: 'rgba(125,211,252,0.35)',
+                      }}
+                      onClick={() => void rerunSessionRun(run.run_id)}
+                    >
+                      <RotateCw
+                        size={14}
+                        aria-hidden
+                        className={rerunningRunId === run.run_id ? 'sway-spin' : undefined}
+                      />{' '}
+                      {rerunningRunId === run.run_id ? 'Queuing…' : 'Rerun'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
                       disabled={subprocessLive || deletingRunId === run.run_id}
                       title={
                         subprocessLive
@@ -1206,15 +1222,22 @@ export function LabPage() {
                     </button>
                   </div>
 
-                  <RunPipelineDetail
-                    runStatus={run.status}
-                    subprocessAlive={run.subprocess_alive}
-                    progressLines={progressByRun[run.run_id] ?? []}
-                    logLines={logByRun[run.run_id] ?? []}
-                    trackSummary={
-                      (run.manifest?.run_context_final?.track_summary as Record<string, unknown> | undefined) ?? null
-                    }
-                  />
+                  <details style={{ marginTop: '0.5rem' }}>
+                    <summary style={{ cursor: 'pointer', color: 'var(--halo-cyan)', fontSize: '0.85rem', fontWeight: 600, padding: '0.25rem 0', outline: 'none' }}>
+                      Run details & process logs
+                    </summary>
+                    <div style={{ paddingTop: '0.75rem' }}>
+                      <RunPipelineDetail
+                        runStatus={run.status}
+                        subprocessAlive={run.subprocess_alive}
+                        progressLines={progressByRun[run.run_id] ?? []}
+                        logLines={logByRun[run.run_id] ?? []}
+                        trackSummary={
+                          (run.manifest?.run_context_final?.track_summary as Record<string, unknown> | undefined) ?? null
+                        }
+                      />
+                    </div>
+                  </details>
 
                   {run.error && (
                     <div style={{ fontSize: '0.85rem', color: '#f87171', lineHeight: 1.45 }}>{run.error}</div>

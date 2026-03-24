@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Side-by-side detection on one video: two Ultralytics YOLO models (default: yolo26l vs yolo11x).
+Side-by-side detection on one video: two Ultralytics YOLO models (default: yolo26l vs yolo26x).
 Same pattern as label_side_by_side_compare.py: letterboxed panels + corner labels, then hstack.
 """
 from __future__ import annotations
@@ -240,9 +240,9 @@ def main() -> None:
     ap.add_argument("video", type=Path, help="Input video path")
     ap.add_argument("-o", "--output", type=Path, required=True, help="Output .mp4 path")
     ap.add_argument("--left-model", default="yolo26l.pt", help="Ultralytics weights (left panel)")
-    ap.add_argument("--right-model", default="yolo11x.pt", help="Ultralytics weights (right panel)")
+    ap.add_argument("--right-model", default="yolo26x.pt", help="Ultralytics weights (right panel)")
     ap.add_argument("--left-title", default="YOLO26l", help="Left panel title")
-    ap.add_argument("--right-title", default="YOLO11x", help="Right panel title")
+    ap.add_argument("--right-title", default="YOLO26x", help="Right panel title")
     ap.add_argument("--conf", type=float, default=0.22, help="Detection confidence threshold")
     ap.add_argument("--imgsz", type=int, default=640, help="Inference size (short side)")
     ap.add_argument("--tw", type=int, default=1280, help="Panel width after letterbox")

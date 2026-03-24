@@ -50,9 +50,10 @@ warnings.filterwarnings("ignore", message=".*GetPrototype.*")
 import json
 import logging
 import os
-import sys
-import warnings
 import queue
+import sys
+import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,22 +67,39 @@ from sway.tracker import (
     run_tracking_before_post_stitch,
 )
 from sway.track_pruning import (
-    prune_tracks,
-    prune_geometric_mirrors,
-    prune_spatial_outliers,
-    prune_short_tracks,
-    prune_audience_region,
-    prune_late_entrant_short_span,
-    prune_bbox_size_outliers,
-    prune_bad_aspect_ratio,
-    prune_ultra_low_skeleton_tracks,
-    prune_by_stage_polygon,
+    ASPECT_RATIO_MAX,
+    AUDIENCE_REGION_WINDOW_FRAMES,
+    AUDIENCE_REGION_X_MIN_FRAC,
+    AUDIENCE_REGION_Y_MIN_FRAC,
+    BBOX_SIZE_MAX_FRAC,
+    BBOX_SIZE_MIN_FRAC,
     compute_confirmed_human_set,
     compute_phase7_voting_prune_set,
+    EDGE_ENTRANT_MARGIN_FRAC,
+    EDGE_MARGIN_FRAC,
+    EDGE_PRESENCE_FRAC,
+    KINETIC_STD_FRAC,
+    LATE_ENTRANT_MAX_SPAN_FRAC,
+    LATE_ENTRANT_START_FRAC,
+    log_pruned_tracks,
+    prune_audience_region,
+    prune_bad_aspect_ratio,
+    prune_bbox_size_outliers,
+    prune_by_stage_polygon,
+    prune_geometric_mirrors,
+    prune_late_entrant_short_span,
+    prune_short_tracks,
+    prune_spatial_outliers,
+    prune_tracks,
+    prune_ultra_low_skeleton_tracks,
+    prune_cause_config,
     PRUNING_WEIGHTS,
     PRUNE_THRESHOLD,
-    log_pruned_tracks,
     raw_tracks_to_per_frame,
+    SHORT_TRACK_MIN_FRAC,
+    SPATIAL_OUTLIER_STD_FACTOR,
+    ULTRA_LOW_SKELETON_FRAME_FRAC,
+    ULTRA_LOW_SKELETON_MEAN,
 )
 from sway.pose_estimator import PoseEstimator
 from sway.temporal_pose_refine import (
@@ -90,6 +108,12 @@ from sway.temporal_pose_refine import (
     want_temporal_pose_refine,
 )
 from sway.crossover import (
+    COLLISION_CENTER_DIST_FRAC,
+    COLLISION_KPT_DIST_FRAC,
+    DEDUP_ANTIPARTNER_MIN_IOU,
+    DEDUP_KPT_TIGHT_FRAC,
+    DEDUP_MIN_PAIR_OKS,
+    DEDUP_TORSO_MEDIAN_FRAC,
     apply_crossover_refinement,
     apply_acceleration_audit,
     apply_occlusion_reid,
@@ -100,6 +124,13 @@ from sway.crossover import (
 from sway.reid_embedder import extract_embeddings
 from sway.smoother import PoseSmoother
 from sway.scoring import process_all_frames_scoring_vectorized
+from sway.prune_preview_overlay import (
+    PRE_POSE_PREVIEW_RULES,
+    COLLISION_PREVIEW_RULES,
+    POST_POSE_PREVIEW_RULES,
+    build_prune_overlay_index,
+    wrap_draw_fn_with_prune_overlays,
+)
 from sway.visualizer import (
     build_dropped_pose_overlay,
     build_pruned_overlay_for_review,
@@ -211,7 +242,7 @@ def _lab_track_summary_heuristic(raw_tracks: Dict[int, List[Any]], ystride: int)
             "median_track_observations": 0.0,
             "mean_track_observations": 0.0,
             "internal_timeline_jumps": 0,
-            "note": "IDF1, IDSW, HOTA require MOT ground truth (see benchmark_trackeval.py).",
+            "note": "IDF1, IDSW, HOTA require MOT ground truth (see python -m tools.benchmark_trackeval).",
         }
     lens: List[int] = []
     jumps = 0
@@ -231,7 +262,7 @@ def _lab_track_summary_heuristic(raw_tracks: Dict[int, List[Any]], ystride: int)
         "median_track_observations": float(np.median(arr)) if arr.size else 0.0,
         "mean_track_observations": float(np.mean(arr)) if arr.size else 0.0,
         "internal_timeline_jumps": int(jumps),
-        "note": "IDF1, IDSW, HOTA require MOT ground truth (see benchmark_trackeval.py).",
+        "note": "IDF1, IDSW, HOTA require MOT ground truth (see python -m tools.benchmark_trackeval).",
     }
 
 
@@ -318,6 +349,78 @@ def _lab_register_preview(stage_key: str, rel_path: str) -> None:
     _LAB_CTX.setdefault("previews", []).append({"stage_key": stage_key, "relpath": rel_path})
 
 
+def _lab_make_tracking_progress_callback(video_path_str: str):
+    """Throttled Lab heartbeats during Phases 1–2 (YOLO + tracking)."""
+    import time as _time
+
+    if _LAB_CTX is None or not _LAB_CTX.get("progress_jsonl"):
+        return None
+    cap = cv2.VideoCapture(video_path_str)
+    total_guess = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    cap.release()
+    if total_guess < 1:
+        total_guess = 0
+    state: Dict[str, Any] = {"last_wall": 0.0, "last_pct": -1}
+    t_phase0 = _time.perf_counter()
+
+    def _cb(frame_idx: int, infer_n: int, tracks_n: int) -> None:
+        now = _time.time()
+        wall = now - t_phase0
+        ex: Dict[str, Any] = {
+            "yolo_passes": int(infer_n),
+            "tracks": int(tracks_n),
+            "wall_s_in_phase": round(wall, 1),
+            "frame": int(frame_idx + 1),
+        }
+        tf = total_guess
+        pct: Optional[int] = None
+        if tf > 0:
+            pct = min(100, max(0, int(100 * (frame_idx + 1) / tf)))
+            ex["total_frames"] = int(tf)
+            ex["pct"] = int(pct)
+        wall_dt = now - float(state["last_wall"])
+        last_pct = int(state["last_pct"])
+        pct_milestone = pct is not None and (pct >= last_pct + 5 or pct >= 99)
+        pass_milestone = infer_n == 1 or (infer_n % 25 == 0)
+        time_hb = wall_dt >= 20.0
+        if not (pct_milestone or pass_milestone or time_hb):
+            return
+        if pct is not None and pct_milestone:
+            state["last_pct"] = int(pct)
+        state["last_wall"] = now
+        _lab_progress(
+            1,
+            "phases_1_2",
+            "Phases 1–2: Detection & tracking",
+            status="running",
+            extra=ex,
+        )
+
+    return _cb
+
+
+def _lab_phase4_tick(t0: float, step: str, pct_approx: int, state: Dict[str, Any]) -> None:
+    if _LAB_CTX is None or not _LAB_CTX.get("progress_jsonl"):
+        return
+    import time as _time
+
+    now = _time.time()
+    if now - float(state.get("last_emit", 0)) < 6.0 and pct_approx < 95:
+        return
+    state["last_emit"] = now
+    _lab_progress(
+        3,
+        "pre_pose_prune",
+        "Phase 4: Pre-pose pruning",
+        status="running",
+        extra={
+            "step": step,
+            "pct": int(pct_approx),
+            "wall_s_in_phase": round(now - t0, 1),
+        },
+    )
+
+
 def _prune_events_extra(prune_log_entries: list, start_i: int, max_items: int = 400) -> Dict[str, Any]:
     """Slice of prune_log_entries for progress.jsonl (cap size for browser JSON)."""
     chunk = prune_log_entries[start_i:]
@@ -378,8 +481,14 @@ def _lab_write_manifest(
         "SWAY_TEMPORAL_POSE_REFINE",
         "SWAY_TEMPORAL_POSE_RADIUS",
         "SWAY_3D_LIFT",
+        "SWAY_LIFT_BACKEND",
         "SWAY_MOTIONAGFORMER_ROOT",
         "SWAY_MOTIONAGFORMER_WEIGHTS",
+        "SWAY_POSEFORMERV2_ROOT",
+        "SWAY_POSEFORMERV2_WEIGHTS",
+        "SWAY_POSEFORMERV2_NFRAMES",
+        "SWAY_POSEFORMERV2_FRAME_KEPT",
+        "SWAY_POSEFORMERV2_COEFF_KEPT",
     ]
     env_snap = {k: os.environ.get(k) for k in env_keys if os.environ.get(k)}
 
@@ -476,9 +585,12 @@ def main():
     parser.add_argument(
         "--pose-model",
         type=str,
-        choices=["base", "large", "huge"],
+        choices=["base", "large", "huge", "rtmpose"],
         default="base",
-        help="ViTPose+: default base for speed/VRAM; use large/huge for accuracy. Override with SWAY_VITPOSE_MODEL.",
+        help=(
+            "2D pose: ViTPose+ base/large/huge, or rtmpose (RTMPose-L via MMPose; optional install). "
+            "Override ViTPose checkpoint with SWAY_VITPOSE_MODEL."
+        ),
     )
     parser.add_argument(
         "--pose-stride",
@@ -596,8 +708,9 @@ def main():
     print("[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT + hybrid SAM when enabled)")
     print("  (Single pass over the video: detection and association per frame.)")
     t0 = time.time()
+    _track_lab_cb = _lab_make_tracking_progress_callback(str(video_path))
     raw_pre, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height, ystride = (
-        run_tracking_before_post_stitch(str(video_path))
+        run_tracking_before_post_stitch(str(video_path), lab_on_infer=_track_lab_cb)
     )
     dt_track = time.time() - t0
     print(f"  └─ Phases 1–2: {dt_track:.1f}s")
@@ -606,7 +719,34 @@ def main():
     # ── Phase 3: Post-track stitching ───────────────────────────────────
     print("\n[3/11] Phase 3 — Post-track stitching (dormant, fragment stitch, coalesce, merge)…")
     t0 = time.time()
-    raw_tracks = apply_post_track_stitching(raw_pre, total_frames, ystride=ystride)
+    ph3_stop = threading.Event()
+    if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+        _lab_progress(
+            2,
+            "phase3_post_stitch",
+            "Phase 3: Post-track stitching",
+            status="running",
+            extra={"wall_s_in_phase": 0.0, "step": "stitch_coalesce_merge"},
+        )
+
+        def _ph3_pulse() -> None:
+            while not ph3_stop.wait(timeout=10.0):
+                _lab_progress(
+                    2,
+                    "phase3_post_stitch",
+                    "Phase 3: Post-track stitching",
+                    status="running",
+                    extra={
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                        "step": "stitch_coalesce_merge",
+                    },
+                )
+
+        threading.Thread(target=_ph3_pulse, daemon=True).start()
+    try:
+        raw_tracks = apply_post_track_stitching(raw_pre, total_frames, ystride=ystride)
+    finally:
+        ph3_stop.set()
     dt_stitch = time.time() - t0
     print(f"  └─ {dt_stitch:.1f}s")
     log_resource_usage("3-post-track-stitch")
@@ -668,6 +808,8 @@ def main():
     # ── Phase 4: Pre-pose pruning (V3.4 enhanced) ─────────────────────────
     print("\n[4/11] Phase 4 — Pre-pose pruning (duration, kinetic, spatial, stage, mirrors, …)…")
     t0 = time.time()
+    _p4_lab_state: Dict[str, Any] = {"last_emit": 0.0}
+    _lab_phase4_tick(t0, "duration_kinetic_scan", 5, _p4_lab_state)
     _prune_kw = {}
     if "min_duration_ratio" in params:
         _prune_kw["min_duration_ratio"] = params["min_duration_ratio"]
@@ -675,12 +817,29 @@ def main():
         _prune_kw["kinetic_std_frac"] = params["KINETIC_STD_FRAC"]
     surviving_ids = prune_tracks(raw_tracks, total_frames, **_prune_kw)
     initial_count = len(raw_tracks)
+    _lab_phase4_tick(t0, "after_duration_kinetic", 18, _p4_lab_state)
 
     # Log tracks that failed duration+kinetic filter
     duration_kinetic_pruned = set(raw_tracks.keys()) - surviving_ids
     if duration_kinetic_pruned:
         print(f"  Pruned {len(duration_kinetic_pruned)} tracks (duration/kinetic filter)")
-        log_pruned_tracks(raw_tracks, duration_kinetic_pruned, "duration/kinetic", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _mdr = float(_prune_kw.get("min_duration_ratio", 0.20))
+        _ksf = float(_prune_kw.get("kinetic_std_frac", KINETIC_STD_FRAC))
+        log_pruned_tracks(
+            raw_tracks,
+            duration_kinetic_pruned,
+            "duration/kinetic",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "duration/kinetic",
+                "Phase 4: track failed duration (min fraction of possible lifespan + floor) "
+                "or normalized kinetic (bbox center std vs KINETIC_STD_FRAC×median dancer bbox height).",
+                {"min_duration_ratio": _mdr, "KINETIC_STD_FRAC": _ksf},
+            ),
+        )
 
     stage_polygon = _parse_stage_polygon_env()
     if stage_polygon is None and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "1") == "1":
@@ -698,6 +857,7 @@ def main():
                 print("  Auto stage polygon: skipped (depth unavailable or heuristic failed)")
     elif stage_polygon:
         print(f"  Stage polygon: {len(stage_polygon)} vertices (SWAY_STAGE_POLYGON)")
+    _lab_phase4_tick(t0, "stage_spatial_short_audience", 42, _p4_lab_state)
 
     stage_pruned_ids = prune_by_stage_polygon(
         raw_tracks, surviving_ids, frame_width, frame_height, polygon_normalized=stage_polygon
@@ -705,7 +865,29 @@ def main():
     surviving_ids = surviving_ids - stage_pruned_ids
     if stage_pruned_ids:
         print(f"  Pruned {len(stage_pruned_ids)} tracks outside stage polygon")
-        log_pruned_tracks(raw_tracks, stage_pruned_ids, "stage_polygon", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _poly_src = (
+            "SWAY_STAGE_POLYGON"
+            if os.environ.get("SWAY_STAGE_POLYGON")
+            else (
+                "auto_depth"
+                if stage_polygon and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "1") == "1"
+                else ("custom" if stage_polygon else "none")
+            )
+        )
+        log_pruned_tracks(
+            raw_tracks,
+            stage_pruned_ids,
+            "stage_polygon",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "stage_polygon",
+                "Phase 4: median bbox center lies outside the configured stage polygon (normalized coords).",
+                {"stage_polygon_source": _poly_src},
+            ),
+        )
 
     _spatial_kw = {}
     if "SPATIAL_OUTLIER_STD_FACTOR" in params:
@@ -716,7 +898,21 @@ def main():
     surviving_ids = surviving_ids - spatial_pruned_ids
     if spatial_pruned_ids:
         print(f"  Pruned {len(spatial_pruned_ids)} spatial outliers (far from group)")
-        log_pruned_tracks(raw_tracks, spatial_pruned_ids, "spatial_outlier", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _osf = float(_spatial_kw.get("outlier_std_factor", SPATIAL_OUTLIER_STD_FACTOR))
+        log_pruned_tracks(
+            raw_tracks,
+            spatial_pruned_ids,
+            "spatial_outlier",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "spatial_outlier",
+                "Phase 4: median position farther than SPATIAL_OUTLIER_STD_FACTOR×σ from group centroid (with spread floor).",
+                {"SPATIAL_OUTLIER_STD_FACTOR": _osf},
+            ),
+        )
 
     _short_kw = {}
     if "SHORT_TRACK_MIN_FRAC" in params:
@@ -729,7 +925,21 @@ def main():
     surviving_ids = surviving_ids - short_pruned_ids
     if short_pruned_ids:
         print(f"  Pruned {len(short_pruned_ids)} short tracks (<20% of video)")
-        log_pruned_tracks(raw_tracks, short_pruned_ids, "short_track", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _stf = float(_short_kw.get("min_frac", SHORT_TRACK_MIN_FRAC))
+        log_pruned_tracks(
+            raw_tracks,
+            short_pruned_ids,
+            "short_track",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "short_track",
+                "Phase 4: detection count below SHORT_TRACK_MIN_FRAC×video length (with edge-entrant exemption rules).",
+                {"SHORT_TRACK_MIN_FRAC": _stf, "EDGE_ENTRANT_MARGIN_FRAC": EDGE_ENTRANT_MARGIN_FRAC},
+            ),
+        )
 
     _audience_kw = {}
     if "AUDIENCE_REGION_X_MIN_FRAC" in params:
@@ -742,7 +952,28 @@ def main():
     surviving_ids = surviving_ids - audience_pruned_ids
     if audience_pruned_ids:
         print(f"  Pruned {len(audience_pruned_ids)} tracks in audience region (bottom-right)")
-        log_pruned_tracks(raw_tracks, audience_pruned_ids, "audience_region", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _ax = float(_audience_kw.get("x_min_frac", AUDIENCE_REGION_X_MIN_FRAC))
+        _ay = float(_audience_kw.get("y_min_frac", AUDIENCE_REGION_Y_MIN_FRAC))
+        log_pruned_tracks(
+            raw_tracks,
+            audience_pruned_ids,
+            "audience_region",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "audience_region",
+                "Phase 4: median position in early window falls in audience rectangle (x≥AUDIENCE_REGION_X_MIN_FRAC, y≥AUDIENCE_REGION_Y_MIN_FRAC).",
+                {
+                    "AUDIENCE_REGION_X_MIN_FRAC": _ax,
+                    "AUDIENCE_REGION_Y_MIN_FRAC": _ay,
+                    "AUDIENCE_REGION_WINDOW_FRAMES": int(
+                        _audience_kw.get("window_frames", AUDIENCE_REGION_WINDOW_FRAMES)
+                    ),
+                },
+            ),
+        )
 
     late_span_pruned_ids = prune_late_entrant_short_span(
         raw_tracks, surviving_ids, total_frames,
@@ -751,19 +982,62 @@ def main():
     surviving_ids = surviving_ids - late_span_pruned_ids
     if late_span_pruned_ids:
         print(f"  Pruned {len(late_span_pruned_ids)} late-entrant short-span tracks")
-        log_pruned_tracks(raw_tracks, late_span_pruned_ids, "late_entrant_short_span", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        log_pruned_tracks(
+            raw_tracks,
+            late_span_pruned_ids,
+            "late_entrant_short_span",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "late_entrant_short_span",
+                "Phase 4: first detection after LATE_ENTRANT_START_FRAC of video and span < LATE_ENTRANT_MAX_SPAN_FRAC×length (edge entrant exempt).",
+                {
+                    "LATE_ENTRANT_START_FRAC": LATE_ENTRANT_START_FRAC,
+                    "LATE_ENTRANT_MAX_SPAN_FRAC": LATE_ENTRANT_MAX_SPAN_FRAC,
+                    "EDGE_ENTRANT_MARGIN_FRAC": EDGE_ENTRANT_MARGIN_FRAC,
+                },
+            ),
+        )
 
     bbox_pruned_ids = prune_bbox_size_outliers(raw_tracks, surviving_ids, frame_height=frame_height)
     surviving_ids = surviving_ids - bbox_pruned_ids
     if bbox_pruned_ids:
         print(f"  Pruned {len(bbox_pruned_ids)} bbox size outliers")
-        log_pruned_tracks(raw_tracks, bbox_pruned_ids, "bbox_size", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        log_pruned_tracks(
+            raw_tracks,
+            bbox_pruned_ids,
+            "bbox_size",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "bbox_size",
+                "Phase 4: median bbox height outside BBOX_SIZE_MIN_FRAC–BBOX_SIZE_MAX_FRAC of group median (foreground relaxed max).",
+                {"BBOX_SIZE_MIN_FRAC": BBOX_SIZE_MIN_FRAC, "BBOX_SIZE_MAX_FRAC": BBOX_SIZE_MAX_FRAC},
+            ),
+        )
 
     aspect_pruned_ids = prune_bad_aspect_ratio(raw_tracks, surviving_ids)
     surviving_ids = surviving_ids - aspect_pruned_ids
     if aspect_pruned_ids:
         print(f"  Pruned {len(aspect_pruned_ids)} non-person aspect ratios (wider than tall)")
-        log_pruned_tracks(raw_tracks, aspect_pruned_ids, "aspect_ratio", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        log_pruned_tracks(
+            raw_tracks,
+            aspect_pruned_ids,
+            "aspect_ratio",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "aspect_ratio",
+                "Phase 4: median bbox width/height exceeds ASPECT_RATIO_MAX (non-person objects).",
+                {"ASPECT_RATIO_MAX": ASPECT_RATIO_MAX},
+            ),
+        )
 
     geometric_mirror_ids = prune_geometric_mirrors(
         raw_tracks, surviving_ids, frame_width, frame_height
@@ -771,8 +1045,24 @@ def main():
     surviving_ids = surviving_ids - geometric_mirror_ids
     if geometric_mirror_ids:
         print(f"  Pruned {len(geometric_mirror_ids)} geometric mirrors (edge + inverted velocity)")
-        log_pruned_tracks(raw_tracks, geometric_mirror_ids, "geometric_mirror", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
+        _gem = float(params.get("EDGE_MARGIN_FRAC", EDGE_MARGIN_FRAC))
+        _gep = float(params.get("EDGE_PRESENCE_FRAC", EDGE_PRESENCE_FRAC))
+        log_pruned_tracks(
+            raw_tracks,
+            geometric_mirror_ids,
+            "geometric_mirror",
+            frame_width,
+            frame_height,
+            prune_log_entries,
+            total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "geometric_mirror",
+                "Phase 4: edge-persistent track with inverted horizontal velocity (mirror reflection heuristic).",
+                {"EDGE_MARGIN_FRAC": _gem, "EDGE_PRESENCE_FRAC": _gep},
+            ),
+        )
 
+    _lab_phase4_tick(t0, "assemble_tracking_results", 88, _p4_lab_state)
     tracking_results = raw_tracks_to_per_frame(raw_tracks, total_frames, surviving_ids)
     print(f"  Kept {len(surviving_ids)} of {initial_count} tracks after pre-pose pruning")
     _lab_update_context(
@@ -796,15 +1086,25 @@ def main():
             for i, t in enumerate(tracking_results)
         ]
         p2 = clip_dir / "02_pre_pose_prune.mp4"
+        _ov_pre = build_prune_overlay_index(
+            prune_log_entries,
+            PRE_POSE_PREVIEW_RULES,
+            max(0, int(total_frames) - 1),
+            raw_tracks=raw_tracks,
+        )
+        _draw_pre = wrap_draw_fn_with_prune_overlays(
+            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            _ov_pre,
+        )
         montage_clips.append(render_phase_clip(
             video_path,
             pre_fd,
             "Phase 4: After pre-pose prune",
-            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            _draw_pre,
             native_fps,
             output_fps,
             p2,
-            caption="Surviving boxes after pre-pose pruning",
+            caption="Surviving boxes + pruned-track highlights (see legend in Lab)",
             full_length=True,
             show_title_card=False,
         ))
@@ -816,8 +1116,11 @@ def main():
         _lab_progress(3, "pre_pose_prune", "Phase 4: Pre-pose pruning", elapsed_s=dt_preprune, extra=_ex4)
 
     # ── Phase 5: Pose estimation with visibility scoring ──────────────────
+    use_rtmpose = args.pose_model == "rtmpose"
     env_pose = os.environ.get("SWAY_VITPOSE_MODEL", "").strip()
-    if env_pose:
+    if use_rtmpose:
+        model_id = "rtmpose-l (MMPose)"
+    elif env_pose:
         model_id = env_pose
     elif args.pose_model == "huge":
         model_id = "usyd-community/vitpose-plus-huge"
@@ -827,11 +1130,22 @@ def main():
         model_id = "usyd-community/vitpose-plus-base"
     _lab_update_context(vitpose_model_id=model_id, pose_stride=int(args.pose_stride))
     stride_note = f" stride={args.pose_stride}" if args.pose_stride > 1 else ""
-    print(f"\n[5/11] Phase 5 — Pose estimation (ViTPose-{args.pose_model.title()}{stride_note}, visibility-gated)…")
+    pose_label = "RTMPose-L" if use_rtmpose else f"ViTPose-{args.pose_model.title()}"
+    print(f"\n[5/11] Phase 5 — Pose estimation ({pose_label}{stride_note}, visibility-gated)…")
     t0 = time.time()
-    print(f"  Loading ViTPose ({model_id}) on {device}…", flush=True)
-    pose_estimator = PoseEstimator(device=device, model_name=model_id)
-    print(f"  ViTPose weights loaded in {time.time() - t0:.1f}s (first forward may add MPS/CUDA compile time)", flush=True)
+    if use_rtmpose:
+        from sway.rtmpose_estimator import RTMPoseEstimator
+
+        print(f"  Loading RTMPose (MMPose) on {device}…", flush=True)
+        pose_estimator = RTMPoseEstimator(device=device)
+    else:
+        print(f"  Loading ViTPose ({model_id}) on {device}…", flush=True)
+        pose_estimator = PoseEstimator(device=device, model_name=model_id)
+    backend = "RTMPose" if use_rtmpose else "ViTPose"
+    print(
+        f"  {backend} weights loaded in {time.time() - t0:.1f}s (first forward may add MPS/CUDA compile time)",
+        flush=True,
+    )
 
     raw_poses_by_frame = [{} for _ in range(total_frames)]
     embeddings_by_frame = [{} for _ in range(total_frames)]  # V3.8: Appearance for Re-ID
@@ -1002,7 +1316,7 @@ def main():
                     n_mask = sum(1 for x in (seg_arg or []) if x is not None)
                     if not phase5_logged_first_forward:
                         print(
-                            f"  [phase5] first ViTPose forward: {len(boxes_to_estimate)} people "
+                            f"  [phase5] first pose forward ({backend}): {len(boxes_to_estimate)} people "
                             f"({n_mask} mask-gated) — first batch often slow (graph compile on MPS/CUDA)…",
                             flush=True,
                         )
@@ -1114,15 +1428,44 @@ def main():
         _reid_kw["min_oks"] = params["REID_MIN_OKS"]
     _reid_kw["debug"] = bool(os.environ.get("SWAY_REID_DEBUG"))
     _reid_kw["total_frames"] = total_frames
-    apply_occlusion_reid(all_frame_data_pre, **_reid_kw)
-    apply_crossover_refinement(all_frame_data_pre, frame_width=frame_width, frame_height=frame_height)
-    apply_acceleration_audit(all_frame_data_pre)
+    assoc_stop = threading.Event()
+    if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+        _lab_progress(
+            5,
+            "association",
+            "Phase 6: Association",
+            status="running",
+            extra={"wall_s_in_phase": 0.0, "step": "occlusion_reid_crossover_accel"},
+        )
+
+        def _assoc_pulse() -> None:
+            while not assoc_stop.wait(timeout=12.0):
+                _lab_progress(
+                    5,
+                    "association",
+                    "Phase 6: Association",
+                    status="running",
+                    extra={
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                        "step": "occlusion_reid_crossover_accel",
+                    },
+                )
+
+        threading.Thread(target=_assoc_pulse, daemon=True).start()
+    try:
+        apply_occlusion_reid(all_frame_data_pre, **_reid_kw)
+        apply_crossover_refinement(all_frame_data_pre, frame_width=frame_width, frame_height=frame_height)
+        apply_acceleration_audit(all_frame_data_pre)
+    finally:
+        assoc_stop.set()
     dt_association = time.time() - t0
     print(f"  └─ Phase 6: {dt_association:.1f}s")
 
     # ── Phase 7: Collision cleanup (keypoint dedup + bbox sanitize) ──────
     print("\n[7/11] Phase 7 — Collision cleanup (keypoint dedup, bbox sanitize)…")
     t0 = time.time()
+    _ph7_n = len(all_frame_data_pre)
+    _ph7_stride = max(1, _ph7_n // 25) if _ph7_n > 0 else 1
     _ensure_collision_cleanup_logging()
     # V3.8: Removed late_entrant_candidates protection — ghosts (e.g. 61) were exempt from
     # post-pose prunes and dedup. Now all tracks subject to same prune/dedup rules.
@@ -1132,22 +1475,64 @@ def main():
     for fd in all_frame_data_pre:
         for tid in fd.get("track_ids", []):
             track_frame_count[tid] = track_frame_count.get(tid, 0) + 1
+    _dedup_kpt_frac = float(params.get("COLLISION_KPT_DIST_FRAC", COLLISION_KPT_DIST_FRAC))
+    _dedup_ctr_frac = float(params.get("COLLISION_CENTER_DIST_FRAC", COLLISION_CENTER_DIST_FRAC))
+    _dedup_ap_iou = float(params.get("DEDUP_ANTIPARTNER_MIN_IOU", DEDUP_ANTIPARTNER_MIN_IOU))
+    _dedup_kpt_tight = float(params.get("DEDUP_KPT_TIGHT_FRAC", DEDUP_KPT_TIGHT_FRAC))
+    _dedup_torso = float(params.get("DEDUP_TORSO_MEDIAN_FRAC", DEDUP_TORSO_MEDIAN_FRAC))
+    _dedup_pair_oks = float(params.get("DEDUP_MIN_PAIR_OKS", DEDUP_MIN_PAIR_OKS))
     dedup_count = 0
     sanitize_count = 0
     sanitize_keypoints_zeroed = 0
     phase6_log: list = []
     snap_pre_dedup = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
-    for fd in all_frame_data_pre:
+    for _pi, fd in enumerate(all_frame_data_pre):
+        if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+            if _pi % _ph7_stride == 0 or _pi == _ph7_n - 1:
+                _lab_progress(
+                    6,
+                    "collision_cleanup",
+                    "Phase 7: Collision cleanup",
+                    status="running",
+                    extra={
+                        "step": "deduplicate_collocated_poses",
+                        "frame": int(_pi + 1),
+                        "total_frames": int(_ph7_n),
+                        "pct": int(100 * (_pi + 1) / _ph7_n) if _ph7_n else 0,
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                    },
+                )
         before = len(fd["poses"])
         deduplicate_collocated_poses(
             fd,
+            kpt_dist_frac=_dedup_kpt_frac,
+            center_dist_frac=_dedup_ctr_frac,
+            dedup_antipartner_min_iou=_dedup_ap_iou,
+            dedup_kpt_tight_frac=_dedup_kpt_tight,
+            dedup_torso_median_frac=_dedup_torso,
+            dedup_min_pair_oks=_dedup_pair_oks,
             protected_tids=late_entrant_candidates,
             track_frame_count=track_frame_count,
             phase6_log=phase6_log,
         )
         dedup_count += before - len(fd["poses"])
     snap_post_dedup_pre_sanitize = [snapshot_tid_box_map(fd) for fd in all_frame_data_pre]
-    for fd in all_frame_data_pre:
+    for _si, fd in enumerate(all_frame_data_pre):
+        if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+            if _si % _ph7_stride == 0 or _si == _ph7_n - 1:
+                _lab_progress(
+                    6,
+                    "collision_cleanup",
+                    "Phase 7: Collision cleanup",
+                    status="running",
+                    extra={
+                        "step": "sanitize_pose_bbox",
+                        "frame": int(_si + 1),
+                        "total_frames": int(_ph7_n),
+                        "pct": int(100 * (_si + 1) / _ph7_n) if _ph7_n else 0,
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                    },
+                )
         n_pose, n_kpt = sanitize_pose_bbox_consistency(fd, phase6_log=phase6_log)
         sanitize_count += n_pose
         sanitize_keypoints_zeroed += n_kpt
@@ -1187,15 +1572,24 @@ def main():
 
     if clip_dir is not None:
         p4 = clip_dir / "04_phases_6_7.mp4"
+        _ov_ph67 = build_prune_overlay_index(
+            prune_log_entries,
+            COLLISION_PREVIEW_RULES,
+            max(0, int(total_frames) - 1),
+        )
+        _draw_ph67 = wrap_draw_fn_with_prune_overlays(
+            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            _ov_ph67,
+        )
         montage_clips.append(render_phase_clip(
             video_path,
             all_frame_data_pre,
             "Phases 6–7: Association & collision cleanup",
-            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            _draw_ph67,
             native_fps,
             output_fps,
             p4,
-            caption="After occlusion re-ID, crossover, dedup, and bbox sanitize",
+            caption="Poses + dedup/sanitize highlights burned in",
             full_length=True,
             show_title_card=False,
         ))
@@ -1263,6 +1657,8 @@ def main():
     )
     if tier_c_ids:
         print(f"  Pruned {len(tier_c_ids)} tracks (Tier C: no confident skeleton)")
+        _tcm = float(_tier_c_kw.get("mean_thresh", ULTRA_LOW_SKELETON_MEAN))
+        _tcl = float(_tier_c_kw.get("min_low_frac", ULTRA_LOW_SKELETON_FRAME_FRAC))
         log_pruned_tracks(
             raw_tracks,
             tier_c_ids,
@@ -1271,6 +1667,12 @@ def main():
             frame_height,
             prune_log_entries,
             total_frames=total_frames,
+            cause_config=prune_cause_config(
+                "tier_c_auto_reject",
+                "Phase 8 Tier C: mean keypoint confidence below TIER_C_SKELETON_MEAN and/or "
+                "fraction of low-confidence frames above TIER_C_LOW_FRAME_FRAC.",
+                {"TIER_C_SKELETON_MEAN": _tcm, "TIER_C_LOW_FRAME_FRAC": _tcl},
+            ),
         )
 
     surviving_after_tier_c = surviving_ids - tier_c_ids
@@ -1286,25 +1688,60 @@ def main():
     _mean_conf_min = float(params.get("MEAN_CONFIDENCE_MIN", 0.45))
     _jitter_max = float(params.get("JITTER_RATIO_MAX", 0.10))
 
-    voting_prune_ids, _tier_b_telemetry = compute_phase7_voting_prune_set(
-        all_frame_data_pre,
-        surviving_after_tier_c,
-        raw_tracks,
-        phase7_poses_by_frame,
-        frame_width,
-        frame_height,
-        total_frames,
-        confirmed_humans,
-        _p7_vote_weights,
-        _prune_threshold,
-        min_sync_score=_sync_min,
-        edge_margin_frac=_mirror_edge,
-        edge_presence_frac=_mirror_pres,
-        min_lower_body_conf=_mirror_lb,
-        min_mean_conf=_mean_conf_min,
-        max_jitter=_jitter_max,
-        phase7_prune_log=prune_log_entries,
-    )
+    ph8_stop = threading.Event()
+    if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+        _lab_progress(
+            7,
+            "post_pose_prune",
+            "Phase 8: Post-pose pruning",
+            status="running",
+            extra={"wall_s_in_phase": 0.0, "step": "tier_b_voting"},
+        )
+
+        def _ph8_pulse() -> None:
+            while not ph8_stop.wait(timeout=12.0):
+                _lab_progress(
+                    7,
+                    "post_pose_prune",
+                    "Phase 8: Post-pose pruning",
+                    status="running",
+                    extra={
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                        "step": "tier_b_voting",
+                    },
+                )
+
+        threading.Thread(target=_ph8_pulse, daemon=True).start()
+    try:
+        voting_prune_ids, _tier_b_telemetry = compute_phase7_voting_prune_set(
+            all_frame_data_pre,
+            surviving_after_tier_c,
+            raw_tracks,
+            phase7_poses_by_frame,
+            frame_width,
+            frame_height,
+            total_frames,
+            confirmed_humans,
+            _p7_vote_weights,
+            _prune_threshold,
+            min_sync_score=_sync_min,
+            edge_margin_frac=_mirror_edge,
+            edge_presence_frac=_mirror_pres,
+            min_lower_body_conf=_mirror_lb,
+            min_mean_conf=_mean_conf_min,
+            max_jitter=_jitter_max,
+            phase7_prune_log=prune_log_entries,
+            phase8_log_context={
+                "SYNC_SCORE_MIN": _sync_min,
+                "EDGE_MARGIN_FRAC": _mirror_edge,
+                "EDGE_PRESENCE_FRAC": _mirror_pres,
+                "min_lower_body_conf": _mirror_lb,
+                "MEAN_CONFIDENCE_MIN": _mean_conf_min,
+                "JITTER_RATIO_MAX": _jitter_max,
+            },
+        )
+    finally:
+        ph8_stop.set()
     if voting_prune_ids:
         print(
             f"  Pruned {len(voting_prune_ids)} tracks (Tier B voting, "
@@ -1350,11 +1787,23 @@ def main():
 
     if clip_dir is not None:
         p5 = clip_dir / "05_post_pose_prune.mp4"
+        _fd_by_fi = {int(fd["frame_idx"]): fd for fd in all_frame_data_pre}
+        _ov_post = build_prune_overlay_index(
+            prune_log_entries,
+            POST_POSE_PREVIEW_RULES,
+            max(0, int(total_frames) - 1),
+            raw_tracks=raw_tracks,
+            frame_data_by_idx=_fd_by_fi,
+        )
+        _draw_post = wrap_draw_fn_with_prune_overlays(
+            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            _ov_post,
+        )
         montage_clips.append(render_phase_clip(
             video_path, postprune_fd, "Phase 8: After post-pose prune",
-            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            _draw_post,
             native_fps, output_fps, p5,
-            caption="Surviving boxes after post-pose pruning",
+            caption="Surviving boxes + Tier B/C prune highlights burned in",
             full_length=True,
             show_title_card=False,
         ))
@@ -1372,8 +1821,24 @@ def main():
     sm_beta = float(params.get("SMOOTHER_BETA", 0.7))
     smoother = PoseSmoother(min_cutoff=sm_cut, beta=sm_beta)
     all_frame_data = []
+    _smooth_n = len(all_frame_data_pre)
+    _smooth_stride = max(1, _smooth_n // 30) if _smooth_n > 0 else 1
 
     for i, fd_pre in enumerate(all_frame_data_pre):
+        if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+            if i % _smooth_stride == 0 or i == _smooth_n - 1:
+                _lab_progress(
+                    8,
+                    "smooth",
+                    "Phase 9: Temporal smoothing",
+                    status="running",
+                    extra={
+                        "frame": int(i + 1),
+                        "total_frames": int(_smooth_n),
+                        "pct": int(100 * (i + 1) / _smooth_n) if _smooth_n else 0,
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                    },
+                )
         fidx = fd_pre["frame_idx"]
         boxes = fd_pre["boxes"]
         track_ids = fd_pre["track_ids"]
@@ -1442,21 +1907,57 @@ def main():
         "off",
     ) and not bool(getattr(args, "no_pose_3d_lift", False))
     pose_3d_blob: Optional[Dict[str, Any]] = None
+    lift_export_depth_series: Optional[list] = None
     if want_3d_lift:
         try:
-            from sway.depth_stage import get_depth_array
+            from sway.depth_stage import collect_strided_depth_series, get_depth_array
             from sway.pose_lift_3d import export_3d_for_viewer, lift_poses_to_3d
+            from sway.video_camera_probe import probe_intrinsics_from_video
 
-            depth_map_for_lift = None
-            for _, fr in iter_video_frames(str(video_path)):
-                depth_map_for_lift = get_depth_array(fr)
-                break
+            video_camera = probe_intrinsics_from_video(
+                str(video_path), int(frame_width), int(frame_height)
+            )
+            if video_camera:
+                feq = video_camera.get("focal_length_35mm_equiv_mm")
+                sk = video_camera.get("source_key", "")
+                print(
+                    f"  [3D Lift] Camera from video metadata ({sk}): "
+                    f"{feq:.1f}mm equiv → fx={video_camera['fx']:.1f}, fy={video_camera['fy']:.1f}",
+                    flush=True,
+                )
+
+            depth_dynamic = os.environ.get("SWAY_DEPTH_DYNAMIC", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            stride_s = os.environ.get("SWAY_DEPTH_STRIDE_FRAMES", "").strip()
+            depth_stride = int(stride_s) if stride_s else max(1, int(round(float(output_fps))))
+
+            depth_series = None
+            if depth_dynamic:
+                depth_series = collect_strided_depth_series(
+                    iter_video_frames(str(video_path)),
+                    depth_stride,
+                )
+            if not depth_series:
+                depth_series = []
+                for fi, fr in iter_video_frames(str(video_path)):
+                    d = get_depth_array(fr)
+                    if d is not None:
+                        depth_series.append((int(fi), d))
+                    break
+
+            lift_export_depth_series = depth_series if depth_series else None
+
             lift_poses_to_3d(
                 all_frame_data,
                 total_frames,
                 frame_width,
                 frame_height,
-                depth_map=depth_map_for_lift,
+                depth_series=lift_export_depth_series,
+                video_camera=video_camera,
             )
             tids_final = sorted(
                 surviving_after_prune,
@@ -1467,6 +1968,9 @@ def main():
                 tids_final,
                 len(all_frame_data),
                 float(output_fps),
+                frame_width,
+                frame_height,
+                video_camera=video_camera,
             )
         except Exception as ex:
             print(f"  [3D Lift] Skipped: {ex}", flush=True)
@@ -1474,7 +1978,34 @@ def main():
     # ── Phase 10: Spatio-temporal scoring (circmean, cDTW, per-joint) ───
     print("\n[10/11] Phase 10 — Spatio-temporal scoring…")
     t0 = time.time()
-    scoring_data = process_all_frames_scoring_vectorized(all_frame_data)
+    score_stop = threading.Event()
+    if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+        _lab_progress(
+            9,
+            "scoring",
+            "Phase 10: Scoring",
+            status="running",
+            extra={"wall_s_in_phase": 0.0, "step": "vectorized_scoring"},
+        )
+
+        def _score_pulse() -> None:
+            while not score_stop.wait(timeout=10.0):
+                _lab_progress(
+                    9,
+                    "scoring",
+                    "Phase 10: Scoring",
+                    status="running",
+                    extra={
+                        "wall_s_in_phase": round(time.time() - t0, 1),
+                        "step": "vectorized_scoring",
+                    },
+                )
+
+        threading.Thread(target=_score_pulse, daemon=True).start()
+    try:
+        scoring_data = process_all_frames_scoring_vectorized(all_frame_data)
+    finally:
+        score_stop.set()
     if scoring_data is not None:
         for i, fd in enumerate(all_frame_data):
             fd["track_angles"] = scoring_data["track_angles"][i]
@@ -1532,6 +2063,16 @@ def main():
         snap_post_dedup_pre_sanitize,
         all_frame_data_pre,
     )
+    _export_lab_cb = None
+    if _LAB_CTX is not None and _LAB_CTX.get("progress_jsonl"):
+        t_export0 = time.perf_counter()
+
+        def _export_lab(extra: Dict[str, Any]) -> None:
+            merged = dict(extra)
+            merged["wall_s_in_phase"] = round(time.perf_counter() - t_export0, 1)
+            _lab_progress(10, "export", "Export", status="running", extra=merged)
+
+        _export_lab_cb = _export_lab
     view_variants = render_and_export(
         video_path=video_path,
         all_frame_data=all_frame_data,
@@ -1542,6 +2083,8 @@ def main():
         prune_entries=prune_log_entries,
         dropped_pose_overlay=dropped_pose_overlay,
         pose_3d=pose_3d_blob,
+        lab_export_progress=_export_lab_cb,
+        lift_depth_series=lift_export_depth_series,
     )
     dt_export = time.time() - t0
     print(f"  └─ {dt_export:.1f}s")

@@ -4,7 +4,7 @@ Detection & Tracking Module — YOLO26l + BoxMOT Deep OC-SORT by default (V3.4)
 Hybrid SAM (default on): SWAY_HYBRID_SAM_OVERLAP=0 disables. When enabled, Ultralytics SAM2 runs on frames where
 person boxes overlap heavily, tightening xyxy before DeepOCSORT (see hybrid_sam_refiner.py).
 
-V3.0: Streaming 300-frame chunks, native FPS; default detector YOLO26l (Core ML yolo11* still used if present).
+V3.0: Streaming 300-frame chunks, native FPS; default detector YOLO26l (.pt under models/ or hub).
 V3.3: YOLO runs on every frame for better dancer detection.
 V3.4: Relative stitch radius (0.5x bbox height) + velocity-consistency check.
 YOLO26 weights: pre-track DIoU-NMS is skipped (Ultralytics NMS + classical IoU-NMS at 0.50 only).
@@ -15,7 +15,7 @@ handles dense overlaps when IoU > 0.6.
 
 import os
 from pathlib import Path
-from typing import Any, List, Dict, Tuple, Optional, Generator, Set
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -278,14 +278,8 @@ def _env_offline() -> bool:
     return False
 
 
-# Pipeline Lab enum / SWAY_YOLO_WEIGHTS token → Ultralytics hub id or local .pt basename
-# (yolo11* kept for legacy env strings; Lab UI only exposes YOLO26 + optional YOLO11 L/X fallback.)
+# Pipeline Lab enum / SWAY_YOLO_WEIGHTS token → Ultralytics hub id or local .pt basename (YOLO26 only).
 _SWAY_YOLO_WEIGHTS_ALIASES: Dict[str, str] = {
-    "yolov11n": "yolo11n.pt",
-    "yolov11s": "yolo11s.pt",
-    "yolov11m": "yolo11m.pt",
-    "yolov11l": "yolo11l.pt",
-    "yolov11x": "yolo11x.pt",
     "yolo26s": "yolo26s.pt",
     "yolo26l": "yolo26l.pt",
     "yolo26x": "yolo26x.pt",
@@ -300,12 +294,11 @@ def resolve_yolo_model_path() -> str:
     air-gapped after prefetch or manual copy.
 
     If SWAY_YOLO_WEIGHTS is a filesystem path to a .pt, that file wins. If it is a
-    Pipeline Lab enum token (e.g. yolo26l, yolov11x), it maps to a hub .pt name.
+    Pipeline Lab enum token (e.g. yolo26l, yolo26x), it maps to a hub .pt name.
 
     When SWAY_YOLO_WEIGHTS is unset:
-    1) On-disk .pt in models/, repo root, cwd (YOLO26 first, e.g. yolo26l.pt then yolo26l_dancetrack.pt, then YOLO11).
-    2) Core ML yolo11l/yolo11m .mlpackage if present (legacy Apple path).
-    3) Hub fallback yolo26l.pt.
+    1) On-disk YOLO26 .pt in models/, repo root, cwd (e.g. yolo26l.pt then yolo26l_dancetrack.pt, then s/x).
+    2) Hub fallback yolo26l.pt.
     """
     repo = Path(__file__).resolve().parent.parent
     models_dir = repo / "models"
@@ -334,15 +327,10 @@ def resolve_yolo_model_path() -> str:
     pt_priority = (
         "yolo26l.pt",
         "yolo26l_dancetrack.pt",
-        "yolo11x_dancetrack.pt",
         "yolo26m.pt",
         "yolo26x.pt",
+        "yolo26x_dancetrack.pt",
         "yolo26s.pt",
-        "yolo11l.pt",
-        "yolo11m.pt",
-        "yolo11x.pt",
-        "yolo11n.pt",
-        "yolo11x_dancetrack.pt",
     )
     for name in pt_priority:
         for base in bases:
@@ -350,24 +338,10 @@ def resolve_yolo_model_path() -> str:
             if p.is_file():
                 return str(p.resolve())
 
-    for base in (models_dir, repo):
-        for name in ("yolo11l.mlpackage", "yolo11m.mlpackage"):
-            p = base / name
-            if p.exists():
-                return str(p.resolve())
-    for c in (
-        cwd / "yolo11l.mlpackage",
-        cwd / "yolo11m.mlpackage",
-        models_dir / "yolo11l.mlpackage",
-        models_dir / "yolo11m.mlpackage",
-    ):
-        if c.exists():
-            return str(c.resolve())
-
     if _env_offline():
         raise FileNotFoundError(
             "Offline mode: no YOLO weights found. While online, run:\n"
-            "  python prefetch_models.py\n"
+            "  python -m tools.prefetch_models\n"
             "Or place yolo26l.pt in repo or models/, or set SWAY_YOLO_WEIGHTS."
         )
     return "yolo26l.pt"
@@ -966,7 +940,10 @@ def _iter_video_chunks(
         cap.release()
 
 
-def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
+def _run_tracking_boxmot_diou(
+    video_path: str,
+    lab_on_infer: Optional[Callable[[int, int, int], None]] = None,
+) -> Tuple[
     Dict[int, List[Any]],
     int,
     float,
@@ -1152,6 +1129,11 @@ def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
                     flush=True,
                 )
 
+            if lab_on_infer is not None and (
+                yolo_infer_count == 1 or yolo_infer_count % 25 == 0
+            ):
+                lab_on_infer(frame_idx, yolo_infer_count, valid_dancers_this_frame)
+
         max_dancers_last_chunk = max_dancers_this_chunk
         total_frames += len(chunk_frames)
         del chunk_frames
@@ -1174,6 +1156,7 @@ def _run_tracking_boxmot_diou(video_path: str) -> Tuple[
 
 def _run_tracking_botsort_pre_stitch(
     video_path: str,
+    lab_on_infer: Optional[Callable[[int, int, int], None]] = None,
 ) -> Tuple[
     Dict[int, List[Any]],
     int,
@@ -1203,6 +1186,7 @@ def _run_tracking_botsort_pre_stitch(
 
     max_dancers_last_chunk = 0
     current_detect_size = base_detect
+    yolo_infer_count = 0
 
     for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
         native_fps = nfps
@@ -1221,6 +1205,7 @@ def _run_tracking_botsort_pre_stitch(
         for frame_idx, frame in chunk_frames:
             if frame_idx % ystride != 0:
                 continue
+            yolo_infer_count += 1
             h_fr, w_fr = frame.shape[:2]
             frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
             frame_low_rgb = frame_low[:, :, ::-1]
@@ -1264,6 +1249,11 @@ def _run_tracking_botsort_pre_stitch(
                 n = len([t for t in track_ids if t >= 0])
                 print(f"  Frame {frame_idx}: {n} persons (YOLO resol: {current_detect_size})")
 
+            if lab_on_infer is not None and (
+                yolo_infer_count == 1 or yolo_infer_count % 25 == 0
+            ):
+                lab_on_infer(frame_idx, yolo_infer_count, valid_dancers_this_frame)
+
         max_dancers_last_chunk = max_dancers_this_chunk
         total_frames += len(chunk_frames)
         del chunk_frames
@@ -1283,6 +1273,7 @@ def _run_tracking_botsort_pre_stitch(
 
 def run_tracking_before_post_stitch(
     video_path: str,
+    lab_on_infer: Optional[Callable[[int, int, int], None]] = None,
 ) -> Tuple[
     Dict[int, List[Any]],
     int,
@@ -1295,8 +1286,8 @@ def run_tracking_before_post_stitch(
 ]:
     """Phases 1–2 only: streaming YOLO + tracker; caller runs apply_post_track_stitching for Phase 3."""
     if _use_boxmot():
-        return _run_tracking_boxmot_diou(video_path)
-    return _run_tracking_botsort_pre_stitch(video_path)
+        return _run_tracking_boxmot_diou(video_path, lab_on_infer=lab_on_infer)
+    return _run_tracking_botsort_pre_stitch(video_path, lab_on_infer=lab_on_infer)
 
 
 def run_tracking(

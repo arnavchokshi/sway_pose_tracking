@@ -15,12 +15,12 @@ Modes
 
 Examples
 --------
-  python run_trackeval_boxmot_ablation.py \\
+  python -m tools.run_trackeval_boxmot_ablation \\
     --videos ~/Desktop/IMG_0256.mov \\
     --out-dir output/trackeval_ablation \\
     --baseline-as-reference
 
-  python run_trackeval_boxmot_ablation.py \\
+  python -m tools.run_trackeval_boxmot_ablation \\
     --videos clip1.mov clip2.mov \\
     --out-dir output/te \\
     --gt-mot-dir benchmarks/mot_gt
@@ -36,7 +36,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _video_dims(video: Path) -> Tuple[int, int]:
@@ -196,7 +198,7 @@ def main() -> None:
 
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    cwd = SCRIPT_DIR
+    cwd = REPO_ROOT
 
     summary: Dict[str, Any] = {"clips": [], "note": None}
     if args.baseline_as_reference and not args.gt_mot_dir:
