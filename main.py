@@ -49,6 +49,7 @@ import sys
 import warnings
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -77,6 +78,11 @@ from sway.track_pruning import (
     raw_tracks_to_per_frame,
 )
 from sway.pose_estimator import PoseEstimator
+from sway.temporal_pose_refine import (
+    apply_temporal_keypoint_smoothing,
+    temporal_pose_radius,
+    want_temporal_pose_refine,
+)
 from sway.crossover import (
     apply_crossover_refinement,
     apply_acceleration_audit,
@@ -137,11 +143,171 @@ def _interpolate_pose_gaps(
         raw_poses_by_frame[idx] = interpolated
 
 
+def _parse_stage_polygon_env() -> Optional[List[Tuple[float, float]]]:
+    """Normalized [0,1] vertices from SWAY_STAGE_POLYGON JSON, e.g. [[0.1,0.2],[0.9,0.2],[0.9,0.95],[0.1,0.95]]."""
+    raw = os.environ.get("SWAY_STAGE_POLYGON", "").strip()
+    if not raw:
+        return None
+    try:
+        pts = json.loads(raw)
+        if not isinstance(pts, list) or len(pts) < 3:
+            print("  Warning: SWAY_STAGE_POLYGON must be a JSON array of at least 3 [x,y] pairs; ignoring.")
+            return None
+        return [(float(p[0]), float(p[1])) for p in pts]
+    except (json.JSONDecodeError, TypeError, ValueError, IndexError):
+        print("  Warning: SWAY_STAGE_POLYGON invalid JSON; ignoring.")
+        return None
+
+
 def get_device() -> torch.device:
     """Select compute device: MPS (Apple Silicon) if available, else CPU."""
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+_LAB_CTX: Optional[Dict[str, Any]] = None
+
+
+def _lab_init(
+    *,
+    progress_jsonl: Optional[str],
+    run_manifest_path: Optional[str],
+) -> None:
+    """Pipeline Lab: optional progress JSONL and run manifest targets."""
+    global _LAB_CTX
+    if not progress_jsonl and not run_manifest_path:
+        _LAB_CTX = None
+        return
+    from pathlib import Path as P
+    _LAB_CTX = {
+        "progress_jsonl": progress_jsonl,
+        "run_manifest_path": P(run_manifest_path) if run_manifest_path else None,
+        "previews": [],
+        "stage_log": [],
+    }
+
+
+def _lab_progress(
+    stage: int,
+    stage_key: str,
+    label: str,
+    *,
+    status: str = "done",
+    preview_relpath: Optional[str] = None,
+    elapsed_s: Optional[float] = None,
+) -> None:
+    if _LAB_CTX is None:
+        return
+    if not _LAB_CTX.get("progress_jsonl"):
+        return
+    import time
+    payload = {
+        "ts": time.time(),
+        "stage": stage,
+        "stage_key": stage_key,
+        "label": label,
+        "status": status,
+    }
+    if preview_relpath:
+        payload["preview_relpath"] = preview_relpath
+    if elapsed_s is not None:
+        payload["elapsed_s"] = round(elapsed_s, 3)
+    _LAB_CTX.setdefault("stage_log", []).append(payload)
+    with open(_LAB_CTX["progress_jsonl"], "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def _lab_register_preview(stage_key: str, rel_path: str) -> None:
+    if _LAB_CTX is None:
+        return
+    _LAB_CTX.setdefault("previews", []).append({"stage_key": stage_key, "relpath": rel_path})
+
+
+def _lab_write_manifest(
+    *,
+    video_path,
+    output_dir,
+    args,
+    params: dict,
+    model_id: str,
+    total_elapsed: float,
+    final_video_relpath: str,
+) -> None:
+    if _LAB_CTX is None or _LAB_CTX.get("run_manifest_path") is None:
+        return
+    import subprocess
+    from pathlib import Path as P
+
+    git_sha = None
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(P(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            git_sha = r.stdout.strip()
+    except Exception:
+        pass
+
+    env_keys = [
+        "SWAY_YOLO_WEIGHTS",
+        "SWAY_USE_BOXMOT",
+        "SWAY_VITPOSE_MODEL",
+        "SWAY_TRACKER_YAML",
+        "SWAY_GROUP_VIDEO",
+        "SWAY_CHUNK_SIZE",
+        "SWAY_DETECT_SIZE",
+        "SWAY_YOLO_CONF",
+        "SWAY_YOLO_DETECTION_STRIDE",
+        "SWAY_STAGE_POLYGON",
+        "SWAY_AUTO_STAGE_DEPTH",
+        "SWAY_TEMPORAL_POSE_REFINE",
+        "SWAY_TEMPORAL_POSE_RADIUS",
+    ]
+    env_snap = {k: os.environ.get(k) for k in env_keys if os.environ.get(k)}
+
+    manifest = {
+        "video_path": str(video_path),
+        "output_dir": str(output_dir),
+        "vitpose_model_id": model_id,
+        "cli": {
+            "pose_model": getattr(args, "pose_model", None),
+            "pose_stride": getattr(args, "pose_stride", None),
+            "temporal_pose_refine": want_temporal_pose_refine(getattr(args, "temporal_pose_refine", False)),
+            "temporal_pose_radius": temporal_pose_radius(getattr(args, "temporal_pose_radius", 2)),
+            "montage": getattr(args, "montage", None),
+            "save_phase_previews": getattr(args, "save_phase_previews", None),
+            "params_file": getattr(args, "params", None),
+        },
+        "params": params,
+        "env": env_snap,
+        "previews": list(_LAB_CTX.get("previews", [])),
+        "final_video_relpath": final_video_relpath,
+        "total_elapsed_s": round(total_elapsed, 3),
+        "git_commit": git_sha,
+    }
+    mp = _LAB_CTX["run_manifest_path"]
+    with open(mp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"  Run manifest: {mp}")
+
+
+def _apply_params_to_env(params: dict) -> None:
+    """Allow YAML to set SWAY_* and common offline env vars before tracking."""
+    extra_keys = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "YOLO_OFFLINE", "ULTRALYTICS_OFFLINE")
+    for k, v in params.items():
+        if v is None:
+            continue
+        if not (k.startswith("SWAY_") or k in extra_keys):
+            continue
+        if isinstance(v, bool):
+            os.environ[k] = "1" if v else "0"
+        else:
+            os.environ[k] = str(v)
 
 
 def log_resource_usage(phase_name: str = "") -> None:
@@ -206,6 +372,22 @@ def main():
         help="Run pose every Nth frame; interpolate others. 2 = ~2x faster.",
     )
     parser.add_argument(
+        "--temporal-pose-refine",
+        action="store_true",
+        default=False,
+        help=(
+            "After ViTPose: confidence-weighted (x,y) smoothing over ±N frames per track. "
+            "Lightweight jitter reduction — not the Poseidon video model. "
+            "Also: SWAY_TEMPORAL_POSE_REFINE=1."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-pose-radius",
+        type=int,
+        default=2,
+        help="Half-window in frames for --temporal-pose-refine (clamped 0–8). Env: SWAY_TEMPORAL_POSE_RADIUS.",
+    )
+    parser.add_argument(
         "--montage",
         action="store_true",
         default=False,
@@ -217,6 +399,24 @@ def main():
         default=None,
         help="Path to YAML file with parameter overrides (e.g. SYNC_SCORE_MIN: 0.12)",
     )
+    parser.add_argument(
+        "--save-phase-previews",
+        action="store_true",
+        default=False,
+        help="Write phase_previews/*.mp4 (Pipeline Lab).",
+    )
+    parser.add_argument(
+        "--progress-jsonl",
+        type=str,
+        default=None,
+        help="Append one JSON line per major pipeline stage.",
+    )
+    parser.add_argument(
+        "--run-manifest",
+        type=str,
+        default=None,
+        help="Write run_manifest.json to this path when the run completes.",
+    )
     args = parser.parse_args()
 
     params = {}
@@ -224,6 +424,8 @@ def main():
         import yaml
         with open(args.params) as f:
             params = yaml.safe_load(f) or {}
+
+    _apply_params_to_env(params)
 
     video_path = Path(args.video_path)
     if not video_path.exists():
@@ -234,10 +436,26 @@ def main():
     (Path("input")).mkdir(exist_ok=True)
     (Path("models")).mkdir(exist_ok=True)
 
-    montage_clips = []
-    montage_dir = output_dir / "_montage_clips"
-    if args.montage:
+    manifest_path = args.run_manifest
+    if manifest_path is None and (args.save_phase_previews or args.progress_jsonl):
+        manifest_path = str(output_dir / "run_manifest.json")
+    _lab_init(progress_jsonl=args.progress_jsonl, run_manifest_path=manifest_path)
+
+    phase_preview_dir = None
+    montage_dir = None
+    if args.save_phase_previews:
+        phase_preview_dir = output_dir / "phase_previews"
+        phase_preview_dir.mkdir(parents=True, exist_ok=True)
+    if args.montage and not args.save_phase_previews:
+        montage_dir = output_dir / "_montage_clips"
         montage_dir.mkdir(parents=True, exist_ok=True)
+    clip_dir = phase_preview_dir if phase_preview_dir is not None else montage_dir
+
+    montage_clips = []
+    montage_clip_frames = 0
+    montage_start = 0
+
+    vis_skip = float(params.get("POSE_VISIBILITY_THRESHOLD", 0.3))
 
     device = get_device()
     print(f"Using device: {device}")
@@ -251,24 +469,32 @@ def main():
     raw_tracks, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height = run_tracking(
         str(video_path)
     )
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_track = time.time() - t0
+    print(f"  └─ {dt_track:.1f}s")
     log_resource_usage("1-detection+tracking")
 
-    if args.montage:
+    if clip_dir is not None:
         montage_clip_frames = int(native_fps * 6)
         montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
         all_ids = set(raw_tracks.keys())
         all_tracking = raw_tracks_to_per_frame(raw_tracks, total_frames, all_ids)
         all_fd = [{"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"],
                     "poses": {}} for i, t in enumerate(all_tracking)]
+        p1 = clip_dir / "01_detection.mp4"
         montage_clips.append(render_phase_clip(
             video_path, all_fd, "Stage 1: Detection",
             lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
-            native_fps, output_fps, montage_dir / "01_detection.mp4",
+            native_fps, output_fps, p1,
             clip_duration=6.0,
             start_frame=montage_start,
             caption="All raw YOLO bounding boxes (noise and all)",
         ))
+        prv = f"phase_previews/{p1.name}" if args.save_phase_previews else None
+        _lab_progress(1, "detection", "Detection & tracking", elapsed_s=dt_track, preview_relpath=prv)
+        if prv:
+            _lab_register_preview("detection", prv)
+    else:
+        _lab_progress(1, "detection", "Detection & tracking", elapsed_s=dt_track)
 
     # Diagnostic log for debugging (prune_log.json)
     prune_log_entries = []
@@ -291,7 +517,26 @@ def main():
         print(f"  Pruned {len(duration_kinetic_pruned)} tracks (duration/kinetic filter)")
         log_pruned_tracks(raw_tracks, duration_kinetic_pruned, "duration/kinetic", frame_width, frame_height, prune_log_entries, total_frames=total_frames)
 
-    stage_pruned_ids = prune_by_stage_polygon(raw_tracks, surviving_ids, frame_width, frame_height)
+    stage_polygon = _parse_stage_polygon_env()
+    if stage_polygon is None and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "1") == "1":
+        from sway.depth_stage import estimate_stage_polygon
+
+        first_frame = None
+        for _, fr in iter_video_frames(str(video_path)):
+            first_frame = fr
+            break
+        if first_frame is not None:
+            stage_polygon = estimate_stage_polygon(first_frame)
+            if stage_polygon:
+                print(f"  Auto stage polygon: {len(stage_polygon)} vertices (Depth Anything V2)")
+            else:
+                print("  Auto stage polygon: skipped (depth unavailable or heuristic failed)")
+    elif stage_polygon:
+        print(f"  Stage polygon: {len(stage_polygon)} vertices (SWAY_STAGE_POLYGON)")
+
+    stage_pruned_ids = prune_by_stage_polygon(
+        raw_tracks, surviving_ids, frame_width, frame_height, polygon_normalized=stage_polygon
+    )
     surviving_ids = surviving_ids - stage_pruned_ids
     if stage_pruned_ids:
         print(f"  Pruned {len(stage_pruned_ids)} tracks outside stage polygon")
@@ -365,8 +610,37 @@ def main():
 
     tracking_results = raw_tracks_to_per_frame(raw_tracks, total_frames, surviving_ids)
     print(f"  Kept {len(surviving_ids)} of {initial_count} tracks after pre-pose pruning")
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_preprune = time.time() - t0
+    print(f"  └─ {dt_preprune:.1f}s")
     log_resource_usage("2-pruning")
+
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        pre_fd = [
+            {"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"], "poses": {}}
+            for i, t in enumerate(tracking_results)
+        ]
+        p2 = clip_dir / "02_pre_pose_prune.mp4"
+        montage_clips.append(render_phase_clip(
+            video_path,
+            pre_fd,
+            "Stage 2: After pre-pose prune",
+            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            native_fps,
+            output_fps,
+            p2,
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="Surviving boxes after pre-pose pruning",
+        ))
+        prv2 = f"phase_previews/{p2.name}" if args.save_phase_previews else None
+        _lab_progress(2, "pre_pose_prune", "Pre-pose pruning", elapsed_s=dt_preprune, preview_relpath=prv2)
+        if prv2:
+            _lab_register_preview("pre_pose_prune", prv2)
+    else:
+        _lab_progress(2, "pre_pose_prune", "Pre-pose pruning", elapsed_s=dt_preprune)
 
     # ── Phase 4: Pose estimation with visibility scoring ─────────────────
     env_pose = os.environ.get("SWAY_VITPOSE_MODEL", "").strip()
@@ -415,10 +689,19 @@ def main():
             tracking = (
                 tracking_results[frame_idx]
                 if frame_idx < len(tracking_results)
-                else {"boxes": [], "track_ids": [], "confs": []}
+                else {
+                    "boxes": [],
+                    "track_ids": [],
+                    "confs": [],
+                    "is_sam_refined": [],
+                    "segmentation_masks": [],
+                }
             )
             boxes = tracking["boxes"]
             track_ids = tracking["track_ids"]
+            seg_masks = tracking.get("segmentation_masks") or []
+            if len(seg_masks) < len(boxes):
+                seg_masks = list(seg_masks) + [None] * (len(boxes) - len(seg_masks))
             frames_stored[frame_idx] = (frame_idx, None, boxes, track_ids)
 
             # V3.8: Extract appearance embeddings for Re-ID (red vs blue during occlusion)
@@ -440,12 +723,14 @@ def main():
                 boxes_to_estimate = []
                 ids_to_estimate = []
                 paddings = []
+                masks_to_estimate: list = []
                 poses = {}
 
-                for tid, box in zip(track_ids, boxes):
+                for i, (tid, box) in enumerate(zip(track_ids, boxes)):
+                    m = seg_masks[i] if i < len(seg_masks) else None
                     # V3.4: Skip pose estimation for heavily occluded tracks
                     vis = vis_scores.get(tid, 1.0)
-                    if vis < 0.3:
+                    if vis < vis_skip:
                         # If tracker box jumped (ID switch), don't use last_good_pose — run pose
                         use_decayed = False
                         if tid in last_good_pose and tid in prev_boxes:
@@ -469,6 +754,7 @@ def main():
                             boxes_to_estimate.append(box)
                             ids_to_estimate.append(tid)
                             paddings.append(0.15)
+                            masks_to_estimate.append(m)
                         continue
 
                     x1, y1, x2, y2 = box
@@ -497,10 +783,18 @@ def main():
                     boxes_to_estimate.append(box)
                     ids_to_estimate.append(tid)
                     paddings.append(pad)
+                    masks_to_estimate.append(m)
 
                 if boxes_to_estimate:
                     frame_rgb = frame[:, :, ::-1]
-                    estimated = pose_estimator.estimate_poses(frame_rgb, boxes_to_estimate, ids_to_estimate, paddings)
+                    seg_arg = masks_to_estimate if any(x is not None for x in masks_to_estimate) else None
+                    estimated = pose_estimator.estimate_poses(
+                        frame_rgb,
+                        boxes_to_estimate,
+                        ids_to_estimate,
+                        paddings,
+                        segmentation_masks=seg_arg,
+                    )
                     for tid, est in estimated.items():
                         poses[tid] = est
                         last_good_pose[tid] = {
@@ -520,9 +814,17 @@ def main():
     if args.pose_stride > 1:
         _interpolate_pose_gaps(raw_poses_by_frame, frames_stored, args.pose_stride)
 
+    if want_temporal_pose_refine(args.temporal_pose_refine):
+        tr = temporal_pose_radius(args.temporal_pose_radius)
+        print(f"  Temporal keypoint refine (±{tr} frames, confidence-weighted; not Poseidon)…")
+        t_tr = time.time()
+        apply_temporal_keypoint_smoothing(raw_poses_by_frame, radius=tr)
+        print(f"  └─ {time.time() - t_tr:.2f}s")
+
     if occluded_skips:
-        print(f"  Skipped {occluded_skips} occluded track-frames (visibility < 0.3)")
-    print(f"  └─ {time.time() - t0:.1f}s")
+        print(f"  Skipped {occluded_skips} occluded track-frames (visibility < {vis_skip})")
+    dt_pose = time.time() - t0
+    print(f"  └─ {dt_pose:.1f}s")
     log_resource_usage("3-pose")
 
     # Build all_frame_data_pre for downstream phases
@@ -539,9 +841,34 @@ def main():
             "embeddings": emb,  # V3.8: Per-track appearance for crossover Re-ID
         })
 
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        p3 = clip_dir / "03_pose.mp4"
+        montage_clips.append(render_phase_clip(
+            video_path,
+            all_frame_data_pre,
+            "Stage 3: Pose estimation",
+            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            native_fps,
+            output_fps,
+            p3,
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="Boxes + skeleton (before re-ID / dedup)",
+        ))
+        prv3 = f"phase_previews/{p3.name}" if args.save_phase_previews else None
+        _lab_progress(3, "pose", "Pose estimation", elapsed_s=dt_pose, preview_relpath=prv3)
+        if prv3:
+            _lab_register_preview("pose", prv3)
+    else:
+        _lab_progress(3, "pose", "Pose estimation", elapsed_s=dt_pose)
+
     # ── Phase 5: Occlusion re-ID (before dedup so both fragments exist for IoU) ─
     print("\n[4/9] Occlusion re-ID + crossover refinement (hybrid CVM)...")
     t0 = time.time()
+    t_reid_block = t0
     _reid_kw = {}
     if "REID_MAX_FRAME_GAP" in params:
         _reid_kw["max_frame_gap"] = params["REID_MAX_FRAME_GAP"]
@@ -585,8 +912,33 @@ def main():
         print(f"  Sanitized {sanitize_count} poses with keypoints outside bbox")
     if phase6_log:
         prune_log_entries.extend(phase6_log)
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_reid_dedup = time.time() - t_reid_block
+    print(f"  └─ {dt_reid_dedup:.1f}s")
     log_resource_usage("5-crossover")
+
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        p4 = clip_dir / "04_reid_dedup.mp4"
+        montage_clips.append(render_phase_clip(
+            video_path,
+            all_frame_data_pre,
+            "Stage 4: After re-ID & dedup",
+            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            native_fps,
+            output_fps,
+            p4,
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="After occlusion re-ID, crossover, and dedup",
+        ))
+        prv4 = f"phase_previews/{p4.name}" if args.save_phase_previews else None
+        _lab_progress(4, "reid_dedup", "Re-ID & dedup", elapsed_s=dt_reid_dedup, preview_relpath=prv4)
+        if prv4:
+            _lab_register_preview("reid_dedup", prv4)
+    else:
+        _lab_progress(4, "reid_dedup", "Re-ID & dedup", elapsed_s=dt_reid_dedup)
 
     # ── Phase 7: Post-pose pruning (sync score + smart mirror + completeness) ─
     print("\n[6/9] Post-pose pruning (sync score + smart mirror + completeness)...")
@@ -724,30 +1076,43 @@ def main():
     for fd in all_frame_data_pre:
         surviving_after_prune.update(t for t in fd["track_ids"] if t not in phase7_prune_ids)
     print(f"  {len(surviving_after_prune)} tracks after post-pose pruning")
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_postprune = time.time() - t0
+    print(f"  └─ {dt_postprune:.1f}s")
     log_resource_usage("6-post-prune")
 
-    if args.montage:
-        postprune_fd = []
-        for fd_pre in all_frame_data_pre:
-            filt_poses = {tid: d for tid, d in fd_pre["poses"].items() if tid not in phase7_prune_ids}
-            filt_boxes = [b for b, tid in zip(fd_pre["boxes"], fd_pre["track_ids"]) if tid not in phase7_prune_ids and tid in filt_poses]
-            filt_tids = [tid for tid in fd_pre["track_ids"] if tid not in phase7_prune_ids and tid in filt_poses]
-            postprune_fd.append({"frame_idx": fd_pre["frame_idx"], "boxes": filt_boxes,
-                                  "track_ids": filt_tids, "poses": filt_poses})
+    postprune_fd = []
+    for fd_pre in all_frame_data_pre:
+        filt_poses = {tid: d for tid, d in fd_pre["poses"].items() if tid not in phase7_prune_ids}
+        filt_boxes = [b for b, tid in zip(fd_pre["boxes"], fd_pre["track_ids"]) if tid not in phase7_prune_ids and tid in filt_poses]
+        filt_tids = [tid for tid in fd_pre["track_ids"] if tid not in phase7_prune_ids and tid in filt_poses]
+        postprune_fd.append({"frame_idx": fd_pre["frame_idx"], "boxes": filt_boxes,
+                              "track_ids": filt_tids, "poses": filt_poses})
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        p5 = clip_dir / "05_post_pose_prune.mp4"
         montage_clips.append(render_phase_clip(
-            video_path, postprune_fd, "Stage 2: Pruning",
+            video_path, postprune_fd, "Stage 5: After post-pose prune",
             lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
-            native_fps, output_fps, montage_dir / "02_pruning.mp4",
+            native_fps, output_fps, p5,
             clip_duration=6.0,
             start_frame=montage_start,
-            caption="Only surviving dancer boxes after all pruning",
+            caption="Surviving boxes after post-pose pruning",
         ))
+        prv5 = f"phase_previews/{p5.name}" if args.save_phase_previews else None
+        _lab_progress(5, "post_pose_prune", "Post-pose pruning", elapsed_s=dt_postprune, preview_relpath=prv5)
+        if prv5:
+            _lab_register_preview("post_pose_prune", prv5)
+    else:
+        _lab_progress(5, "post_pose_prune", "Post-pose pruning", elapsed_s=dt_postprune)
 
     # ── Phase 8: Temporal smoothing (1 Euro, conf<0.3 guard) ─────────────
     print("\n[7/9] Temporal smoothing (1 Euro filter)...")
     t0 = time.time()
-    smoother = PoseSmoother(min_cutoff=1.0, beta=0.7)
+    sm_cut = float(params.get("SMOOTHER_MIN_CUTOFF", 1.0))
+    sm_beta = float(params.get("SMOOTHER_BETA", 0.7))
+    smoother = PoseSmoother(min_cutoff=sm_cut, beta=sm_beta)
     all_frame_data = []
 
     for i, fd_pre in enumerate(all_frame_data_pre):
@@ -775,8 +1140,33 @@ def main():
             "deviations": {},
         })
 
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_smooth = time.time() - t0
+    print(f"  └─ {dt_smooth:.1f}s")
     log_resource_usage("7-smoothing")
+
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        p6 = clip_dir / "06_smooth.mp4"
+        montage_clips.append(render_phase_clip(
+            video_path,
+            all_frame_data,
+            "Stage 6: Smoothed poses",
+            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
+            native_fps,
+            output_fps,
+            p6,
+            clip_duration=6.0,
+            start_frame=montage_start,
+            caption="After temporal smoothing",
+        ))
+        prv6 = f"phase_previews/{p6.name}" if args.save_phase_previews else None
+        _lab_progress(6, "smooth", "Temporal smoothing", elapsed_s=dt_smooth, preview_relpath=prv6)
+        if prv6:
+            _lab_register_preview("smooth", prv6)
+    else:
+        _lab_progress(6, "smooth", "Temporal smoothing", elapsed_s=dt_smooth)
 
     # ── Phase 9: Spatio-temporal scoring (circmean, cDTW, per-joint) ─────
     print("\n[8/9] Spatio-temporal scoring...")
@@ -790,18 +1180,41 @@ def main():
             fd["shape_errors"] = scoring_data.get("shape_errors", [{} for _ in all_frame_data])[i]
             fd["timing_errors"] = scoring_data.get("timing_errors", [{} for _ in all_frame_data])[i]
 
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_score = time.time() - t0
+    print(f"  └─ {dt_score:.1f}s")
     log_resource_usage("8-scoring")
 
-    if args.montage:
+    if clip_dir is not None:
+        if montage_clip_frames <= 0:
+            montage_clip_frames = int(native_fps * 6)
+            montage_start = max(0, total_frames // 2 - (montage_clip_frames * 4) // 2)
+        p7 = clip_dir / "07_scoring.mp4"
         montage_clips.append(render_phase_clip(
-            video_path, all_frame_data, "Stage 3: Pose Estimation",
-            lambda f, d: draw_frame_with_boxes(f, d["boxes"], d["track_ids"], d["poses"]),
-            native_fps, output_fps, montage_dir / "03_pose.mp4",
+            video_path,
+            all_frame_data,
+            "Stage 7: Scoring",
+            lambda f, d: draw_frame(
+                f,
+                d["boxes"],
+                d["track_ids"],
+                d["poses"],
+                deviations=d.get("deviations"),
+                shape_errors=d.get("shape_errors"),
+                timing_errors=d.get("timing_errors"),
+            ),
+            native_fps,
+            output_fps,
+            p7,
             clip_duration=6.0,
-            start_frame=montage_start + montage_clip_frames * 2,
-            caption="Boxes + skeleton overlays on dancers",
+            start_frame=montage_start,
+            caption="Heatmap skeletons (scored)",
         ))
+        prv7 = f"phase_previews/{p7.name}" if args.save_phase_previews else None
+        _lab_progress(7, "scoring", "Scoring", elapsed_s=dt_score, preview_relpath=prv7)
+        if prv7:
+            _lab_register_preview("scoring", prv7)
+    else:
+        _lab_progress(7, "scoring", "Scoring", elapsed_s=dt_score)
 
     # ── Phase 10: Export & visualization ──────────────────────────────────
     print("\n[9/9] Rendering and exporting...")
@@ -827,23 +1240,17 @@ def main():
         prune_entries=prune_log_entries,
         dropped_pose_overlay=dropped_pose_overlay,
     )
-    print(f"  └─ {time.time() - t0:.1f}s")
+    dt_export = time.time() - t0
+    print(f"  └─ {dt_export:.1f}s")
     log_resource_usage("9-export")
 
-    if args.montage:
-        montage_clips.append(render_phase_clip(
-            video_path, all_frame_data, "Stage 4: Scoring",
-            lambda f, d: draw_frame(f, d["boxes"], d["track_ids"], d["poses"],
-                                     deviations=d.get("deviations"),
-                                     shape_errors=d.get("shape_errors"),
-                                     timing_errors=d.get("timing_errors")),
-            native_fps, output_fps, montage_dir / "04_scoring.mp4",
-            clip_duration=6.0,
-            start_frame=montage_start + montage_clip_frames * 3,
-            caption="Colored heatmap skeletons (final output)",
-        ))
+    final_video_relpath = f"{video_path.stem}_poses.mp4"
+    _lab_progress(8, "export", "Export", elapsed_s=dt_export, preview_relpath=final_video_relpath)
+
+    if args.montage and montage_clips:
         print("\n  Stitching montage...")
         stitch_montage(montage_clips, output_dir / "montage.mp4", native_fps)
+    if montage_dir is not None:
         import shutil as _shutil
         _shutil.rmtree(montage_dir, ignore_errors=True)
 
@@ -851,6 +1258,16 @@ def main():
     print(f"\nDone. Outputs in {output_dir}")
     print(f"Total pipeline: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
     log_resource_usage("final")
+
+    _lab_write_manifest(
+        video_path=video_path,
+        output_dir=output_dir,
+        args=args,
+        params=params,
+        model_id=model_id,
+        total_elapsed=total_elapsed,
+        final_video_relpath=final_video_relpath,
+    )
 
     # Write prune diagnostic log for debugging
     prune_log_path = output_dir / "prune_log.json"
