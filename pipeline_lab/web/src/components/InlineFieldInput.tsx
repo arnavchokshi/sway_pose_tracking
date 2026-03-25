@@ -17,16 +17,18 @@ const POSE_CARD_META: Record<string, { accent: string; badge: string; hint: stri
   'ViTPose-Large': { accent: '#fbbf24', badge: 'Heavy', hint: 'Sharper poses' },
   'ViTPose-Huge': { accent: '#f97316', badge: 'Max', hint: 'Best, slowest' },
   'RTMPose-L': { accent: '#22d3ee', badge: 'MMPose', hint: 'Fast (optional install)' },
+  'Sapiens (ViTPose-Base fallback)': {
+    accent: '#c084fc',
+    badge: 'Sapiens slot',
+    hint: 'ViTPose-Base until native Sapiens is wired',
+  },
 }
 
 const BOOL_STATUS: Record<string, { on: string; off: string }> = {
-  sway_group_video: { on: 'Crowd detail on', off: 'Solo / speed' },
-  sway_hybrid_sam_overlap: { on: 'Overlap fix on', off: 'Skip (faster)' },
-  sway_hybrid_sam_roi_crop: { on: 'SAM on overlap crop', off: 'SAM full frame' },
-  sway_global_link: { on: 'Long-range merge on', off: 'Skip' },
-  sway_boxmot_reid_on: { on: 'Outfit matching on', off: 'Motion only' },
-  sway_reid_debug: { on: 'Verbose logs', off: 'Quiet' },
-  sway_3d_lift: { on: '3D + viewer data', off: '2D only' },
+  sway_hybrid_sam_weak_cues: { on: 'Stable-overlap gate on', off: 'IoU only' },
+  sway_bidirectional_track_pass: { on: 'Forward + reverse pass', off: 'Forward only' },
+  sway_gnn_track_refine: { on: 'GNN hook on (stub)', off: 'Off' },
+  sway_hmr_mesh_sidecar: { on: 'hmr_mesh_sidecar.json', off: 'Off' },
   montage: { on: 'Montage clip', off: 'No montage' },
   save_phase_previews: { on: 'Phase clips saved', off: 'Skip previews' },
   temporal_pose_refine: { on: 'Neighbor blend on', off: 'Raw only' },
@@ -39,26 +41,34 @@ function choiceDisplayLabel(fieldId: string, raw: string): string {
       if (raw === '2') return 'Every other frame'
       break
     case 'tracker_technology':
-      if (raw === 'BoxMOT') return 'Built-in'
-      if (raw === 'BoT-SORT') return 'Alternate'
-      if (raw === 'ByteTrack') return 'ByteTrack (soon)'
-      if (raw === 'OC-SORT') return 'OC-SORT (soon)'
-      if (raw === 'StrongSORT') return 'StrongSORT (soon)'
+      if (raw === 'deep_ocsort') return 'Default (motion only)'
+      if (raw === 'deep_ocsort_osnet') return 'Deep OC-SORT + OSNet'
+      if (raw === 'BoxMOT') return 'Default (motion only)'
+      if (raw === 'StrongSORT') return 'Deep OC-SORT + OSNet'
+      if (raw === 'BoT-SORT' || raw === 'ByteTrack' || raw === 'OC-SORT') return 'Default (motion only)'
       break
     case 'sway_global_aflink_mode':
       if (raw === 'neural_if_available') return 'Smart linker'
       if (raw === 'force_heuristic') return 'Simple rules'
+      break
+    case 'sway_box_interp_mode':
+      if (raw === 'linear') return 'Linear'
+      if (raw === 'gsi') return 'GSI (smooth)'
+      break
+    case 'sway_pose_gap_interp_mode':
+      if (raw === 'linear') return 'Linear'
+      if (raw === 'gsi') return 'GSI (smooth)'
+      break
+    case 'sway_vis_temporal_interp_mode':
+      if (raw === 'linear') return 'Linear'
+      if (raw === 'gsi') return 'GSI (smooth)'
       break
     case 'pose_model':
       if (raw === 'ViTPose-Base') return 'Base — fastest'
       if (raw === 'ViTPose-Large') return 'Large — sharper'
       if (raw === 'ViTPose-Huge') return 'Huge — heaviest'
       if (raw === 'RTMPose-L') return 'RTMPose — speed test'
-      break
-    case 'sway_boxmot_assoc_metric':
-      if (raw === 'IoU') return 'Overlap (IoU)'
-      if (raw === 'GIoU') return 'Shape-aware (GIoU)'
-      if (raw === 'DIoU') return 'Center-aware (DIoU)'
+      if (raw === 'Sapiens (ViTPose-Base fallback)') return 'Sapiens slot — ViT base'
       break
     case 'sway_boxmot_reid_model':
       if (raw === 'osnet_x0_25') return 'Lighter'
@@ -78,9 +88,6 @@ function choiceDisplayLabel(fieldId: string, raw: string): string {
 
 function sliderStep(f: SchemaField): number {
   if (f.type === 'int') {
-    if (f.id === 'sway_chunk_size') return 10
-    if (f.id === 'reid_max_frame_gap') return 5
-    if (f.id === 'sway_detect_size') return 32
     return 1
   }
   const span = (f.max ?? 1) - (f.min ?? 0)

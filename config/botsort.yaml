@@ -2,7 +2,7 @@
 # Previously `ocsort.yaml` shadowed this file; only this path is loaded now.
 #
 # with_reid: Ultralytics built-in Re-ID is OFF here — dance/costume ambiguity; BoxMOT Deep OC-SORT
-# Used when SWAY_USE_BOXMOT=0 (Ultralytics BoT-SORT). Default pipeline uses BoxMOT + OSNet Re-ID.
+# Used when SWAY_USE_BOXMOT=0 (Ultralytics BoT-SORT). Lab defaults use BoxMOT Deep OC-SORT (optional OSNet via env).
 #
 # track_buffer MUST be >= crossover.REID_MAX_FRAME_GAP (90).
 

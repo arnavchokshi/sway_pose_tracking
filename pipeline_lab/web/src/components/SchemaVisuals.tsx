@@ -54,8 +54,7 @@ export function SchemaFieldVisual({ fieldId, value }: { fieldId: string; value?:
         </SvgBox>
       )
     }
-    case 'sway_boxmot_max_age':
-    case 'reid_max_frame_gap': {
+    case 'sway_boxmot_max_age': {
       const frames = num;
       const width = Math.min(140, Math.max(20, frames * 1.5));
       return (
@@ -156,7 +155,6 @@ export function SchemaFieldVisual({ fieldId, value }: { fieldId: string; value?:
         </SvgBox>
       )
     }
-    case 'reid_min_oks':
     case 'dedup_min_pair_oks': {
       const circleDist = 40 * (1.0 - num);
       return (
@@ -164,41 +162,6 @@ export function SchemaFieldVisual({ fieldId, value }: { fieldId: string; value?:
           <circle cx={120 - circleDist} cy="40" r="15" fill="none" stroke="var(--halo-cyan)" strokeWidth="2" />
           <circle cx={120 + circleDist} cy="40" r="15" fill="none" stroke="#f87171" strokeWidth="2" />
           <text x="120" y="70" fill="var(--text-muted)" fontSize="9" textAnchor="middle">OKS Similarity &gt; {Math.round(num * 100)}% triggers merge</text>
-        </SvgBox>
-      )
-    }
-    case 'collision_kpt_dist_frac': {
-      const radius = num * 80;
-      return (
-        <SvgBox>
-          <circle cx="120" cy="40" r="4" fill="var(--halo-cyan)" />
-          <circle cx="120" cy="40" r={radius} fill="rgba(248,113,113,0.1)" stroke="#f87171" strokeWidth="1.5" strokeDasharray="3 3" />
-          <line x1="120" y1="40" x2={120 + radius} y2="40" stroke="#f87171" strokeWidth="1" />
-          <text x="120" y="75" fill="var(--text-muted)" fontSize="9" textAnchor="middle">Joint proximity strictness: {Math.round(num * 100)}%</text>
-        </SvgBox>
-      )
-    }
-    case 'collision_center_dist_frac': {
-      const radius = num * 40; 
-      return (
-        <SvgBox>
-          <rect x="110" y="20" width="20" height="40" fill="none" stroke="var(--halo-cyan)" strokeWidth="2" />
-          <circle cx="120" cy="40" r={radius} fill="none" stroke="#f87171" strokeWidth="1.5" strokeDasharray="3 3" />
-          <text x="120" y="75" fill="var(--text-muted)" fontSize="9" textAnchor="middle">BBox center strictness: {Math.round(num * 100)}%</text>
-        </SvgBox>
-      )
-    }
-    case 'dedup_torso_median_frac': {
-      const radius = num * 80;
-      return (
-        <SvgBox>
-          <circle cx="100" cy="30" r="3" fill="var(--halo-cyan)" />
-          <circle cx="140" cy="30" r="3" fill="var(--halo-cyan)" />
-          <circle cx="105" cy="50" r="3" fill="var(--halo-cyan)" />
-          <circle cx="135" cy="50" r="3" fill="var(--halo-cyan)" />
-          
-          <circle cx="120" cy="40" r={radius} fill="none" stroke="#f87171" strokeWidth="1.5" strokeDasharray="3 3" />
-          <text x="120" y="75" fill="var(--text-muted)" fontSize="9" textAnchor="middle">Torso center strictness: {Math.round(num * 100)}%</text>
         </SvgBox>
       )
     }
@@ -220,7 +183,7 @@ export function SchemaFieldVisual({ fieldId, value }: { fieldId: string; value?:
           <path d="M 40 40 L 90 40" stroke="var(--halo-cyan)" strokeWidth="3" markerEnd="url(#arrow)" />
           <rect x="25" y="25" width="20" height="30" stroke="var(--halo-cyan)" fill="none" strokeWidth="2" />
           <rect x="95" y="25" width="20" height="30" stroke="var(--halo-cyan)" fill="none" strokeWidth="2" />
-          <text x="160" y="43" fill="#fff" fontSize="11">{String(value || 'BoxMOT')}</text>
+          <text x="160" y="43" fill="#fff" fontSize="11">{String(value || 'deep_ocsort')}</text>
         </SvgBox>
       )
     default:

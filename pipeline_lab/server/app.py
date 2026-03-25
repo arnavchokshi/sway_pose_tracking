@@ -26,10 +26,12 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import sys
 import yaml
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -40,6 +42,36 @@ from pydantic import BaseModel, Field
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_ROOT = REPO_ROOT / "pipeline_lab" / "runs"
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _merge_lab_request_into_manifest(run_dir: Path) -> None:
+    """
+    Attach Lab UI field snapshot to run_manifest (main.py does not receive request.json).
+    """
+    mp = run_dir / "run_manifest.json"
+    req = run_dir / "request.json"
+    if not mp.is_file() or not req.is_file():
+        return
+    try:
+        with open(req, encoding="utf-8") as f:
+            meta = json.load(f)
+        fields = meta.get("fields")
+        if not isinstance(fields, dict):
+            fields = {}
+        with open(mp, encoding="utf-8") as f:
+            man = json.load(f)
+        rcf = man.get("run_context_final")
+        if not isinstance(rcf, dict):
+            rcf = {}
+        rcf["fields"] = fields
+        rn = meta.get("recipe_name")
+        if isinstance(rn, str) and rn.strip():
+            rcf["recipe_name"] = rn.strip()
+        man["run_context_final"] = rcf
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump(man, f, indent=2)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return
 
 
 def _disk_run_status(run_dir: Path) -> str:
@@ -62,7 +94,20 @@ def _disk_run_status(run_dir: Path) -> str:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sway.pipeline_config_schema import PIPELINE_PARAM_FIELDS, schema_payload  # noqa: E402
+from sway.pipeline_config_schema import (  # noqa: E402
+    PIPELINE_PARAM_FIELDS,
+    apply_master_locked_post_pose_prune_params,
+    apply_master_locked_pre_pose_prune_params,
+    apply_master_locked_reid_dedup_params,
+    apply_master_locked_smooth_params,
+    freeze_lab_subprocess_detection_env,
+    freeze_lab_subprocess_hybrid_sam_env,
+    freeze_lab_subprocess_phase3_stitch_env,
+    freeze_lab_subprocess_pose_env,
+    freeze_lab_subprocess_smooth_env,
+    schema_payload,
+)
+from sway.pipeline_matrix_presets import pipeline_matrix_for_api  # noqa: E402
 
 
 def _default_ui_fields() -> Dict[str, Any]:
@@ -94,6 +139,7 @@ _POSE_MODEL_CLI: Dict[str, str] = {
     "ViTPose-Large": "large",
     "ViTPose-Huge": "huge",
     "RTMPose-L": "rtmpose",
+    "Sapiens (ViTPose-Base fallback)": "sapiens",
 }
 
 
@@ -107,6 +153,7 @@ class RunState:
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     recipe_name: str = ""
     video_stem: str = ""
+    batch_id: str = ""
 
 
 def _pipeline_subprocess_is_alive(st: Optional[RunState]) -> bool:
@@ -150,26 +197,42 @@ def _build_params_yaml(fields: Dict[str, Any]) -> Dict[str, Any]:
             out[key] = float(val)
         else:
             out[key] = val
+    apply_master_locked_pre_pose_prune_params(out)
+    apply_master_locked_reid_dedup_params(out)
+    apply_master_locked_post_pose_prune_params(out)
+    apply_master_locked_smooth_params(out)
     return out
 
 
-# Tracker enum choices shown in the Lab but not yet integrated in tracker.py / Ultralytics wiring.
-_UNWIRED_TRACKER_BACKENDS = frozenset({"ByteTrack", "OC-SORT", "StrongSORT"})
-
-
-def _validate_pipeline_fields(fields: Dict[str, Any]) -> None:
-    tt = fields.get("tracker_technology")
-    if isinstance(tt, str) and tt in _UNWIRED_TRACKER_BACKENDS:
-        raise ValueError(
-            f"Tracker backend {tt!r} is not wired yet — choose BoxMOT or BoT-SORT, "
-            "or watch for a future release that connects alternate BoxMOT trackers."
-        )
+def _validate_pipeline_fields(_fields: Dict[str, Any]) -> None:
+    """Reserved for server-side validation; tracker backends map to env in _subprocess_env."""
 
 
 _REID_PRESET_FILES = {
     "osnet_x0_25": REPO_ROOT / "models" / "osnet_x0_25_msmt17.pt",
     "osnet_x1_0": REPO_ROOT / "models" / "osnet_x1_0_msmt17.pt",
 }
+
+
+def _normalize_tracker_technology(raw: Any) -> str:
+    """Lab enum + legacy saved runs → ``deep_ocsort`` | ``deep_ocsort_osnet``."""
+    legacy = {
+        "BoxMOT": "deep_ocsort",
+        "BoT-SORT": "deep_ocsort",
+        "ByteTrack": "deep_ocsort",
+        "OC-SORT": "deep_ocsort",
+        "StrongSORT": "deep_ocsort_osnet",
+    }
+    if raw is None or raw == "":
+        return "deep_ocsort"
+    if not isinstance(raw, str):
+        return "deep_ocsort"
+    s = raw.strip()
+    if s in legacy:
+        return legacy[s]
+    if s in ("deep_ocsort", "deep_ocsort_osnet"):
+        return s
+    return "deep_ocsort"
 
 
 def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
@@ -188,34 +251,46 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
             env[key] = "1" if val else "0"
         else:
             env[key] = str(val)
-    # BoxMOT Re-ID preset → concrete weights path when Re-ID on and custom path empty
-    custom_rw = str(fields.get("sway_boxmot_reid_weights") or "").strip()
-    preset = fields.get("sway_boxmot_reid_model")
-    if (
-        bool(fields.get("sway_boxmot_reid_on"))
-        and not custom_rw
-        and isinstance(preset, str)
-        and preset in _REID_PRESET_FILES
-    ):
-        p = _REID_PRESET_FILES[preset]
-        if p.is_file():
-            env["SWAY_BOXMOT_REID_WEIGHTS"] = str(p.resolve())
     # Normalize association metric for tracker.py (case-insensitive)
     am = str(env.get("SWAY_BOXMOT_ASSOC_METRIC", "")).strip().lower()
     if am in ("iou", "giou", "diou", "ciou"):
         env["SWAY_BOXMOT_ASSOC_METRIC"] = am
-    # tracker_technology is binding=none in schema but drives SWAY_USE_BOXMOT for wired modes
-    tt = fields.get("tracker_technology")
-    if tt == "BoT-SORT":
-        env["SWAY_USE_BOXMOT"] = "0"
-    elif tt == "BoxMOT":
-        env["SWAY_USE_BOXMOT"] = "1"
+    # tracker_technology → BoxMOT Deep OC-SORT, optional track-time OSNet (see pipeline_config_schema)
+    tt = _normalize_tracker_technology(fields.get("tracker_technology"))
+    env["SWAY_USE_BOXMOT"] = "1"
+    env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
+    custom_rw = str(fields.get("sway_boxmot_reid_weights") or "").strip()
+    preset = fields.get("sway_boxmot_reid_model")
+    if tt == "deep_ocsort_osnet":
+        env["SWAY_BOXMOT_REID_ON"] = "1"
+        if custom_rw:
+            p = Path(custom_rw).expanduser()
+            if p.is_file():
+                env["SWAY_BOXMOT_REID_WEIGHTS"] = str(p.resolve())
+            else:
+                env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
+        elif isinstance(preset, str) and preset in _REID_PRESET_FILES:
+            pw = _REID_PRESET_FILES[preset]
+            if pw.is_file():
+                env["SWAY_BOXMOT_REID_WEIGHTS"] = str(pw.resolve())
+            else:
+                env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
+        else:
+            env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
+    else:
+        env["SWAY_BOXMOT_REID_ON"] = "0"
+        env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
     # Aligns with global_track_link.py: unset SWAY_GLOBAL_AFLINK = allow neural when weights exist.
     mode = fields.get("sway_global_aflink_mode", "neural_if_available")
     if mode == "force_heuristic":
         env["SWAY_GLOBAL_AFLINK"] = "0"
     else:
         env.pop("SWAY_GLOBAL_AFLINK", None)
+    freeze_lab_subprocess_detection_env(env)
+    freeze_lab_subprocess_hybrid_sam_env(env)
+    freeze_lab_subprocess_phase3_stitch_env(env)
+    freeze_lab_subprocess_pose_env(env)
+    freeze_lab_subprocess_smooth_env(env)
     return env
 
 
@@ -355,17 +430,90 @@ def _execute_run(run_id: str) -> None:
             st.status = "cancelled"
             st.error = None
         elif rc == 0:
+            _merge_lab_request_into_manifest(run_dir)
             st.status = "done"
         else:
             st.status = "error"
             st.error = f"exit code {rc}"
 
 
+def _rehydrate_pending_runs_on_startup() -> int:
+    """
+    After uvicorn restart, the in-memory queue and _runs are empty but run folders still exist.
+    Re-queue any job that never finished (no run_manifest.json) so batches actually drain.
+    Stale ``running`` rows (params.yaml but no manifest, no live subprocess) are reset to queued.
+    """
+    pending: List[Tuple[float, str, Path]] = []
+    for p in RUNS_ROOT.iterdir():
+        if not p.is_dir() or p.name.startswith("_"):
+            continue
+        rid = p.name
+        req = p / "request.json"
+        if not req.is_file():
+            continue
+        if (p / "run_manifest.json").is_file():
+            continue
+        ds = _disk_run_status(p)
+        if ds == "unknown":
+            continue
+        if ds == "running":
+            try:
+                (p / "params.yaml").unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                (p / "progress.jsonl").unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            mtime = req.stat().st_mtime
+        except OSError:
+            continue
+        pending.append((mtime, rid, p))
+    pending.sort(key=lambda x: (x[0], x[1]))
+    requeued = 0
+    for mtime, rid, run_dir in pending:
+        try:
+            with open(run_dir / "request.json", encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        recipe_name = str(meta.get("recipe_name") or "")
+        video_stem = str(meta.get("video_stem") or "")
+        batch_id = str(meta.get("batch_id") or "").strip()
+        created = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        with _run_lock:
+            if rid in _runs:
+                continue
+            _runs[rid] = RunState(
+                run_id=rid,
+                status="queued",
+                recipe_name=recipe_name,
+                video_stem=video_stem,
+                batch_id=batch_id,
+                created=created,
+            )
+        _job_queue.put(rid)
+        requeued += 1
+    if requeued:
+        print(
+            f"[pipeline_lab] Rehydrated {requeued} queued run(s) from disk (pending jobs after restart).",
+            flush=True,
+        )
+    return requeued
+
+
+@asynccontextmanager
+async def _lab_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _rehydrate_pending_runs_on_startup()
+    yield
+
+
 for _ in range(max(1, _max_parallel)):
     threading.Thread(target=_worker_loop, daemon=True).start()
 
 
-app = FastAPI(title="Sway Pipeline Lab")
+app = FastAPI(title="Sway Pipeline Lab", lifespan=_lab_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("PIPELINE_LAB_CORS", "http://127.0.0.1:5173,http://localhost:5173").split(","),
@@ -373,6 +521,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.post("/api/runs/rehydrate_from_disk")
+def rehydrate_from_disk() -> Dict[str, Any]:
+    """
+    Re-queue unfinished runs after a crash or if the Lab was restarted without draining the queue.
+    Safe to call multiple times (skips runs already registered in memory).
+    """
+    n = _rehydrate_pending_runs_on_startup()
+    return {"ok": True, "rehydrated": n}
 
 
 @app.get("/api/health")
@@ -383,6 +541,21 @@ def health() -> Dict[str, str]:
 @app.get("/api/schema")
 def get_schema() -> Dict[str, Any]:
     return schema_payload()
+
+
+@app.get("/api/pipeline_matrix")
+def get_pipeline_matrix() -> Dict[str, Any]:
+    """Curated A/B recipes (single-knob deltas) for ``POST /api/runs/batch_path`` and the Lab UI."""
+    return pipeline_matrix_for_api()
+
+
+def _link_or_copy_video(src: Path, dst: Path) -> None:
+    """Hardlink when same filesystem (saves space for N-way matrix); else copy."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 @app.get("/api/models/status")
@@ -427,6 +600,9 @@ def _enqueue_run(
         "video_stem": video_stem,
         **meta_extra,
     }
+    bid = str(meta_extra.get("batch_id") or "").strip()
+    if bid:
+        meta["batch_id"] = bid
     with open(run_dir / "request.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     with _run_lock:
@@ -434,6 +610,7 @@ def _enqueue_run(
             run_id=run_id,
             recipe_name=recipe_name,
             video_stem=video_stem,
+            batch_id=bid,
         )
     _job_queue.put(run_id)
 
@@ -580,6 +757,98 @@ async def create_runs_batch_upload(
     return JSONResponse({"batch_id": batch_id, "run_ids": run_ids, "status": "queued"})
 
 
+class BatchPathRunSpec(BaseModel):
+    recipe_name: str = ""
+    fields: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateBatchPathRequest(BaseModel):
+    """Queue many runs that share one video copied once into the Lab runs tree (then hardlinked per run)."""
+
+    video_path: str
+    runs: List[BatchPathRunSpec]
+    source_label: str = ""
+
+
+@app.post("/api/runs/batch_path")
+def create_runs_batch_path(req: CreateBatchPathRequest) -> JSONResponse:
+    """
+    Automation / CLI: ``video_path`` must exist on the machine running uvicorn.
+    Copies the file once under ``runs/_batch_staging/<batch_id>/``, then hardlinks into each run dir
+    (fallback: copy) so large matrix batches do not multiply disk usage.
+    """
+    if not req.runs:
+        raise HTTPException(400, "runs must contain at least one spec")
+    src = Path(req.video_path)
+    if not src.is_file():
+        raise HTTPException(400, "video_path must exist")
+
+    for sp in req.runs:
+        try:
+            _validate_pipeline_fields(sp.fields or {})
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    batch_id = str(uuid.uuid4())
+    ext = src.suffix or ".mp4"
+    if ext.lower() not in (
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".m4v",
+    ):
+        ext = ".mp4"
+
+    staging_dir = RUNS_ROOT / "_batch_staging" / batch_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_video = staging_dir / f"source{ext}"
+    shutil.copy2(src, staging_video)
+
+    stem = src.stem
+    if req.source_label and req.source_label.strip():
+        stem = req.source_label.strip()
+
+    run_ids: List[str] = []
+    for spec in req.runs:
+        run_id = str(uuid.uuid4())
+        run_dir = RUNS_ROOT / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        dest = run_dir / f"input_video{ext}"
+        _link_or_copy_video(staging_video, dest)
+        _enqueue_run(
+            run_id,
+            run_dir,
+            spec.recipe_name,
+            spec.fields,
+            stem,
+            {
+                "source_path": str(src.resolve()),
+                "batch_id": batch_id,
+                "batch_kind": "batch_path",
+            },
+        )
+        run_ids.append(run_id)
+
+    if staging_video.is_file():
+        staging_video.unlink()
+    try:
+        staging_dir.rmdir()
+    except OSError:
+        pass
+
+    return JSONResponse(
+        {
+            "batch_id": batch_id,
+            "run_ids": run_ids,
+            "status": "queued",
+            "video_stem": stem,
+            "run_count": len(run_ids),
+        }
+    )
+
+
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     """Merge in-memory state with runs on disk (survives API restart)."""
@@ -593,6 +862,7 @@ def list_runs() -> List[Dict[str, Any]]:
                 "recipe_name": r.recipe_name,
                 "video_stem": r.video_stem,
                 "created": r.created,
+                "batch_id": r.batch_id,
             }
             if r.status == "running":
                 row["subprocess_alive"] = _pipeline_subprocess_is_alive(r)
@@ -601,17 +871,21 @@ def list_runs() -> List[Dict[str, Any]]:
         if not p.is_dir():
             continue
         rid = p.name
+        if rid.startswith("_"):
+            continue
         if rid in rows:
             continue
         meta = p / "request.json"
         recipe_name = ""
         video_stem = ""
+        batch_id_disk = ""
         if meta.is_file():
             try:
                 with open(meta, encoding="utf-8") as f:
                     m = json.load(f)
                 recipe_name = m.get("recipe_name") or ""
                 video_stem = m.get("video_stem") or ""
+                batch_id_disk = str(m.get("batch_id") or "").strip()
             except Exception:
                 pass
         status = _disk_run_status(p)
@@ -623,6 +897,7 @@ def list_runs() -> List[Dict[str, Any]]:
             "recipe_name": recipe_name,
             "video_stem": video_stem,
             "created": created,
+            "batch_id": batch_id_disk,
         }
         if status == "running":
             # No in-memory Popen after API restart — Stop will not work; Delete is allowed.

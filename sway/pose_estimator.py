@@ -2,7 +2,9 @@
 Top-Down Pose Estimation Module — ViTPose (V3.0)
 
 V3.0: ViTPose-Large for high-fidelity pose estimation (15° wrist/elbow accuracy).
-Extracts 17 COCO keypoints per detected person. Batched [N, 3, 256, 192], fp16 on MPS.
+Extracts 17 COCO keypoints per detected person. Batched [N, 3, 256, 192], fp16 on MPS unless
+``SWAY_VITPOSE_FP32=1``. Production ``main.py`` reapplies ViTPose env (§9.0.1) after params unless
+``SWAY_UNLOCK_POSE_TUNING=1``.
 """
 
 import os
@@ -45,6 +47,31 @@ COCO_SKELETON_EDGES = [
 # Bbox padding: expand YOLO box by this fraction in all directions before cropping for ViTPose.
 # Prevents limbs (e.g. fast hand raises) from being cut off at crop boundaries.
 BBOX_PADDING = 0.15
+
+
+def vitpose_force_fp32() -> bool:
+    """
+    When True, keep ViTPose in float32 on MPS/CUDA (slower, sometimes numerically safer).
+    Default False — the pipeline still uses FP16 on GPU when this is off.
+    Env: SWAY_VITPOSE_FP32
+    """
+    v = os.environ.get("SWAY_VITPOSE_FP32", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def vitpose_max_per_forward() -> int:
+    """
+    When > 0, split a single-frame multi-person ViTPose forward into chunks of at most this many
+    boxes (VRAM / stability for crowded frames). 0 = one forward for all boxes (default).
+    Env: SWAY_VITPOSE_MAX_PER_FORWARD
+    """
+    v = os.environ.get("SWAY_VITPOSE_MAX_PER_FORWARD", "").strip()
+    if not v:
+        return 0
+    try:
+        return max(1, int(v))
+    except ValueError:
+        return 0
 
 
 def _to_float32(obj):
@@ -175,9 +202,12 @@ class PoseEstimator:
                 )
         self.model.to(self.device)
         self.model.eval()
-        # fp16 on MPS/CUDA (M2 optimization): ~2x speed, ~half memory
-        use_fp16 = self.device.type in ("mps", "cuda")
+        # fp16 on MPS/CUDA unless SWAY_VITPOSE_FP32=1 (opt-in full precision)
+        _fp32 = vitpose_force_fp32()
+        use_fp16 = self.device.type in ("mps", "cuda") and not _fp32
         self.use_fp16 = use_fp16
+        if _fp32 and self.device.type in ("mps", "cuda"):
+            print("  ViTPose: SWAY_VITPOSE_FP32=1 — using float32 on GPU.", flush=True)
         if use_fp16:
             self.model = self.model.to(torch.float16)
 
@@ -192,6 +222,17 @@ class PoseEstimator:
         if len(boxes) == 0:
             return {}
         assert len(boxes) == len(track_ids) == len(paddings)
+        cap = vitpose_max_per_forward()
+        if cap and len(boxes) > cap:
+            out: Dict[int, Dict] = {}
+            for start in range(0, len(boxes), cap):
+                sl = slice(start, start + cap)
+                out.update(
+                    self._estimate_poses_batch(
+                        frame, boxes[sl], track_ids[sl], paddings[sl]
+                    )
+                )
+            return out
         img_h, img_w = frame.shape[:2]
         boxes_expanded = [
             _expand_bbox(b, img_w, img_h, pad) for b, pad in zip(boxes, paddings)

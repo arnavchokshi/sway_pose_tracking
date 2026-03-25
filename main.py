@@ -61,11 +61,24 @@ import cv2
 import numpy as np
 import torch
 
+from sway.bidirectional_track_merge import (
+    bidirectional_iou_threshold,
+    bidirectional_min_match_frames,
+    bidirectional_track_pass_enabled,
+    merge_forward_backward_tracks,
+    remap_reverse_pass_timeline,
+    reverse_video_via_ffmpeg,
+)
+from sway.experimental_hooks import (
+    maybe_gnn_refine_raw_tracks,
+    write_hmr_mesh_sidecar_json,
+)
 from sway.tracker import (
     apply_post_track_stitching,
     iter_video_frames,
     run_tracking_before_post_stitch,
 )
+from sway.track_stats_export import compute_track_quality_stats, write_track_stats_json
 from sway.track_pruning import (
     ASPECT_RATIO_MAX,
     AUDIENCE_REGION_WINDOW_FRAMES,
@@ -101,6 +114,7 @@ from sway.track_pruning import (
     ULTRA_LOW_SKELETON_FRAME_FRAC,
     ULTRA_LOW_SKELETON_MEAN,
 )
+from sway.interp_utils import blend_pose_keypoints_scores
 from sway.pose_estimator import PoseEstimator
 from sway.temporal_pose_refine import (
     apply_temporal_keypoint_smoothing,
@@ -122,6 +136,17 @@ from sway.crossover import (
     sanitize_pose_bbox_consistency,
 )
 from sway.reid_embedder import extract_embeddings
+from sway.pipeline_config_schema import (
+    apply_master_locked_detection_env,
+    apply_master_locked_hybrid_sam_env,
+    apply_master_locked_phase3_stitch_env,
+    apply_master_locked_pose_env,
+    apply_master_locked_post_pose_prune_params,
+    apply_master_locked_pre_pose_prune_params,
+    apply_master_locked_reid_dedup_params,
+    apply_master_locked_smooth_env,
+    apply_master_locked_smooth_params,
+)
 from sway.smoother import PoseSmoother
 from sway.scoring import process_all_frames_scoring_vectorized
 from sway.prune_preview_overlay import (
@@ -139,6 +164,8 @@ from sway.visualizer import (
     snapshot_tid_box_map,
     stitch_montage,
     draw_boxes_only,
+    draw_phase1_detection_preview,
+    draw_tracks_post_stitch_preview,
     draw_frame_with_boxes,
     draw_frame,
 )
@@ -151,6 +178,8 @@ def _apply_stack_default_env() -> None:
     """
     os.environ.setdefault("SWAY_GROUP_VIDEO", "1")
     os.environ.setdefault("SWAY_GLOBAL_LINK", "1")
+    # Depth-based stage polygon is easy to get wrong on group/competition video; opt-in via SWAY_AUTO_STAGE_DEPTH=1.
+    os.environ.setdefault("SWAY_AUTO_STAGE_DEPTH", "0")
 
 
 def _ensure_collision_cleanup_logging() -> None:
@@ -170,12 +199,35 @@ def _ensure_collision_cleanup_logging() -> None:
     log._sway_pipeline_collision_handler = h  # type: ignore[attr-defined]
 
 
+def _pose_gap_interp_runtime(
+    gap_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
+) -> Tuple[str, float]:
+    """Read optional pose-stride gap interpolation; default linear (unchanged pipeline)."""
+    mode = gap_interp_mode
+    if mode is None:
+        mode = os.environ.get("SWAY_POSE_GAP_INTERP_MODE", "linear").strip().lower() or "linear"
+    gsl = gsi_lengthscale
+    if gsl is None:
+        pgl = os.environ.get("SWAY_POSE_GSI_LENGTHSCALE", "").strip()
+        if pgl:
+            gsl = float(pgl)
+        else:
+            g = os.environ.get("SWAY_GSI_LENGTHSCALE", "").strip()
+            gsl = float(g) if g else 0.35
+    return str(mode), float(gsl)
+
+
 def _interpolate_pose_gaps(
     raw_poses_by_frame: list,
     frames_stored: list,
     stride: int,
+    *,
+    gap_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
 ) -> None:
     """Fill pose gaps for frames skipped by pose_stride. Modifies raw_poses_by_frame in place."""
+    mode, gsi_l = _pose_gap_interp_runtime(gap_interp_mode, gsi_lengthscale)
     n = len(raw_poses_by_frame)
     for idx in range(n):
         if idx % stride == 0:
@@ -196,9 +248,10 @@ def _interpolate_pose_gaps(
                 kp_next = next_poses[tid]["keypoints"]
                 sc_prev = prev_poses[tid]["scores"]
                 sc_next = next_poses[tid]["scores"]
-                kp = (1 - t) * kp_prev + t * kp_next
-                sc = (1 - t) * sc_prev + t * sc_next
-                interpolated[int(tid)] = {"keypoints": np.asarray(kp, dtype=np.float32), "scores": np.asarray(sc, dtype=np.float32)}
+                kp, sc = blend_pose_keypoints_scores(
+                    kp_prev, kp_next, sc_prev, sc_next, float(t), mode=mode, gsi_l=gsi_l
+                )
+                interpolated[int(tid)] = {"keypoints": kp, "scores": sc}
             elif tid in prev_poses:
                 interpolated[int(tid)] = dict(prev_poses[tid])
             elif tid in next_poses:
@@ -263,6 +316,128 @@ def _lab_track_summary_heuristic(raw_tracks: Dict[int, List[Any]], ystride: int)
         "mean_track_observations": float(np.mean(arr)) if arr.size else 0.0,
         "internal_timeline_jumps": int(jumps),
         "note": "IDF1, IDSW, HOTA require MOT ground truth (see python -m tools.benchmark_trackeval).",
+    }
+
+
+def _merge_hybrid_sam_stats(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Sum counters across forward + reverse tracking passes (bidirectional)."""
+    if not b:
+        return dict(a) if a else {}
+    if not a:
+        return dict(b)
+    out = dict(a)
+    for k in (
+        "hybrid_sam_frames_total",
+        "hybrid_sam_frames_refined",
+        "hybrid_sam_predict_calls",
+        "hybrid_sam_weak_cue_skips",
+    ):
+        out[k] = int(a.get(k) or 0) + int(b.get(k) or 0)
+    out["hybrid_sam_weak_cues_enabled"] = bool(
+        a.get("hybrid_sam_weak_cues_enabled") or b.get("hybrid_sam_weak_cues_enabled")
+    )
+    return out
+
+
+def _pose_gap_interp_mode_read() -> str:
+    return os.environ.get("SWAY_POSE_GAP_INTERP_MODE", "linear").strip().lower() or "linear"
+
+
+def _build_pipeline_diagnostics(
+    hybrid_sam_stats: Dict[str, Any],
+    args: Any,
+    params: dict,
+) -> Dict[str, Any]:
+    """Structured Lab / manifest payload: what ran and how optional features behaved."""
+    from sway.global_track_link import _force_heuristic_global_link, resolve_aflink_weights
+    from sway.tracker import _use_boxmot, boxmot_tracker_kind_from_env, load_tracking_runtime
+
+    tr = load_tracking_runtime()
+    p = resolve_aflink_weights()
+    gl = os.environ.get("SWAY_GLOBAL_LINK", "").lower() in ("1", "true", "yes")
+    force_h = _force_heuristic_global_link()
+    weights_ok = p.is_file()
+    if not gl:
+        af_eff = "disabled"
+    elif weights_ok and not force_h:
+        af_eff = "neural"
+    else:
+        af_eff = "heuristic"
+    pgl = os.environ.get("SWAY_POSE_GSI_LENGTHSCALE", "").strip()
+    gsi = float(pgl) if pgl else float(os.environ.get("SWAY_GSI_LENGTHSCALE", "0.35") or 0.35)
+    vis_gsi_v = os.environ.get("SWAY_VIS_GSI_LENGTHSCALE", "").strip()
+    vis_gsi_eff = float(vis_gsi_v) if vis_gsi_v else gsi
+    vis_mode = os.environ.get("SWAY_VIS_TEMPORAL_INTERP_MODE", "linear").strip().lower() or "linear"
+    h = dict(hybrid_sam_stats) if hybrid_sam_stats else {}
+    total = max(1, int(h.get("hybrid_sam_frames_total") or 0))
+    refined = int(h.get("hybrid_sam_frames_refined") or 0)
+    h["hybrid_sam_refined_frac"] = round(refined / total, 4) if total else 0.0
+    weak_sk = int(h.get("hybrid_sam_weak_cue_skips") or 0)
+    h["hybrid_sam_weak_cue_skip_note"] = (
+        f"{weak_sk} high-IoU frames skipped SAM (weak-cue gate)."
+        if weak_sk
+        else "No weak-cue SAM skips this run."
+    )
+    stage_wall: Dict[str, Any] = {"per_stage_elapsed_s": {}, "sum_stages_s": 0.0, "count": 0}
+    if _LAB_CTX is not None:
+        slog = _LAB_CTX.get("stage_log") or []
+        per: Dict[str, float] = {}
+        for e in slog:
+            sk = e.get("stage_key")
+            es = e.get("elapsed_s")
+            if sk is not None and es is not None:
+                per[str(sk)] = float(es)
+        stage_wall = {
+            "per_stage_elapsed_s": per,
+            "sum_stages_s": round(sum(per.values()), 3) if per else 0.0,
+            "count": len(per),
+        }
+    tp = "botsort"
+    if _use_boxmot():
+        kind = boxmot_tracker_kind_from_env()
+        reid_on = os.environ.get("SWAY_BOXMOT_REID_ON", "").strip().lower() in ("1", "true", "yes")
+        if kind == "deepocsort" and reid_on:
+            tp = "boxmot:deepocsort+osnet"
+        else:
+            tp = f"boxmot:{kind}"
+    exp = {
+        "gnn_track_refine": os.environ.get("SWAY_GNN_TRACK_REFINE", "").strip().lower()
+        in ("1", "true", "yes"),
+        "sapiens_pose_cli": str(getattr(args, "pose_model", "") or "") == "sapiens",
+        "hmr_mesh_sidecar": os.environ.get("SWAY_HMR_MESH_SIDECAR", "").strip().lower()
+        in ("1", "true", "yes"),
+    }
+    return {
+        "hybrid_sam": h,
+        "tracker_path": tp,
+        "interpolation": {
+            "box_mode": str(tr.get("box_interp_mode", "linear")),
+            "box_gsi_lengthscale": float(tr.get("gsi_lengthscale", 0.35)),
+            "pose_stride_gap_mode": _pose_gap_interp_mode_read(),
+            "pose_stride_cli": int(getattr(args, "pose_stride", 1)),
+            "export_video_temporal": vis_mode,
+            "export_gsi_lengthscale_effective": vis_gsi_eff,
+        },
+        "global_stitch": {
+            "enabled": gl,
+            "aflink_effective": af_eff,
+            "aflink_weights_found": weights_ok,
+            "aflink_weights_path": str(p.resolve()) if weights_ok else None,
+        },
+        "bidirectional_track_pass": bidirectional_track_pass_enabled(),
+        "temporal_pose_refine": want_temporal_pose_refine(getattr(args, "temporal_pose_refine", True)),
+        "temporal_pose_radius": temporal_pose_radius(getattr(args, "temporal_pose_radius", 2)),
+        "export_track_stats_json": True,
+        "run_quality": {
+            **stage_wall,
+            "track_stats_json_requested": True,
+            "note": "per_stage_elapsed_s sums major Lab progress stages for this video run (not pytest golden_bench).",
+        },
+        "experimental": exp,
+        "notes": {
+            "gsi": "GSI modes only change interpolated geometry (boxes / pose gaps / export MP4), not discrete JSON keyframes.",
+            "aflink": "Neural AFLink runs only when global link is on, weights exist, and Lab does not force heuristic.",
+        },
     }
 
 
@@ -476,6 +651,14 @@ def _lab_write_manifest(
         "SWAY_DETECT_SIZE",
         "SWAY_YOLO_CONF",
         "SWAY_YOLO_DETECTION_STRIDE",
+        "SWAY_YOLO_INFER_BATCH",
+        "SWAY_YOLO_HALF",
+        "SWAY_YOLO_ENGINE",
+        "SWAY_VITPOSE_MAX_PER_FORWARD",
+        "SWAY_VITPOSE_FP32",
+        "SWAY_BIDIRECTIONAL_TRACK_PASS",
+        "SWAY_BIDIRECTIONAL_IOU_THRESH",
+        "SWAY_BIDIRECTIONAL_MIN_MATCH_FRAMES",
         "SWAY_STAGE_POLYGON",
         "SWAY_AUTO_STAGE_DEPTH",
         "SWAY_TEMPORAL_POSE_REFINE",
@@ -489,6 +672,23 @@ def _lab_write_manifest(
         "SWAY_POSEFORMERV2_NFRAMES",
         "SWAY_POSEFORMERV2_FRAME_KEPT",
         "SWAY_POSEFORMERV2_COEFF_KEPT",
+        "SWAY_BOX_INTERP_MODE",
+        "SWAY_GSI_LENGTHSCALE",
+        "SWAY_POSE_GAP_INTERP_MODE",
+        "SWAY_POSE_GSI_LENGTHSCALE",
+        "SWAY_HYBRID_SAM_WEAK_CUES",
+        "SWAY_HYBRID_WEAK_CONF_DELTA",
+        "SWAY_HYBRID_WEAK_HEIGHT_FRAC",
+        "SWAY_HYBRID_WEAK_MATCH_IOU",
+        "SWAY_VIS_TEMPORAL_INTERP_MODE",
+        "SWAY_VIS_GSI_LENGTHSCALE",
+        "SWAY_AFLINK_THR_T0",
+        "SWAY_AFLINK_THR_T1",
+        "SWAY_AFLINK_THR_S",
+        "SWAY_AFLINK_THR_P",
+        "SWAY_BOXMOT_TRACKER",
+        "SWAY_GNN_TRACK_REFINE",
+        "SWAY_HMR_MESH_SIDECAR",
     ]
     env_snap = {k: os.environ.get(k) for k in env_keys if os.environ.get(k)}
 
@@ -585,10 +785,11 @@ def main():
     parser.add_argument(
         "--pose-model",
         type=str,
-        choices=["base", "large", "huge", "rtmpose"],
+        choices=["base", "large", "huge", "rtmpose", "sapiens"],
         default="base",
         help=(
-            "2D pose: ViTPose+ base/large/huge, or rtmpose (RTMPose-L via MMPose; optional install). "
+            "2D pose: ViTPose+ base/large/huge, rtmpose (RTMPose-L via MMPose), or sapiens "
+            "(not bundled — uses ViTPose-Base until Sapiens is wired in code). "
             "Override ViTPose checkpoint with SWAY_VITPOSE_MODEL."
         ),
     )
@@ -660,7 +861,16 @@ def main():
         with open(args.params) as f:
             params = yaml.safe_load(f) or {}
 
+    apply_master_locked_pre_pose_prune_params(params)
+    apply_master_locked_reid_dedup_params(params)
+    apply_master_locked_post_pose_prune_params(params)
+    apply_master_locked_smooth_params(params)
     _apply_params_to_env(params)
+    apply_master_locked_detection_env()
+    apply_master_locked_hybrid_sam_env()
+    apply_master_locked_phase3_stitch_env()
+    apply_master_locked_pose_env()
+    apply_master_locked_smooth_env()
 
     video_path = Path(args.video_path)
     if not video_path.exists():
@@ -705,13 +915,76 @@ def main():
 
     # ── Phase 1 & 2: Detection + Tracking (single streaming pass) ─────────
     print("\n[1/11] Phase 1 — Detection (YOLO)")
-    print("[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT + hybrid SAM when enabled)")
+    print(
+        "[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT, optional track-time OSNet; hybrid SAM when enabled)",
+    )
     print("  (Single pass over the video: detection and association per frame.)")
     t0 = time.time()
     _track_lab_cb = _lab_make_tracking_progress_callback(str(video_path))
-    raw_pre, total_frames, output_fps, _frames_list, native_fps, frame_width, frame_height, ystride = (
-        run_tracking_before_post_stitch(str(video_path), lab_on_infer=_track_lab_cb)
-    )
+    (
+        raw_pre,
+        total_frames,
+        output_fps,
+        _frames_list,
+        native_fps,
+        frame_width,
+        frame_height,
+        ystride,
+        hybrid_sam_stats,
+        phase1_dets_by_frame,
+    ) = run_tracking_before_post_stitch(str(video_path), lab_on_infer=_track_lab_cb)
+    if bidirectional_track_pass_enabled():
+        t_bi = time.time()
+        print(
+            "  Optional bidirectional pass: SWAY_BIDIRECTIONAL_TRACK_PASS=1 "
+            "(reverse video + second track, then merge; ~2× Phase 1–2 time)…",
+            flush=True,
+        )
+        rev_path = output_dir / ".sway_bidirectional_rev_input.mp4"
+        try:
+            reverse_video_via_ffmpeg(video_path.resolve(), rev_path)
+            (
+                raw_rev,
+                tf_rev,
+                _,
+                _,
+                _,
+                _,
+                _,
+                ys_rev,
+                hybrid_rev,
+                _phase1_rev,
+            ) = run_tracking_before_post_stitch(str(rev_path), lab_on_infer=_track_lab_cb)
+            hybrid_sam_stats = _merge_hybrid_sam_stats(hybrid_sam_stats, hybrid_rev)
+            if tf_rev != total_frames or int(ys_rev) != int(ystride):
+                print(
+                    f"  Warning: reverse tracking shape mismatch "
+                    f"(frames {tf_rev} vs {total_frames}, stride {ys_rev} vs {ystride}); skipping merge.",
+                    flush=True,
+                )
+            else:
+                rev_mapped = remap_reverse_pass_timeline(raw_rev, total_frames)
+                iou_t = bidirectional_iou_threshold()
+                min_m = bidirectional_min_match_frames()
+                n_before = len(raw_pre)
+                raw_pre = merge_forward_backward_tracks(
+                    raw_pre,
+                    rev_mapped,
+                    iou_threshold=iou_t,
+                    min_match_frames=min_m,
+                )
+                print(
+                    f"  └─ Bidirectional merge: {n_before} → {len(raw_pre)} raw tracks "
+                    f"(IoU≥{iou_t}, ≥{min_m} matched frames); +{time.time() - t_bi:.1f}s",
+                    flush=True,
+                )
+        except Exception as ex:
+            print(f"  Warning: bidirectional pass skipped ({ex})", flush=True)
+        finally:
+            try:
+                rev_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     dt_track = time.time() - t0
     print(f"  └─ Phases 1–2: {dt_track:.1f}s")
     log_resource_usage("1-2-detection-tracking")
@@ -748,6 +1021,7 @@ def main():
     finally:
         ph3_stop.set()
     dt_stitch = time.time() - t0
+    raw_tracks = maybe_gnn_refine_raw_tracks(raw_tracks, int(total_frames), int(ystride))
     print(f"  └─ {dt_stitch:.1f}s")
     log_resource_usage("3-post-track-stitch")
 
@@ -761,6 +1035,12 @@ def main():
         track_summary=_lab_track_summary_heuristic(raw_tracks, int(ystride)),
     )
 
+    ts_path = output_dir / "track_stats.json"
+    stats = compute_track_quality_stats(raw_tracks, int(total_frames), int(ystride))
+    write_track_stats_json(ts_path, stats)
+    print(f"  Track stats written: {ts_path}", flush=True)
+    _lab_update_context(track_stats_path=str(ts_path.name))
+
     if clip_dir is not None:
         print(
             "  Phase preview videos: full source length, no title slate "
@@ -769,12 +1049,60 @@ def main():
         )
         all_ids = set(raw_tracks.keys())
         all_tracking = raw_tracks_to_per_frame(raw_tracks, total_frames, all_ids)
-        all_fd = [{"frame_idx": i, "boxes": t["boxes"], "track_ids": t["track_ids"],
-                    "poses": {}} for i, t in enumerate(all_tracking)]
+        phase1_fd = []
+        for i in range(total_frames):
+            pairs = phase1_dets_by_frame.get(i, [])
+            phase1_fd.append(
+                {
+                    "frame_idx": i,
+                    "phase1_boxes": [p[0] for p in pairs],
+                    "phase1_confs": [p[1] for p in pairs],
+                    "boxes": [],
+                    "track_ids": [],
+                    "poses": {},
+                }
+            )
+        p0 = clip_dir / "00_phase1_detections.mp4"
+        montage_clips.append(
+            render_phase_clip(
+                video_path,
+                phase1_fd,
+                "Phase 1: Detections",
+                draw_phase1_detection_preview,
+                native_fps,
+                output_fps,
+                p0,
+                caption="All detector boxes + confidence (no track IDs)",
+                full_length=True,
+                show_title_card=False,
+            )
+        )
+        prv0 = f"phase_previews/{p0.name}" if args.save_phase_previews else None
+        if prv0:
+            _lab_register_preview("phase1_detections", prv0)
+            _lab_progress(
+                1,
+                "phase1_detections",
+                "Phase 1: Detections (all boxes + conf)",
+                preview_relpath=prv0,
+                extra={"det_frames": sum(1 for i in range(total_frames) if phase1_dets_by_frame.get(i))},
+            )
+        all_fd = [
+            {
+                "frame_idx": i,
+                "boxes": t["boxes"],
+                "track_ids": t["track_ids"],
+                "poses": {},
+                "sam2_input_roi_xyxy": t.get("sam2_input_roi_xyxy"),
+            }
+            for i, t in enumerate(all_tracking)
+        ]
         p1 = clip_dir / "01_tracks_post_stitch.mp4"
         montage_clips.append(render_phase_clip(
             video_path, all_fd, "Phases 1–3: Tracks",
-            lambda f, d: draw_boxes_only(f, d["boxes"], d["track_ids"]),
+            lambda f, d: draw_tracks_post_stitch_preview(
+                f, d["boxes"], d["track_ids"], d.get("sam2_input_roi_xyxy")
+            ),
             native_fps, output_fps, p1,
             caption="After detection, tracking, and post-track stitching",
             full_length=True,
@@ -842,7 +1170,7 @@ def main():
         )
 
     stage_polygon = _parse_stage_polygon_env()
-    if stage_polygon is None and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "1") == "1":
+    if stage_polygon is None and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "0") == "1":
         from sway.depth_stage import estimate_stage_polygon
 
         first_frame = None
@@ -870,7 +1198,7 @@ def main():
             if os.environ.get("SWAY_STAGE_POLYGON")
             else (
                 "auto_depth"
-                if stage_polygon and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "1") == "1"
+                if stage_polygon and os.environ.get("SWAY_AUTO_STAGE_DEPTH", "0") == "1"
                 else ("custom" if stage_polygon else "none")
             )
         )
@@ -884,7 +1212,7 @@ def main():
             total_frames=total_frames,
             cause_config=prune_cause_config(
                 "stage_polygon",
-                "Phase 4: median bbox center lies outside the configured stage polygon (normalized coords).",
+                "Phase 4: median foot position (bottom-center of bbox) lies outside the stage polygon (normalized coords).",
                 {"stage_polygon_source": _poly_src},
             ),
         )
@@ -1117,9 +1445,17 @@ def main():
 
     # ── Phase 5: Pose estimation with visibility scoring ──────────────────
     use_rtmpose = args.pose_model == "rtmpose"
+    use_sapiens_requested = args.pose_model == "sapiens"
     env_pose = os.environ.get("SWAY_VITPOSE_MODEL", "").strip()
     if use_rtmpose:
         model_id = "rtmpose-l (MMPose)"
+    elif use_sapiens_requested:
+        model_id = "usyd-community/vitpose-plus-base"
+        print(
+            "  Note: --pose-model sapiens — true Meta Sapiens is not bundled; using ViTPose-Base for 2D keypoints "
+            "this run. Implement a Sapiens backend and swap in sway/pose_estimator or main Phase 5 when ready.",
+            flush=True,
+        )
     elif env_pose:
         model_id = env_pose
     elif args.pose_model == "huge":
@@ -1130,7 +1466,12 @@ def main():
         model_id = "usyd-community/vitpose-plus-base"
     _lab_update_context(vitpose_model_id=model_id, pose_stride=int(args.pose_stride))
     stride_note = f" stride={args.pose_stride}" if args.pose_stride > 1 else ""
-    pose_label = "RTMPose-L" if use_rtmpose else f"ViTPose-{args.pose_model.title()}"
+    if use_rtmpose:
+        pose_label = "RTMPose-L"
+    elif use_sapiens_requested:
+        pose_label = "Sapiens (ViTPose-Base fallback)"
+    else:
+        pose_label = f"ViTPose-{args.pose_model.title()}"
     print(f"\n[5/11] Phase 5 — Pose estimation ({pose_label}{stride_note}, visibility-gated)…")
     t0 = time.time()
     if use_rtmpose:
@@ -1138,10 +1479,15 @@ def main():
 
         print(f"  Loading RTMPose (MMPose) on {device}…", flush=True)
         pose_estimator = RTMPoseEstimator(device=device)
-    else:
+    elif use_sapiens_requested or not use_rtmpose:
         print(f"  Loading ViTPose ({model_id}) on {device}…", flush=True)
         pose_estimator = PoseEstimator(device=device, model_name=model_id)
-    backend = "RTMPose" if use_rtmpose else "ViTPose"
+    if use_rtmpose:
+        backend = "RTMPose"
+    elif use_sapiens_requested:
+        backend = "ViTPose (Sapiens slot — fallback weights)"
+    else:
+        backend = "ViTPose"
     print(
         f"  {backend} weights loaded in {time.time() - t0:.1f}s (first forward may add MPS/CUDA compile time)",
         flush=True,
@@ -1193,6 +1539,7 @@ def main():
                     "confs": [],
                     "is_sam_refined": [],
                     "segmentation_masks": [],
+                    "sam2_input_roi_xyxy": None,
                 }
             )
             boxes = tracking["boxes"]
@@ -1388,6 +1735,7 @@ def main():
             "embeddings": emb,  # V3.8: Per-track appearance for crossover Re-ID
             "is_sam_refined": sam_f,
             "segmentation_masks": sam_m,
+            "sam2_input_roi_xyxy": tr.get("sam2_input_roi_xyxy"),
         })
 
     _ex5 = {
@@ -2117,6 +2465,10 @@ def main():
     log_resource_usage("final")
 
     _lab_update_context(total_pipeline_wall_s=round(total_elapsed, 3))
+    write_hmr_mesh_sidecar_json(output_dir)
+    _lab_update_context(
+        pipeline_diagnostics=_build_pipeline_diagnostics(hybrid_sam_stats, args, params),
+    )
     _lab_progress(
         11,
         "pipeline_total",
@@ -2142,6 +2494,14 @@ def main():
     # Write prune diagnostic log for debugging
     prune_log_path = output_dir / "prune_log.json"
     try:
+        _sam_roi_frames = raw_tracks_to_per_frame(
+            raw_tracks, total_frames, set(raw_tracks.keys())
+        )
+        hybrid_sam_frame_rois = [
+            {"frame_idx": i, "roi_xyxy": t["sam2_input_roi_xyxy"]}
+            for i, t in enumerate(_sam_roi_frames)
+            if t.get("sam2_input_roi_xyxy") is not None
+        ]
         prune_log_data = {
             "video_path": str(video_path),
             "native_fps": round(float(native_fps), 4),
@@ -2154,6 +2514,7 @@ def main():
             },
             "surviving_after_pre_pose": sorted(surviving_ids, key=lambda x: int(x) if isinstance(x, int) else 999),
             "surviving_after_post_pose": sorted(surviving_after_prune, key=lambda x: int(x) if isinstance(x, int) else 999),
+            "hybrid_sam_frame_rois": hybrid_sam_frame_rois,
             "prune_entries": prune_log_entries,
         }
         with open(prune_log_path, "w") as f:

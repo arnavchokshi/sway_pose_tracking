@@ -4,6 +4,9 @@ Pre-pose + post-pose track pruning — V3.5 Non-Person Object Detection
 Pre-pose rules run in main Phase 4; post-pose Tier A/B/C runs in main Phase 8:
 Tier C hard skeleton auto-reject, Tier A confirmed-human
 whitelist (torso + span + mirror-edge spatial sanity), Tier B weighted vote across six signals.
+Production ``main.py`` reapplies locked Tier C / Tier A span / edge / mushy-skeleton / jitter thresholds and three
+vote weights (completeness, head-only, jittery) via ``params`` (``MASTER_PIPELINE_GUIDELINE.md`` §13.0.1) unless
+``SWAY_UNLOCK_POST_POSE_PRUNE_TUNING=1``.
 
 V3.5 Pruning (additions):
 - Bbox Aspect Ratio: Pre-pose prune tracks with median width/height > 1.2 (non-person objects)
@@ -1718,7 +1721,14 @@ def raw_tracks_to_per_frame(
         for entry in raw_tracks[track_id]:
             obs = coerce_observation(entry)
             frame_boxes[obs.frame_idx].append(
-                (obs.bbox, track_id, obs.conf, obs.is_sam_refined, obs.segmentation_mask)
+                (
+                    obs.bbox,
+                    track_id,
+                    obs.conf,
+                    obs.is_sam_refined,
+                    obs.segmentation_mask,
+                    obs.sam2_input_roi_xyxy,
+                )
             )
 
     results = []
@@ -1730,6 +1740,12 @@ def raw_tracks_to_per_frame(
         confs = [e[2] for e in entries]
         is_sam_refined = [e[3] for e in entries]
         segmentation_masks = [e[4] for e in entries]
+        sam2_roi = None
+        for e in entries:
+            r = e[5] if len(e) > 5 else None
+            if r is not None:
+                sam2_roi = [float(x) for x in r[:4]]
+                break
         results.append({
             "frame_idx": frame_idx,
             "boxes": boxes,
@@ -1737,5 +1753,6 @@ def raw_tracks_to_per_frame(
             "confs": confs,
             "is_sam_refined": is_sam_refined,
             "segmentation_masks": segmentation_masks,
+            "sam2_input_roi_xyxy": sam2_roi,
         })
     return results

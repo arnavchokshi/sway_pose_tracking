@@ -2,6 +2,8 @@
 
 export type PruneEntry = Record<string, unknown>
 
+export type HybridSamRoiEntry = { frame_idx: number; roi_xyxy: number[] }
+
 export type PruneLogPayload = {
   video_path?: string
   native_fps?: number
@@ -11,11 +13,14 @@ export type PruneLogPayload = {
   tracker?: { count?: number; track_ids_before_prune?: number[] }
   surviving_after_pre_pose?: number[]
   surviving_after_post_pose?: number[]
+  /** Frames where hybrid SAM2 ran: region (xyxy, source pixels) passed to SAM. */
+  hybrid_sam_frame_rois?: HybridSamRoiEntry[]
   prune_entries?: PruneEntry[]
 }
 
 /** Only these phase preview files appear in Watch (full-length MP4s). */
 export const WATCH_PHASE_CLIP_FILES = [
+  '00_phase1_detections.mp4',
   '01_tracks_post_stitch.mp4',
   '02_pre_pose_prune.mp4',
   '03_pose.mp4',
@@ -23,7 +28,13 @@ export const WATCH_PHASE_CLIP_FILES = [
   '05_post_pose_prune.mp4',
 ] as const
 
-export type WatchPhaseId = 'track' | 'pre_pose' | 'pose' | 'collision' | 'post_pose'
+export type WatchPhaseId =
+  | 'phase1_dets'
+  | 'track'
+  | 'pre_pose'
+  | 'pose'
+  | 'collision'
+  | 'post_pose'
 
 export const WATCH_PHASE_ROWS: {
   file: (typeof WATCH_PHASE_CLIP_FILES)[number]
@@ -32,11 +43,18 @@ export const WATCH_PHASE_ROWS: {
   blurb: string
 }[] = [
   {
+    file: '00_phase1_detections.mp4',
+    id: 'phase1_dets',
+    title: 'Phase 1 · All detector boxes',
+    blurb:
+      'Every person detection passed to the tracker that frame (YOLO + pre-track NMS; hybrid SAM may refine boxes on BoxMOT path). Yellow boxes show detector confidence only — no track IDs. Stride-skipped frames reuse temporal blend from neighbors in the preview encoder.',
+  },
+  {
     file: '01_tracks_post_stitch.mp4',
     id: 'track',
     title: 'Phases 1–3 · Tracks after stitch',
     blurb:
-      'main.py [1–2/11] YOLO + tracker (+ Hybrid SAM on BoxMOT); then [3/11] post-track stitch / global link. Matches 01_tracks_post_stitch.mp4.',
+      'main.py [1–2/11] YOLO + BoxMOT Deep OC-SORT (optional track-time OSNet); Hybrid SAM when overlap refiner on. [3/11] post-track stitch / global link; optional SWAY_GNN_TRACK_REFINE hook after stitch. Orange dashed rectangle = SAM2 ROI that frame.',
   },
   {
     file: '02_pre_pose_prune.mp4',
@@ -49,7 +67,8 @@ export const WATCH_PHASE_ROWS: {
     file: '03_pose.mp4',
     id: 'pose',
     title: 'Phase 5 · Pose estimation',
-    blurb: 'ViTPose on surviving tracks; POSE_VISIBILITY_THRESHOLD in params.yaml when set.',
+    blurb:
+      'ViTPose or RTMPose-L (if installed) on surviving tracks. Recipe: pose model, stride (1 vs 2), gap interpolation (linear/GSI), POSE_VISIBILITY_THRESHOLD, optional SWAY_3D_LIFT for data.json / 3D viewer.',
   },
   {
     file: '04_phases_6_7.mp4',
@@ -159,7 +178,7 @@ export function pruneOverlayStyle(rule: string): PruneOverlayStyle {
 
 export function pruneEntriesForWatchPhase(phase: WatchPhaseId, entries: PruneEntry[]): PruneEntry[] {
   const list = entries ?? []
-  if (phase === 'track') return []
+  if (phase === 'phase1_dets' || phase === 'track') return []
   if (phase === 'pose') return []
   if (phase === 'pre_pose') {
     return list.filter((e) => PRE_POSE_RULES.has(pruneEntryRule(e)))
@@ -253,3 +272,18 @@ export const WATCH_OVERLAY_LEGEND: { label: string; color: string }[] = [
   { label: 'Tier C — weak skeleton', color: '#f87171' },
   { label: 'Tier B — weighted vote', color: '#dc2626' },
 ]
+
+/** Sparse list from prune_log.json → map frame index → xyxy (source pixels). */
+export function hybridSamRoiMap(
+  entries: HybridSamRoiEntry[] | undefined,
+): Map<number, [number, number, number, number]> {
+  const m = new Map<number, [number, number, number, number]>()
+  if (!entries?.length) return m
+  for (const e of entries) {
+    if (typeof e.frame_idx !== 'number' || !Array.isArray(e.roi_xyxy) || e.roi_xyxy.length < 4) continue
+    const q = e.roi_xyxy.map((x) => Number(x)) as [number, number, number, number]
+    if (!q.every((n) => Number.isFinite(n))) continue
+    m.set(Math.round(e.frame_idx), q)
+  }
+  return m
+}

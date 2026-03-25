@@ -27,6 +27,8 @@ class TrackObservation:
     Boolean mask aligned to bbox: shape (int(y2-y1), int(x2-x1)) for integer
     clip of bbox. True = dancer pixels from SAM; False = background/occluder.
     """
+    sam2_input_roi_xyxy: Optional[Tuple[float, float, float, float]] = None
+    """When hybrid SAM ran this frame: xyxy region passed to SAM2 (full frame = 0,0,w,h)."""
 
     def __iter__(self):
         yield self.frame_idx

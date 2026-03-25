@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
 import { API } from '../types'
+import type { Schema } from '../types'
 import { Pause, Play, SkipBack, SkipForward } from 'lucide-react'
+import { WATCH_PHASE_ROWS } from '../lib/watchPrune'
+import { TrackQualitySummary, PipelineImpactSummary, PipelineImpactReport } from '../components/RunMetrics'
+import { formatConfigValue } from '../lib/formatConfigValue'
 
 type RunDetail = {
   run_id: string
@@ -13,12 +17,10 @@ type RunDetail = {
     run_context_final?: {
       fields?: Record<string, unknown>
       track_summary?: Record<string, unknown>
+      pipeline_diagnostics?: Record<string, unknown>
     }
   }
 }
-
-import { WATCH_PHASE_ROWS } from '../lib/watchPrune'
-import { TrackQualitySummary } from '../components/RunMetrics'
 
 type Slot = {
   run_id: string
@@ -27,6 +29,7 @@ type Slot = {
   error: string | null
   fields?: Record<string, unknown>
   trackSummary?: Record<string, unknown>
+  pipelineDiagnostics?: Record<string, unknown>
 }
 
 function useSyncedVideos() {
@@ -109,6 +112,20 @@ export function ComparePage() {
 
   const [slots, setSlots] = useState<Slot[]>([])
   const [viewMode, setViewMode] = useState<string>('final')
+  const [labSchema, setLabSchema] = useState<Schema | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/schema`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s) => {
+        if (!cancelled && s && typeof s === 'object') setLabSchema(s as Schema)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     if (runIds.length < 2) {
@@ -146,6 +163,7 @@ export function ComparePage() {
               error,
               fields: data.manifest?.run_context_final?.fields,
               trackSummary: data.manifest?.run_context_final?.track_summary,
+              pipelineDiagnostics: data.manifest?.run_context_final?.pipeline_diagnostics,
             } satisfies Slot
           })
           .catch(() => ({
@@ -323,52 +341,102 @@ export function ComparePage() {
 
       {slots.length > 0 && (
         <div style={{ marginTop: '2rem' }}>
-          <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', color: '#fff' }}>Performance Metrics</h2>
+          <h2 style={{ fontSize: '1.25rem', marginBottom: '0.35rem', color: '#fff' }}>Tracking & pipeline impact</h2>
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5, maxWidth: 720 }}>
+            Heuristic track cards plus manifest diagnostics so you can see how hybrid SAM, interpolation, and global stitch differed
+            run-to-run — not just the final MP4.
+          </p>
           <div style={{ display: 'grid', gridTemplateColumns: `repeat(${slots.length}, minmax(320px, 1fr))`, gap: '1rem' }}>
-            {slots.map(s => (
+            {slots.map((s) => (
               <div key={s.run_id} className="glass-panel" style={{ padding: '1.25rem' }}>
-                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '0.5rem' }}>
-                  {s.label}
-                </div>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '0.5rem' }}>{s.label}</div>
                 <TrackQualitySummary summary={s.trackSummary || {}} />
+                <div style={{ marginTop: '0.85rem' }}>
+                  <PipelineImpactSummary diagnostics={s.pipelineDiagnostics} />
+                </div>
+                <details style={{ marginTop: '0.65rem' }}>
+                  <summary
+                    style={{
+                      cursor: 'pointer',
+                      color: 'var(--halo-cyan)',
+                      fontSize: '0.78rem',
+                      fontWeight: 600,
+                    }}
+                  >
+                    Full impact report
+                  </summary>
+                  <div style={{ marginTop: '0.5rem' }}>
+                    <PipelineImpactReport diagnostics={s.pipelineDiagnostics} />
+                  </div>
+                </details>
               </div>
             ))}
           </div>
 
-          <h2 style={{ fontSize: '1.25rem', margin: '2.5rem 0 1rem', color: '#fff' }}>Configuration Differences</h2>
+          <h2 style={{ fontSize: '1.25rem', margin: '2.5rem 0 0.35rem', color: '#fff' }}>Configuration differences</h2>
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5, maxWidth: 720 }}>
+            Only keys that differ between runs. Labels match the Lab when the schema is loaded; technical id shown below the label.
+          </p>
           <div className="glass-panel" style={{ padding: '1.25rem', overflowX: 'auto' }}>
             {(() => {
-              const allKeys = Array.from(new Set(slots.flatMap(s => Object.keys(s.fields || {}))))
-              const diffKeys = allKeys.filter(k => {
-                const vals = new Set(slots.map(s => JSON.stringify((s.fields || {})[k])))
-                return vals.size > 1
-              }).sort()
+              const allKeys = Array.from(new Set(slots.flatMap((s) => Object.keys(s.fields || {}))))
+              const diffKeys = allKeys
+                .filter((k) => {
+                  const vals = new Set(slots.map((s) => JSON.stringify((s.fields || {})[k])))
+                  return vals.size > 1
+                })
+                .sort()
+
+              const fieldLabel = (id: string) => labSchema?.fields.find((f) => f.id === id)?.label
 
               if (diffKeys.length === 0) {
-                return <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>No configuration differences found between these runs.</div>
+                return (
+                  <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                    No configuration differences found between these runs.
+                  </div>
+                )
               }
 
               return (
                 <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
                   <thead>
                     <tr>
-                      <th style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: 'var(--halo-cyan)', width: '25%' }}>Parameter</th>
-                      {slots.map(s => (
-                        <th key={s.run_id} style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: '#f8fafc' }}>
+                      <th
+                        style={{
+                          padding: '0.75rem',
+                          borderBottom: '1px solid var(--glass-border)',
+                          color: 'var(--halo-cyan)',
+                          width: '28%',
+                        }}
+                      >
+                        Parameter
+                      </th>
+                      {slots.map((s) => (
+                        <th
+                          key={s.run_id}
+                          style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: '#f8fafc' }}
+                        >
                           {s.label}
                         </th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {diffKeys.map(k => (
+                    {diffKeys.map((k) => (
                       <tr key={k} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                        <td style={{ padding: '0.75rem', color: 'var(--text-muted)', fontFamily: 'ui-monospace, monospace' }}>{k}</td>
-                        {slots.map(s => {
+                        <td style={{ padding: '0.75rem', color: 'var(--text-muted)', verticalAlign: 'top' }}>
+                          <div style={{ color: '#e2e8f0', fontWeight: 600 }}>{fieldLabel(k) ?? k}</div>
+                          {fieldLabel(k) && (
+                            <div style={{ fontSize: '0.72rem', fontFamily: 'ui-monospace, monospace', marginTop: '0.2rem', opacity: 0.85 }}>
+                              {k}
+                            </div>
+                          )}
+                        </td>
+                        {slots.map((s) => {
                           const val = (s.fields || {})[k]
                           return (
-                            <td key={s.run_id} style={{ padding: '0.75rem', color: '#fff', fontFamily: 'ui-monospace, monospace' }}>
-                              {val !== undefined ? JSON.stringify(val) : <span style={{ color: '#ef4444' }}>Missing</span>}
+                            <td key={s.run_id} style={{ padding: '0.75rem', color: '#fff', verticalAlign: 'top', lineHeight: 1.45 }}>
+                              {val !== undefined ? formatConfigValue(val) : <span style={{ color: '#ef4444' }}>Missing</span>}
                             </td>
                           )
                         })}

@@ -1,3 +1,5 @@
+export { PipelineImpactReport, FriendlyRunConfig, PipelineImpactSummary, RunOverviewStrip } from './PipelineImpactReport'
+
 export function TrackQualitySummary({ summary }: { summary: Record<string, unknown> }) {
   const count = typeof summary.track_count === 'number' ? summary.track_count : null
   const med = typeof summary.median_track_observations === 'number' ? summary.median_track_observations : null
@@ -27,19 +29,19 @@ export function TrackQualitySummary({ summary }: { summary: Record<string, unkno
     },
     {
       label: 'IDF1 / HOTA',
-      value: '—',
-      hint: 'Require MOT ground truth. Use python -m tools.benchmark_trackeval or python -m tools.run_trackeval_boxmot_ablation.',
+      value: 'N/A',
+      hint: 'Not computed in the Lab UI. Need MOT ground-truth labels; run TrackEval offline (tools.benchmark_trackeval, run_trackeval_boxmot_ablation).',
     },
     {
       label: 'IDSW',
-      value: '—',
-      hint: 'Identity switches need GT. The jump count above is a no-GT heuristic only.',
+      value: 'N/A',
+      hint: 'Not computed without GT. “Timeline jumps” above is only a no-GT heuristic.',
     },
   ]
   return (
     <div style={{ marginTop: '0.5rem' }}>
       <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '0.45rem' }}>
-        Tracking quality (no ground truth)
+        Track stats (no MOT / GT labels)
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '0.5rem' }}>
         {cards.map((c) => (
@@ -63,27 +65,6 @@ export function TrackQualitySummary({ summary }: { summary: Record<string, unkno
       {note && (
         <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.5rem', lineHeight: 1.45 }}>{note}</div>
       )}
-    </div>
-  )
-}
-
-export function RunConfigDisplay({ fields }: { fields?: Record<string, unknown> }) {
-  if (!fields || Object.keys(fields).length === 0) {
-    return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>No configuration data available.</div>
-  }
-  return (
-    <div style={{ marginTop: '0.5rem' }}>
-      <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '0.45rem' }}>
-        Run Configuration
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.4rem', fontSize: '0.75rem' }}>
-        {Object.entries(fields).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => (
-          <div key={k} style={{ display: 'flex', flexDirection: 'column', background: 'rgba(0,0,0,0.2)', padding: '0.4rem 0.5rem', borderRadius: 6, border: '1px solid var(--glass-border)' }}>
-            <span style={{ color: 'var(--text-muted)', fontSize: '0.65rem', marginBottom: '0.1rem', wordBreak: 'break-all' }}>{k}</span>
-            <span style={{ color: '#fff', fontFamily: 'ui-monospace, monospace' }}>{JSON.stringify(v)}</span>
-          </div>
-        ))}
-      </div>
     </div>
   )
 }

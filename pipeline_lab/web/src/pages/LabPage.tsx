@@ -15,7 +15,7 @@ import { isProbableVideoFile, VIDEO_ACCEPT_ATTR } from '../lib/videoFile'
 import { useLab } from '../context/LabContext'
 import { RunEditorModal } from '../components/RunEditorModal'
 import { RunConfigModal } from '../components/RunConfigModal'
-import { TrackQualitySummary } from '../components/RunMetrics'
+import { TrackQualitySummary, PipelineImpactSummary } from '../components/RunMetrics'
 import {
   Play,
   Plus,
@@ -35,10 +35,13 @@ import {
   Unplug,
   RotateCw,
   Upload,
+  ListChecks,
 } from 'lucide-react'
 function formatShortId(runId: string) {
   return runId.length > 12 ? `${runId.slice(0, 8)}…` : runId
 }
+
+const MATRIX_HIDDEN_STORAGE_KEY = 'sway_lab_matrix_hidden_recipes'
 
 function formatCreated(iso?: string) {
   if (!iso) return null
@@ -451,6 +454,24 @@ export function LabPage() {
   const dropDepthRef = useRef(0)
   const [dropActive, setDropActive] = useState(false)
 
+  type MatrixRecipeRow = {
+    id: string
+    recipe_name: string
+    description?: string
+    varies?: string
+    fields: Record<string, unknown>
+  }
+  type MatrixPayload = { version: number; intro: string; recipes: MatrixRecipeRow[] }
+  const [matrixPayload, setMatrixPayload] = useState<MatrixPayload | null>(null)
+  const [matrixLoadError, setMatrixLoadError] = useState<string | null>(null)
+  const [matrixHiddenRecipeIds, setMatrixHiddenRecipeIds] = useState<string[]>([])
+  const [matrixSelectedIds, setMatrixSelectedIds] = useState<string[]>([])
+  const [matrixPathInput, setMatrixPathInput] = useState('')
+  const [matrixQueueing, setMatrixQueueing] = useState(false)
+  const [matrixBannerError, setMatrixBannerError] = useState<string | null>(null)
+  const lastMatrixVersionRef = useRef<number | null>(null)
+  const [deletingAllRuns, setDeletingAllRuns] = useState(false)
+
   const applyVideoFile = useCallback(
     (file?: File) => {
       if (!file) return
@@ -487,6 +508,146 @@ export function LabPage() {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    setMatrixLoadError(null)
+    fetch(`${API}/api/pipeline_matrix`)
+      .then(async (r) => {
+        const text = await r.text()
+        if (!r.ok) throw new Error(`pipeline_matrix HTTP ${r.status}`)
+        return JSON.parse(text) as MatrixPayload
+      })
+      .then((p) => {
+        if (!cancelled) setMatrixPayload(p)
+      })
+      .catch((e) => {
+        if (!cancelled) setMatrixLoadError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!matrixPayload?.recipes?.length) return
+    const v = matrixPayload.version ?? 0
+    if (lastMatrixVersionRef.current === v) return
+    lastMatrixVersionRef.current = v
+    let hidden: string[] = []
+    try {
+      const raw = localStorage.getItem(MATRIX_HIDDEN_STORAGE_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw) as { version?: number; ids?: string[] }
+        if (parsed.version === v && Array.isArray(parsed.ids)) {
+          hidden = parsed.ids.filter((id) => matrixPayload.recipes.some((r) => r.id === id))
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    setMatrixHiddenRecipeIds(hidden)
+    const hiddenSet = new Set(hidden)
+    setMatrixSelectedIds(matrixPayload.recipes.filter((r) => !hiddenSet.has(r.id)).map((r) => r.id))
+  }, [matrixPayload])
+
+  const visibleMatrixRecipes = useMemo(() => {
+    if (!matrixPayload?.recipes?.length) return []
+    const h = new Set(matrixHiddenRecipeIds)
+    return matrixPayload.recipes.filter((r) => !h.has(r.id))
+  }, [matrixPayload, matrixHiddenRecipeIds])
+
+  const persistMatrixHiddenIds = useCallback(
+    (ids: string[]) => {
+      if (!matrixPayload) return
+      const v = matrixPayload.version ?? 0
+      try {
+        localStorage.setItem(MATRIX_HIDDEN_STORAGE_KEY, JSON.stringify({ version: v, ids }))
+      } catch {
+        /* ignore */
+      }
+    },
+    [matrixPayload],
+  )
+
+  const hideMatrixRecipes = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return
+      setMatrixHiddenRecipeIds((prev) => {
+        const next = [...new Set([...prev, ...ids])]
+        persistMatrixHiddenIds(next)
+        return next
+      })
+      setMatrixSelectedIds((p) => p.filter((x) => !ids.includes(x)))
+    },
+    [persistMatrixHiddenIds],
+  )
+
+  const restoreMatrixRecipes = useCallback(() => {
+    setMatrixHiddenRecipeIds([])
+    try {
+      localStorage.removeItem(MATRIX_HIDDEN_STORAGE_KEY)
+    } catch {
+      /* ignore */
+    }
+    if (matrixPayload?.recipes?.length) {
+      setMatrixSelectedIds(matrixPayload.recipes.map((r) => r.id))
+    }
+  }, [matrixPayload])
+
+  const toggleMatrixRecipe = useCallback((id: string) => {
+    setMatrixSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }, [])
+
+  const queueMatrixFromServerPath = useCallback(async () => {
+    setMatrixBannerError(null)
+    if (!matrixPayload?.recipes?.length) {
+      window.alert('Pipeline matrix is not loaded yet.')
+      return
+    }
+    const p = matrixPathInput.trim()
+    if (!p) {
+      window.alert('Enter the full path to the video on the machine running the Lab API (e.g. /Users/you/Desktop/clip.mp4).')
+      return
+    }
+    const sel = new Set(matrixSelectedIds)
+    const runs = matrixPayload.recipes
+      .filter((r) => sel.has(r.id))
+      .map((r) => ({ recipe_name: r.recipe_name, fields: { ...r.fields } }))
+    if (runs.length === 0) {
+      window.alert('Select at least one matrix recipe.')
+      return
+    }
+    setMatrixQueueing(true)
+    try {
+      const r = await fetch(`${API}/api/runs/batch_path`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          video_path: p,
+          runs,
+          source_label: '',
+        }),
+      })
+      const text = await r.text()
+      if (!r.ok) {
+        let msg = `Queue failed (HTTP ${r.status})`
+        try {
+          const j = JSON.parse(text) as { detail?: string }
+          if (typeof j.detail === 'string') msg = j.detail
+        } catch {
+          if (text.trim()) msg = text.slice(0, 280)
+        }
+        throw new Error(msg)
+      }
+      const j = JSON.parse(text) as { run_ids: string[] }
+      setSessionRunIds(j.run_ids)
+    } catch (e) {
+      setMatrixBannerError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMatrixQueueing(false)
+    }
+  }, [matrixPayload, matrixPathInput, matrixSelectedIds, setSessionRunIds])
 
   useEffect(() => {
     if (!labHydrated || !videoFile || !schema || drafts.length > 0 || sessionRunIds.length > 0) return
@@ -677,8 +838,6 @@ export function LabPage() {
     [runRows, setSessionRunIds],
   )
 
-
-
   const startAll = () => {
     if (!videoFile || !schema || drafts.length === 0 || starting) return
     setBatchError(null)
@@ -736,6 +895,60 @@ export function LabPage() {
       }),
     [sessionRunIds, runRows],
   )
+
+  const deleteAllSessionRuns = useCallback(async () => {
+    if (sessionRunIds.length === 0) return
+    const blocking = sessionRunsOrdered.filter(
+      ({ run }) => run.status === 'running' && run.subprocess_alive === true,
+    )
+    if (blocking.length > 0) {
+      window.alert(
+        `Stop ${blocking.length} active run(s) first, or wait until they finish — a live pipeline process is still attached.`,
+      )
+      return
+    }
+    if (
+      !window.confirm(
+        `Delete all ${sessionRunIds.length} run(s) in this batch from disk? Outputs, logs, and previews will be removed. This cannot be undone.`,
+      )
+    ) {
+      return
+    }
+    setDeletingAllRuns(true)
+    try {
+      const ids = [...sessionRunIds]
+      const remaining: string[] = []
+      for (const id of ids) {
+        const r = await fetch(`${API}/api/runs/${id}`, { method: 'DELETE' })
+        if (r.status === 204 || r.status === 404) continue
+        remaining.push(id)
+      }
+      setSessionRunIds(remaining)
+      setRunRows((prev) => prev.filter((x) => remaining.includes(x.run_id)))
+      setProgressByRun((prev) => {
+        const next = { ...prev }
+        for (const id of ids) {
+          if (!remaining.includes(id)) delete next[id]
+        }
+        return next
+      })
+      setLogByRun((prev) => {
+        const next = { ...prev }
+        for (const id of ids) {
+          if (!remaining.includes(id)) delete next[id]
+        }
+        return next
+      })
+      setConfigRunId((cur) => (cur && remaining.includes(cur) ? cur : null))
+      if (remaining.length > 0) {
+        window.alert(
+          `Could not remove ${remaining.length} run folder(s) (still running, or server error). Short IDs: ${remaining.map(formatShortId).join(', ')}`,
+        )
+      }
+    } finally {
+      setDeletingAllRuns(false)
+    }
+  }, [sessionRunIds, sessionRunsOrdered, setSessionRunIds])
 
   const batchStats = useMemo(() => {
     let done = 0
@@ -811,6 +1024,169 @@ export function LabPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
+      <div className="glass-panel" style={{ padding: '1.25rem' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+          <h2 style={{ margin: 0, fontSize: '1.05rem', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <ListChecks size={20} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
+            Pipeline matrix (server path)
+          </h2>
+          <button
+            type="button"
+            className="btn primary"
+            disabled={matrixQueueing || !matrixPayload}
+            onClick={() => void queueMatrixFromServerPath()}
+          >
+            {matrixQueueing ? 'Queueing…' : `Queue ${matrixSelectedIds.length} run(s)`}
+          </button>
+        </div>
+        <p style={{ margin: '0.5rem 0 0', fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 720 }}>
+          A/B recipes are defined in code (<code style={{ color: 'var(--halo-cyan)' }}>sway/pipeline_matrix_presets.py</code>
+          ) — each varies one stage vs. defaults. The path must exist on the computer running{' '}
+          <code style={{ color: 'var(--halo-cyan)' }}>uvicorn</code>, not necessarily your browser. CLI:{' '}
+          <code style={{ color: '#e2e8f0' }}>python -m tools.pipeline_matrix_runs --video /path/to/file.mp4</code>
+        </p>
+        {matrixLoadError && <p style={{ color: '#f87171', marginTop: '0.65rem', marginBottom: 0 }}>{matrixLoadError}</p>}
+        {matrixBannerError && <p style={{ color: '#f87171', marginTop: '0.65rem', marginBottom: 0 }}>{matrixBannerError}</p>}
+        <label style={{ display: 'block', marginTop: '0.85rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+          Video path on API server
+          <input
+            type="text"
+            value={matrixPathInput}
+            onChange={(e) => setMatrixPathInput(e.target.value)}
+            placeholder="/Users/you/Desktop/IMG_2946.MP4"
+            style={{
+              display: 'block',
+              width: '100%',
+              maxWidth: 640,
+              marginTop: '0.35rem',
+              padding: '0.5rem 0.65rem',
+              borderRadius: 8,
+              border: '1px solid var(--glass-border)',
+              background: 'rgba(0,0,0,0.25)',
+              color: '#e2e8f0',
+              fontSize: '0.88rem',
+            }}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        {matrixPayload && (
+          <>
+            <p style={{ margin: '0.75rem 0 0', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{matrixPayload.intro}</p>
+            <div style={{ marginTop: '0.65rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              <button
+                type="button"
+                className="btn"
+                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
+                onClick={() => setMatrixSelectedIds(visibleMatrixRecipes.map((x) => x.id))}
+              >
+                Select all
+              </button>
+              <button
+                type="button"
+                className="btn"
+                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
+                onClick={() => setMatrixSelectedIds([])}
+              >
+                Clear selection
+              </button>
+              <button
+                type="button"
+                className="btn"
+                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
+                disabled={matrixSelectedIds.length === 0}
+                onClick={() => hideMatrixRecipes(matrixSelectedIds)}
+                title="Hide selected recipes from this list (this browser only)"
+              >
+                Remove selected
+              </button>
+              {matrixHiddenRecipeIds.length > 0 && (
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
+                  onClick={restoreMatrixRecipes}
+                  title="Show all hidden matrix recipes again"
+                >
+                  Restore hidden ({matrixHiddenRecipeIds.length})
+                </button>
+              )}
+            </div>
+            <div
+              style={{
+                marginTop: '0.65rem',
+                maxHeight: 220,
+                overflow: 'auto',
+                borderRadius: 10,
+                border: '1px solid var(--glass-border)',
+                background: 'rgba(0,0,0,0.2)',
+              }}
+            >
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: 'var(--text-muted)' }}>
+                    <th style={{ padding: '0.45rem 0.5rem', width: 36 }} />
+                    <th style={{ padding: '0.45rem 0.5rem' }}>Recipe</th>
+                    <th style={{ padding: '0.45rem 0.5rem' }}>Axis</th>
+                    <th style={{ padding: '0.45rem 0.5rem', width: 44 }} aria-label="Remove from list" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleMatrixRecipes.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} style={{ padding: '0.75rem 0.5rem', color: 'var(--text-muted)', textAlign: 'center' }}>
+                        All recipes are hidden in this browser. Use “Restore hidden” to show them again.
+                      </td>
+                    </tr>
+                  ) : (
+                    visibleMatrixRecipes.map((row) => (
+                      <tr key={row.id} style={{ borderTop: '1px solid var(--glass-border)' }}>
+                        <td style={{ padding: '0.35rem 0.5rem', verticalAlign: 'top' }}>
+                          <input
+                            type="checkbox"
+                            checked={matrixSelectedIds.includes(row.id)}
+                            onChange={() => toggleMatrixRecipe(row.id)}
+                            aria-label={`Include ${row.recipe_name}`}
+                          />
+                        </td>
+                        <td style={{ padding: '0.45rem 0.5rem', color: '#e2e8f0', verticalAlign: 'top' }}>
+                          <div style={{ fontWeight: 600 }}>{row.recipe_name}</div>
+                          {row.description && (
+                            <div style={{ color: 'var(--text-muted)', marginTop: '0.2rem', lineHeight: 1.45 }}>{row.description}</div>
+                          )}
+                        </td>
+                        <td style={{ padding: '0.45rem 0.5rem', color: 'var(--text-muted)', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
+                          {row.varies ?? '—'}
+                        </td>
+                        <td style={{ padding: '0.35rem 0.5rem', verticalAlign: 'top', textAlign: 'right' }}>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{
+                              padding: '0.25rem',
+                              minWidth: 32,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              color: 'var(--text-muted)',
+                            }}
+                            aria-label={`Remove ${row.recipe_name} from list`}
+                            title="Hide this recipe from the list (this browser only)"
+                            onClick={() => hideMatrixRecipes([row.id])}
+                          >
+                            <Trash2 size={14} strokeWidth={2} aria-hidden />
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+
       {/* Step 1: no video yet — empty Lab was rendering nothing here before */}
       {!videoFile && (
         <div className="glass-panel" style={{ padding: '1.5rem' }}>
@@ -994,6 +1370,15 @@ export function LabPage() {
                   <Plus size={16} /> New runs (same video)
                 </button>
               )}
+              <button
+                type="button"
+                className="btn"
+                disabled={deletingAllRuns}
+                style={{ color: '#f87171', borderColor: 'rgba(248,113,113,0.35)' }}
+                onClick={() => void deleteAllSessionRuns()}
+              >
+                <Trash2 size={16} /> {deletingAllRuns ? 'Deleting…' : 'Delete all in batch'}
+              </button>
             </div>
           </div>
 
@@ -1244,14 +1629,45 @@ export function LabPage() {
                   )}
 
                   {isDone && (
-                    <button
-                      type="button"
-                      className="btn primary"
-                      style={{ marginTop: '0.25rem', width: '100%' }}
-                      onClick={() => nav(`/watch/${run.run_id}`)}
-                    >
-                      <Play size={16} /> Watch results
-                    </button>
+                    <>
+                      <div
+                        style={{
+                          marginTop: '0.65rem',
+                          padding: '0.65rem 0.75rem',
+                          borderRadius: 10,
+                          border: '1px solid rgba(34, 211, 238, 0.2)',
+                          background: 'rgba(15, 23, 42, 0.45)',
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: '0.62rem',
+                            fontWeight: 700,
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.06em',
+                            color: '#94a3b8',
+                            marginBottom: '0.35rem',
+                          }}
+                        >
+                          Pipeline impact (manifest)
+                        </div>
+                        <PipelineImpactSummary
+                          diagnostics={
+                            run.manifest?.run_context_final?.pipeline_diagnostics as
+                              | Record<string, unknown>
+                              | undefined
+                          }
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="btn primary"
+                        style={{ marginTop: '0.65rem', width: '100%' }}
+                        onClick={() => nav(`/watch/${run.run_id}`)}
+                      >
+                        <Play size={16} /> Watch results
+                      </button>
+                    </>
                   )}
                   {isErr && (
                     <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>

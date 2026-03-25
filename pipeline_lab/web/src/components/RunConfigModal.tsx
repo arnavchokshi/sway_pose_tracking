@@ -2,13 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { API } from '../types'
 import type { Schema } from '../types'
 import { X, ClipboardList, Loader2 } from 'lucide-react'
-
-function formatValue(v: unknown): string {
-  if (v === null || v === undefined) return '—'
-  if (typeof v === 'boolean') return v ? 'On' : 'Off'
-  if (typeof v === 'object') return JSON.stringify(v)
-  return String(v)
-}
+import { formatConfigValue } from '../lib/formatConfigValue'
+import { FriendlyRunConfig } from './PipelineImpactReport'
 
 type ConfigPayload = {
   recipe_name: string
@@ -82,12 +77,12 @@ export function RunConfigModal({
       for (const f of schema.fields) {
         if (!(f.id in fields)) continue
         seen.add(f.id)
-        rows.push({ id: f.id, label: f.label, value: formatValue(fields[f.id]) })
+        rows.push({ id: f.id, label: f.label, value: formatConfigValue(fields[f.id]) })
       }
     }
     for (const id of Object.keys(fields).sort()) {
       if (seen.has(id)) continue
-      rows.push({ id, label: id, value: formatValue(fields[id]) })
+      rows.push({ id, label: id, value: formatConfigValue(fields[id]) })
     }
     return rows
   }, [data, schema])
@@ -200,7 +195,9 @@ export function RunConfigModal({
                   <span style={{ fontStyle: 'italic' }}>Raw request.json</span> below if the stored file still has an empty{' '}
                   <span style={{ fontFamily: 'ui-monospace, monospace' }}>fields</span> object from an older Lab version.
                 </div>
-                {orderedRows.length === 0 ? (
+                {schema ? (
+                  <FriendlyRunConfig fields={data.fields} schemaFields={schema.fields} stages={schema.stages} />
+                ) : orderedRows.length === 0 ? (
                   <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>No tunable fields to show.</div>
                 ) : (
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>

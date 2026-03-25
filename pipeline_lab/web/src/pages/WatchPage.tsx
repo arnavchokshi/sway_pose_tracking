@@ -21,9 +21,13 @@ import {
   pruneEntryRule,
   pruneEntryVisibleAtFrame,
   sortPruneEntriesForUi,
+  hybridSamRoiMap,
 } from '../lib/watchPrune'
+import { WATCH_PHASE_TUNING_FIELD_IDS } from '../lib/watchPhaseTuning'
+import { formatConfigValue } from '../lib/formatConfigValue'
 import { ArrowLeft, Box, Clapperboard, Film, RotateCw, Search, Gauge } from 'lucide-react'
-import { TrackQualitySummary, RunConfigDisplay } from '../components/RunMetrics'
+import { TrackQualitySummary, PipelineImpactReport, FriendlyRunConfig, RunOverviewStrip } from '../components/RunMetrics'
+import type { Schema } from '../types'
 
 type RunDetail = {
   run_id: string
@@ -33,9 +37,13 @@ type RunDetail = {
   manifest?: {
     final_video_relpath?: string
     view_variants?: Record<string, string>
+    /** Subset of SWAY_* env written for run diffing (see Lab manifest). */
+    env?: Record<string, unknown>
     run_context_final?: {
       track_summary?: Record<string, unknown>
       fields?: Record<string, unknown>
+      pipeline_diagnostics?: Record<string, unknown>
+      recipe_name?: string
     }
   }
 }
@@ -61,6 +69,111 @@ function clipFilename(rel: string): string {
   return i >= 0 ? rel.slice(i + 1) : rel
 }
 
+function WatchPhaseTuningBlock({
+  phaseId,
+  fields,
+  schema,
+}: {
+  phaseId: WatchPhaseId
+  fields: Record<string, unknown>
+  schema: Schema | null
+}) {
+  const ids = WATCH_PHASE_TUNING_FIELD_IDS[phaseId]
+  const labelById = new Map(schema?.fields.map((f) => [f.id, f.label]) ?? [])
+  const rows = ids
+    .map((id) => ({ id, label: labelById.get(id) ?? id, raw: fields[id] }))
+    .filter((r) => Object.prototype.hasOwnProperty.call(fields, r.id))
+  if (rows.length === 0) {
+    return (
+      <div
+        style={{
+          marginBottom: '0.75rem',
+          padding: '0.5rem 0.65rem',
+          borderRadius: 8,
+          background: 'rgba(15, 23, 42, 0.35)',
+          border: '1px solid rgba(148, 163, 184, 0.18)',
+        }}
+      >
+        <div
+          style={{
+            fontSize: '0.65rem',
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            color: '#64748b',
+            marginBottom: '0.35rem',
+          }}
+        >
+          Recipe knobs for this stage
+        </div>
+        <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+          {!schema?.fields?.length ? (
+            <>
+              Start the Lab API so <code style={{ fontSize: '0.65rem' }}>/api/schema</code> loads field labels.
+            </>
+          ) : (
+            <>
+              No settings from your recipe map to this preview (defaults only, or not in the run snapshot). Open{' '}
+              <strong style={{ color: '#94a3b8' }}>Metrics &amp; Config</strong> for the full effective configuration.
+            </>
+          )}
+        </p>
+      </div>
+    )
+  }
+  return (
+    <div
+      style={{
+        marginBottom: '0.75rem',
+        padding: '0.55rem 0.65rem',
+        borderRadius: 8,
+        background: 'rgba(14, 165, 233, 0.06)',
+        border: '1px solid rgba(14, 165, 233, 0.22)',
+      }}
+    >
+      <div
+        style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          textTransform: 'uppercase',
+          letterSpacing: '0.06em',
+          color: '#7dd3fc',
+          marginBottom: '0.45rem',
+        }}
+      >
+        Recipe knobs for this stage
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: 220, overflowY: 'auto' }}>
+        {rows.map((r) => (
+          <div
+            key={r.id}
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+              gap: '0.5rem',
+              fontSize: '0.72rem',
+              lineHeight: 1.4,
+            }}
+            title={r.id}
+          >
+            <span style={{ color: 'var(--text-muted)', flex: '1 1 auto' }}>{r.label}</span>
+            <span style={{ color: '#e2e8f0', fontFamily: 'ui-monospace, monospace', flexShrink: 0 }}>
+              {formatConfigValue(r.raw)}
+            </span>
+          </div>
+        ))}
+      </div>
+      {!schema?.fields?.length && (
+        <div style={{ fontSize: '0.65rem', color: '#94a3b8', marginTop: '0.35rem', lineHeight: 1.4 }}>
+          Start the Lab API (<code style={{ fontSize: '0.6rem' }}>uvicorn …</code>) so labels load from{' '}
+          <code style={{ fontSize: '0.6rem' }}>/api/schema</code>.
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** Map bbox from video pixel space onto the letterboxed `object-fit: contain` video element. */
 function videoContainContentRect(video: HTMLVideoElement): {
   left: number
@@ -83,6 +196,50 @@ function videoContainContentRect(video: HTMLVideoElement): {
     w: dw,
     h: dh,
     scale,
+  }
+}
+
+/** Live overlay: dashed box + label in letterboxed video coordinates (matches burned-in preview). */
+function sam2RoiLayerStyles(
+  roi: [number, number, number, number],
+  video: HTMLVideoElement,
+): { box: CSSProperties; label: CSSProperties } | null {
+  const c = videoContainContentRect(video)
+  if (!c) return null
+  const [x1, y1, x2, y2] = roi
+  const left = c.left + x1 * c.scale
+  const top = c.top + y1 * c.scale
+  const width = Math.max(0, (x2 - x1) * c.scale)
+  const height = Math.max(0, (y2 - y1) * c.scale)
+  const labelTop = Math.max(c.top + 4, top - 22)
+  return {
+    box: {
+      position: 'absolute',
+      left,
+      top,
+      width,
+      height,
+      pointerEvents: 'none',
+      boxSizing: 'border-box',
+      border: '2px dashed rgba(255, 140, 0, 0.92)',
+      borderRadius: 6,
+      boxShadow: '0 0 0 1px rgba(0,0,0,0.45)',
+      zIndex: 3,
+    },
+    label: {
+      position: 'absolute',
+      left,
+      top: labelTop,
+      pointerEvents: 'none',
+      fontSize: '0.68rem',
+      fontWeight: 700,
+      letterSpacing: '0.06em',
+      textTransform: 'uppercase',
+      color: '#ffb020',
+      textShadow: '0 0 8px rgba(0,0,0,0.95)',
+      whiteSpace: 'nowrap',
+      zIndex: 4,
+    },
   }
 }
 
@@ -380,7 +537,25 @@ export function WatchPage() {
   const [selectedPruneKey, setSelectedPruneKey] = useState<string | null>(null)
   const [videoFocusStyle, setVideoFocusStyle] = useState<CSSProperties>({})
   const [rerunning, setRerunning] = useState(false)
+  /** Playback frame index (for hybrid SAM ROI overlay on track phase). */
+  const [playFrame, setPlayFrame] = useState(0)
+  /** Bumps when the video wrapper resizes so SAM2 overlay rescales with letterbox. */
+  const [samOverlayLayout, setSamOverlayLayout] = useState(0)
   const initialModeSet = useRef(false)
+  const [labSchema, setLabSchema] = useState<Schema | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/schema`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s) => {
+        if (!cancelled && s && typeof s === 'object') setLabSchema(s as Schema)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     initialModeSet.current = false
@@ -409,7 +584,11 @@ export function WatchPage() {
         .then(([data, prog]) => {
           if (cancelled) return
           setRun(data)
-          setTitle(data.recipe_name || data.run_id.slice(0, 8))
+          setTitle(
+            data.recipe_name ||
+              (data.manifest?.run_context_final?.recipe_name as string | undefined) ||
+              data.run_id.slice(0, 8),
+          )
           setProgress(Array.isArray(prog) ? prog : [])
         })
         .catch((e) => {
@@ -498,6 +677,11 @@ export function WatchPage() {
 
   const nativeFps = pruneLog?.native_fps && pruneLog.native_fps > 0 ? pruneLog.native_fps : 30
 
+  const samRoiMap = useMemo(
+    () => hybridSamRoiMap(pruneLog?.hybrid_sam_frame_rois),
+    [pruneLog?.hybrid_sam_frame_rois],
+  )
+
   const showPruneAside = mode === 'phase' && Boolean(activePhase)
   const gridTemplateColumns =
     mode === 'final'
@@ -546,6 +730,30 @@ export function WatchPage() {
   }, [run, phaseTabs.length, finalVariants.length])
 
   const currentPhaseId: WatchPhaseId | null = activePhase?.id ?? null
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const bump = () => setPlayFrame(Math.max(0, Math.floor(v.currentTime * nativeFps)))
+    bump()
+    v.addEventListener('timeupdate', bump)
+    v.addEventListener('seeked', bump)
+    v.addEventListener('loadedmetadata', bump)
+    return () => {
+      v.removeEventListener('timeupdate', bump)
+      v.removeEventListener('seeked', bump)
+      v.removeEventListener('loadedmetadata', bump)
+    }
+  }, [activeSrc, nativeFps])
+
+  useEffect(() => {
+    const w = videoWrapRef.current
+    if (!w) return
+    const ro = new ResizeObserver(() => setSamOverlayLayout((n) => n + 1))
+    ro.observe(w)
+    return () => ro.disconnect()
+  }, [activeSrc])
+
   const phasePruneEntries = useMemo(() => {
     if (!currentPhaseId) return []
     const raw = pruneLog?.prune_entries ?? []
@@ -674,14 +882,19 @@ export function WatchPage() {
     const tf = pruneLog.total_frames
     const fps = pruneLog.native_fps
     const tr = pruneLog.tracker
+    const rois = pruneLog.hybrid_sam_frame_rois
+    const hybridSamFrames = Array.isArray(rois) ? rois.length : 0
     return {
       videoLabel: pruneLog.video_path ? basenamePath(pruneLog.video_path) : null,
       resolution: w && h ? `${w}×${h}` : null,
       frames: tf,
       fps,
       tracksIn: tr?.count,
+      hybridSamFrames,
     }
   }, [pruneLog])
+
+  const manifestFields = run?.manifest?.run_context_final?.fields
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', maxWidth: 1400, margin: '0 auto' }}>
@@ -705,6 +918,12 @@ export function WatchPage() {
             <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
               {id?.slice(0, 8)}…{run?.status ? ` · ${run.status}` : ''}
             </div>
+            {isDone && (manifestFields || run?.manifest?.run_context_final?.pipeline_diagnostics) ? (
+              <RunOverviewStrip
+                fields={manifestFields ?? null}
+                diagnostics={run.manifest?.run_context_final?.pipeline_diagnostics ?? null}
+              />
+            ) : null}
           </div>
         </div>
         <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -726,16 +945,14 @@ export function WatchPage() {
           )}
           <button
             type="button"
-            className={`btn ${mode === 'metrics' ? 'primary' : ''}`}
-            onClick={() => setMode('metrics')}
-          >
-            <Gauge size={16} /> Metrics & Config
-          </button>
-          <button
-            type="button"
             className={`btn ${mode === 'phase' ? 'primary' : ''}`}
             onClick={() => setMode('phase')}
-            disabled={phaseTabs.length === 0}
+            disabled={!isDone && phaseTabs.length === 0}
+            title={
+              phaseTabs.length === 0 && isDone
+                ? 'No phase preview MP4s — enable phase previews in the Lab recipe (Export) and re-run'
+                : undefined
+            }
           >
             <Clapperboard size={16} /> Pipeline
           </button>
@@ -746,6 +963,13 @@ export function WatchPage() {
             disabled={finalVariants.length === 0}
           >
             <Film size={16} /> Final render
+          </button>
+          <button
+            type="button"
+            className={`btn ${mode === 'metrics' ? 'primary' : ''}`}
+            onClick={() => setMode('metrics')}
+          >
+            <Gauge size={16} /> Metrics & Config
           </button>
         </div>
       </header>
@@ -783,6 +1007,19 @@ export function WatchPage() {
         </div>
       )}
 
+      {!err && run && mode === 'phase' && phaseTabs.length === 0 && (
+        <div className="glass-panel" style={{ padding: '0.85rem 1rem' }}>
+          <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: '0.45rem' }}>
+            Stage preview
+          </div>
+          <p style={{ margin: 0, fontSize: '0.85rem', color: '#e2e8f0', lineHeight: 1.55, maxWidth: 640 }}>
+            No phase preview videos for this run. In the Lab, open your recipe&apos;s <strong style={{ color: '#7dd3fc' }}>Export</strong>{' '}
+            step and enable phase preview MP4s, then re-run. Use <strong style={{ color: '#7dd3fc' }}>Final render</strong> or{' '}
+            <strong style={{ color: '#7dd3fc' }}>Metrics &amp; Config</strong> meanwhile.
+          </p>
+        </div>
+      )}
+
       {!err && run && mode === 'final' && (
         <div className="glass-panel" style={{ padding: '0.85rem 1rem' }}>
           <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
@@ -812,15 +1049,68 @@ export function WatchPage() {
 
       {!err && run && mode === 'metrics' && (
         <div className="glass-panel" style={{ padding: '1.25rem' }}>
-          <h2 style={{ fontSize: '1.1rem', margin: '0 0 1rem', color: '#fff' }}>Run Metrics & Config</h2>
-          
-          <div style={{ marginBottom: '2rem' }}>
+          <h2 style={{ fontSize: '1.1rem', margin: '0 0 0.75rem', color: '#fff' }}>Run metrics & configuration</h2>
+          <p
+            style={{
+              fontSize: '0.82rem',
+              color: 'var(--text-muted)',
+              margin: '0 0 1.25rem',
+              lineHeight: 1.55,
+              maxWidth: 760,
+            }}
+          >
+            <strong style={{ color: '#e2e8f0' }}>Tracks</strong> — counts and heuristics only (no MOT ground truth).{' '}
+            <strong style={{ color: '#e2e8f0' }}>What changed</strong> — hybrid SAM, interpolation, stitch, stage timing, and
+            experimental flags from the manifest. <strong style={{ color: '#e2e8f0' }}>Configuration</strong> — same field groups as
+            the Lab, plus raw <code style={{ fontSize: '0.78rem' }}>SWAY_*</code> env below.
+          </p>
+
+          <div style={{ marginBottom: '1.75rem' }}>
             <TrackQualitySummary summary={run.manifest?.run_context_final?.track_summary || {}} />
           </div>
-          
-          <div>
-            <RunConfigDisplay fields={run.manifest?.run_context_final?.fields} />
+
+          <div style={{ marginBottom: '1.75rem' }}>
+            <PipelineImpactReport diagnostics={run.manifest?.run_context_final?.pipeline_diagnostics} />
           </div>
+
+          <details style={{ marginBottom: '1.25rem' }}>
+            <summary
+              style={{
+                cursor: 'pointer',
+                color: 'var(--halo-cyan)',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                marginBottom: '0.35rem',
+              }}
+            >
+              Effective SWAY_* environment (subset)
+            </summary>
+            <p style={{ fontSize: '0.72rem', color: 'var(--text-muted)', margin: '0 0 0.5rem', lineHeight: 1.45 }}>
+              Non-empty variables recorded on the manifest for diffing runs. Empty defaults are omitted.
+            </p>
+            <pre
+              style={{
+                margin: 0,
+                maxHeight: 280,
+                overflow: 'auto',
+                padding: '0.65rem 0.75rem',
+                borderRadius: 10,
+                background: 'rgba(0,0,0,0.45)',
+                border: '1px solid var(--glass-border)',
+                color: '#cbd5e1',
+                fontSize: '0.68rem',
+                lineHeight: 1.4,
+              }}
+            >
+              {JSON.stringify(run.manifest?.env ?? {}, null, 2)}
+            </pre>
+          </details>
+
+          <FriendlyRunConfig
+            fields={run.manifest?.run_context_final?.fields as Record<string, unknown> | undefined}
+            schemaFields={labSchema?.fields}
+            stages={labSchema?.stages}
+          />
         </div>
       )}
 
@@ -856,7 +1146,67 @@ export function WatchPage() {
                     ...videoFocusStyle,
                   }}
                 />
+                {currentPhaseId === 'track' &&
+                  samRoiMap.size > 0 &&
+                  (() => {
+                    const v = videoRef.current
+                    const roi = samRoiMap.get(playFrame)
+                    if (!v || !roi) return null
+                    const layers = sam2RoiLayerStyles(roi, v)
+                    if (!layers) return null
+                    return (
+                      <div key={`samroi-${playFrame}-${samOverlayLayout}`} style={{ pointerEvents: 'none' }}>
+                        <div style={layers.box} title="Region passed to SAM2 (hybrid overlap refiner)" />
+                        <div style={layers.label}>SAM2 input</div>
+                      </div>
+                    )
+                  })()}
               </div>
+              {mode === 'phase' && currentPhaseId === 'track' && (
+                <div
+                  style={{
+                    padding: '0.5rem 0.85rem 0.65rem',
+                    fontSize: '0.72rem',
+                    color: 'var(--text-muted)',
+                    lineHeight: 1.5,
+                    borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '0.5rem 1rem',
+                    alignItems: 'center',
+                  }}
+                >
+                  <span style={{ fontWeight: 600, color: '#94a3b8' }}>Hybrid SAM2</span>
+                  {samRoiMap.size > 0 ? (
+                    <>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        <span
+                          style={{
+                            width: 28,
+                            height: 18,
+                            borderRadius: 4,
+                            border: '2px dashed rgba(255, 140, 0, 0.9)',
+                            boxShadow: '0 0 0 1px rgba(0,0,0,0.35)',
+                            flexShrink: 0,
+                          }}
+                          aria-hidden
+                        />
+                        <span>
+                          Orange dashed box = the image region passed to SAM2 on overlap frames (ROI crop or full frame).
+                          It is drawn in the preview MP4 and, when <code style={{ fontSize: '0.65rem' }}>prune_log.json</code>{' '}
+                          includes <code style={{ fontSize: '0.65rem' }}>hybrid_sam_frame_rois</code>, the same box tracks playback
+                          above the video.
+                        </span>
+                      </span>
+                    </>
+                  ) : (
+                    <span style={{ fontSize: '0.7rem', opacity: 0.9 }}>
+                      No hybrid SAM frame metadata in this run&apos;s prune log (hybrid off, or re-export from an older pipeline).
+                      Re-run with hybrid SAM enabled to record ROI boxes.
+                    </span>
+                  )}
+                </div>
+              )}
               {showPruneAside &&
                 (currentPhaseId === 'pre_pose' ||
                   currentPhaseId === 'collision' ||
@@ -951,7 +1301,17 @@ export function WatchPage() {
                     {runSummary.tracksIn}
                   </div>
                 )}
+                {currentPhaseId === 'track' && runSummary.hybridSamFrames > 0 && (
+                  <div>
+                    <span style={{ color: 'var(--text-muted)' }}>Hybrid SAM ROI frames in log </span>
+                    {runSummary.hybridSamFrames}
+                    <span style={{ color: 'var(--text-muted)' }}> (xyxy per frame in prune_log)</span>
+                  </div>
+                )}
               </div>
+            )}
+            {manifestFields && currentPhaseId && (
+              <WatchPhaseTuningBlock phaseId={currentPhaseId} fields={manifestFields} schema={labSchema} />
             )}
             {!pruneLog && !pruneLogErr && (
               <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Loading prune log…</div>
@@ -978,8 +1338,9 @@ export function WatchPage() {
 
             {currentPhaseId === 'pose' && (
               <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5, margin: '0 0 0.5rem' }}>
-                No track-level prune rows are logged during ViTPose itself. Occluded / skipped frames are reflected in the
-                video and in Lab phase metadata. Tune pose stride in the recipe if needed.
+                No track-level prune rows are logged during pose itself. Check the recipe snapshot above for model (ViTPose vs
+                RTMPose-L), stride, gap interpolation, visibility threshold, and 3D lift — then adjust in the Lab Config page if
+                overlays look soft or sparse.
               </p>
             )}
 

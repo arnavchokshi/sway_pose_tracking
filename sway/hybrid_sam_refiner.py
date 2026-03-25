@@ -20,7 +20,8 @@ to use the legacy full-frame path.
 Data contract (same as BoxMOT / tracker):
   dets: float32 array shape (N, 6) — columns [x1, y1, x2, y2, conf, cls].
 
-Default on; set SWAY_HYBRID_SAM_OVERLAP=0 to disable. Optional env:
+Default on; set SWAY_HYBRID_SAM_OVERLAP=0 to disable (production ``main.py`` reapplies overlap + ROI crop + pad after
+params unless SWAY_UNLOCK_HYBRID_SAM_TUNING=1 — see ``MASTER_PIPELINE_GUIDELINE.md`` §6.4.1). Optional env:
   SWAY_HYBRID_SAM_IOU_TRIGGER   — max pairwise IoU above this triggers SAM (default 0.42)
   SWAY_HYBRID_SAM_MIN_DETS        — minimum person count to consider overlap (default 2)
   SWAY_HYBRID_SAM_WEIGHTS         — Ultralytics SAM checkpoint (default sam2.1_b.pt)
@@ -28,12 +29,17 @@ Default on; set SWAY_HYBRID_SAM_OVERLAP=0 to disable. Optional env:
   SWAY_HYBRID_SAM_BBOX_PAD        — pixel pad on mask-derived boxes (default 2)
   SWAY_HYBRID_SAM_ROI_CROP        — 1 = ROI union crop for SAM (default 1)
   SWAY_HYBRID_SAM_ROI_PAD_FRAC    — expand ROI union by this fraction of its size (default 0.1)
+  SWAY_HYBRID_SAM_WEAK_CUES       — optional extra gate: skip SAM when overlap is high but boxes
+                                    match the previous frame (conf + height stable). Default 0.
+  SWAY_HYBRID_WEAK_CONF_DELTA     — max |Δconf| vs previous matched box to count as stable (default 0.08)
+  SWAY_HYBRID_WEAK_HEIGHT_FRAC    — max relative height change vs previous match (default 0.12)
+  SWAY_HYBRID_WEAK_MATCH_IOU      — min IoU to match a det to previous frame (default 0.25)
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -86,6 +92,11 @@ def load_hybrid_sam_config() -> Dict[str, Any]:
         "bbox_pad": _i("SWAY_HYBRID_SAM_BBOX_PAD", 2),
         "roi_crop": _truthy("SWAY_HYBRID_SAM_ROI_CROP", True),
         "roi_pad_frac": _f("SWAY_HYBRID_SAM_ROI_PAD_FRAC", 0.1),
+        # Optional Hybrid-SORT–style weak cues: skip SAM when overlap is high but boxes look temporally stable.
+        "weak_cues": _truthy("SWAY_HYBRID_SAM_WEAK_CUES", False),
+        "weak_conf_delta": _f("SWAY_HYBRID_WEAK_CONF_DELTA", 0.08),
+        "weak_height_frac": _f("SWAY_HYBRID_WEAK_HEIGHT_FRAC", 0.12),
+        "weak_match_min_iou": _f("SWAY_HYBRID_WEAK_MATCH_IOU", 0.25),
     }
 
 
@@ -162,6 +173,91 @@ def overlap_stats(xyxy: np.ndarray, cfg: Dict[str, Any]) -> Tuple[float, bool]:
     if not cfg["enabled"]:
         return mp, False
     return mp, mp >= cfg["iou_trigger"]
+
+
+def _bbox_height_xyxy(row: np.ndarray) -> float:
+    return max(0.0, float(row[3] - row[1]))
+
+
+def _greedy_match_curr_to_prev(
+    xyxy_curr: np.ndarray,
+    xyxy_prev: np.ndarray,
+    min_iou: float,
+) -> List[int]:
+    """Greedy one-to-one match of current rows to previous frame by IoU."""
+    n = int(xyxy_curr.shape[0])
+    m = int(xyxy_prev.shape[0])
+    match = [-1] * n
+    if m == 0:
+        return match
+    used = [False] * m
+    thr = float(min_iou)
+    for i in range(n):
+        best_j = -1
+        best_iou = thr
+        for j in range(m):
+            if used[j]:
+                continue
+            iou_val = _iou_xyxy(xyxy_curr[i], xyxy_prev[j])
+            if iou_val > best_iou:
+                best_iou = iou_val
+                best_j = j
+        if best_j >= 0:
+            used[best_j] = True
+            match[i] = best_j
+    return match
+
+
+def _max_iou_pair_indices(xyxy: np.ndarray) -> Optional[Tuple[int, int]]:
+    n = int(xyxy.shape[0])
+    if n < 2:
+        return None
+    best_iou = -1.0
+    best_pair: Optional[Tuple[int, int]] = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            v = _iou_xyxy(xyxy[i], xyxy[j])
+            if v > best_iou:
+                best_iou = v
+                best_pair = (i, j)
+    return best_pair
+
+
+def weak_cues_say_ambiguous(
+    dets: np.ndarray,
+    prev_out: Optional[np.ndarray],
+    cfg: Dict[str, Any],
+) -> bool:
+    """
+    When overlap triggers SAM, weak cues can veto if the worst-overlap pair looks
+    temporally stable vs the previous frame (safe overlap). True => run SAM.
+    """
+    if prev_out is None or prev_out.size == 0 or int(prev_out.shape[0]) == 0:
+        return True
+    xyxy_c = dets[:, :4].astype(np.float32)
+    xyxy_p = prev_out[:, :4].astype(np.float32)
+    min_match_iou = float(cfg.get("weak_match_min_iou", 0.25))
+    match = _greedy_match_curr_to_prev(xyxy_c, xyxy_p, min_match_iou)
+    pair = _max_iou_pair_indices(xyxy_c)
+    if pair is None:
+        return True
+    i, j = pair
+    h_thr = float(cfg["weak_height_frac"])
+    c_thr = float(cfg["weak_conf_delta"])
+    for idx in (i, j):
+        pj = match[idx]
+        if pj < 0:
+            return True
+        h_c = _bbox_height_xyxy(dets[idx])
+        h_p = _bbox_height_xyxy(prev_out[pj])
+        denom = max(h_c, h_p, 1e-3)
+        if abs(h_c - h_p) / denom > h_thr:
+            return True
+        conf_c = float(dets[idx, 4]) if dets.shape[1] > 4 else 1.0
+        conf_p = float(prev_out[pj, 4]) if prev_out.shape[1] > 4 else 1.0
+        if abs(conf_c - conf_p) > c_thr:
+            return True
+    return False
 
 
 def _mask_to_xyxy(
@@ -339,6 +435,8 @@ class HybridSamRefiner:
     frames_seen: int = 0
     frames_sam_used: int = 0
     sam_calls: int = 0
+    weak_cue_skip_frames: int = 0
+    _prev_dets_out: Optional[np.ndarray] = field(default=None, repr=False)
 
     def _model(self):
         if self._sam is None:
@@ -365,6 +463,7 @@ class HybridSamRefiner:
             "n_out": int(len(dets)),
             "roi_crop": False,
             "roi_box": None,
+            "weak_cues_skipped_sam": False,
         }
         if dets.size == 0 or dets.shape[0] == 0:
             return dets, meta
@@ -376,6 +475,15 @@ class HybridSamRefiner:
         mp, need = overlap_stats(xyxy, self.cfg)
         meta["max_iou"] = float(mp)
         if not need:
+            self._prev_dets_out = np.asarray(dets, dtype=np.float32).copy()
+            return dets, meta
+
+        if bool(self.cfg.get("weak_cues")) and not weak_cues_say_ambiguous(
+            dets, self._prev_dets_out, self.cfg
+        ):
+            meta["weak_cues_skipped_sam"] = True
+            self.weak_cue_skip_frames += 1
+            self._prev_dets_out = np.asarray(dets, dtype=np.float32).copy()
             return dets, meta
 
         h, w = frame_bgr.shape[:2]
@@ -407,6 +515,7 @@ class HybridSamRefiner:
             boxes_crop = _xyxy_to_crop_space(sub, rcx1, rcy1, cw, ch)
             masks = _sam_predict_masks(sam, crop, boxes_crop)
             if masks is None:
+                self._prev_dets_out = np.asarray(dets, dtype=np.float32).copy()
                 return dets, meta
             out, per_det_masks = _apply_sam_masks_to_dets(
                 dets,
@@ -421,11 +530,13 @@ class HybridSamRefiner:
             meta["used_sam"] = True
             meta["n_out"] = int(len(out))
             meta["per_det_masks"] = per_det_masks
+            self._prev_dets_out = np.asarray(out, dtype=np.float32).copy()
             return out, meta
 
         # Full-frame SAM (legacy or when everyone is in the overlap cluster)
         masks = _sam_predict_masks(sam, frame_bgr, xyxy)
         if masks is None:
+            self._prev_dets_out = np.asarray(dets, dtype=np.float32).copy()
             return dets, meta
 
         all_idx = list(range(min(nd, masks.shape[0])))
@@ -435,6 +546,7 @@ class HybridSamRefiner:
         meta["used_sam"] = True
         meta["n_out"] = int(len(out))
         meta["per_det_masks"] = per_det_masks
+        self._prev_dets_out = np.asarray(out, dtype=np.float32).copy()
         return out, meta
 
     def summary(self) -> Dict[str, Any]:
@@ -442,4 +554,6 @@ class HybridSamRefiner:
             "hybrid_sam_frames_total": self.frames_seen,
             "hybrid_sam_frames_refined": self.frames_sam_used,
             "hybrid_sam_predict_calls": self.sam_calls,
+            "hybrid_sam_weak_cue_skips": int(self.weak_cue_skip_frames),
+            "hybrid_sam_weak_cues_enabled": bool(self.cfg.get("weak_cues")),
         }

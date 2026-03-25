@@ -7,17 +7,243 @@ any key starting with SWAY_ (applied in main.py before tracking).
 
 Stage order and ``main_phases`` match ``docs/PIPELINE_CODE_REFERENCE.md`` and
 ``main.py`` progress lines ``[1/11]`` … ``[11/11]`` (Lab groups some steps into
-one tab, e.g. phases 6–7 in ``reid_dedup``).
+one tab, e.g. phases 6–7 in ``reid_dedup``). Printed **Phase 4** has no Lab tab.
 
 Only options that change behavior are listed; read-only ``info`` rows document
 what the pipeline always does so the UI does not offer unwired presets.
+Phase 4 (pre-pose prune) has no Lab stage: YAML knobs are master-locked (see
+``MASTER_LOCKED_PRE_POSE_PRUNE_PARAMS``). Five Phase 6–7 re-ID / collocated-dedup YAML keys are master-locked
+(``MASTER_LOCKED_REID_DEDUP_PARAMS``); finer dedup sliders stay in the Lab UI.
+Tier C / Tier A span / selected Tier B thresholds and three pruning weights are
+master-locked for Phase 8 (``MASTER_LOCKED_POST_POSE_PRUNE_*``); sync, vote
+threshold, mirror, and low-conf weights stay tunable.
+Phase 9 locks ``SMOOTHER_MIN_CUTOFF`` and ``SWAY_TEMPORAL_POSE_RADIUS`` (neighbor-blend
+window); ``SMOOTHER_BETA`` and the neighbor-blend on/off toggle stay tunable.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List
 
-# Ordered stages: ``main_phases`` is shown in the Lab flowchart for A/B alignment with main.py.
+# Canonical person-detection stack (Spot people phase). Enforced in ``main.py`` after params YAML;
+# Pipeline Lab subprocess env is frozen via ``freeze_lab_subprocess_detection_env`` in ``app.py``.
+# Set ``SWAY_UNLOCK_DETECTION_TUNING=1`` to allow smoke matrices / advanced overrides.
+MASTER_LOCKED_DETECTION_ENV: Dict[str, str] = {
+    "SWAY_GROUP_VIDEO": "1",
+    "SWAY_DETECT_SIZE": "640",
+    "SWAY_CHUNK_SIZE": "300",
+    "SWAY_YOLO_INFER_BATCH": "1",
+    "SWAY_YOLO_HALF": "0",
+    "SWAY_GSI_LENGTHSCALE": "0.35",
+}
+
+
+def apply_master_locked_detection_env() -> None:
+    """Force ``MASTER_LOCKED_DETECTION_ENV`` on ``os.environ``; clear ``SWAY_YOLO_ENGINE``."""
+    v = os.environ.get("SWAY_UNLOCK_DETECTION_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    for key, val in MASTER_LOCKED_DETECTION_ENV.items():
+        os.environ[key] = val
+    os.environ.pop("SWAY_YOLO_ENGINE", None)
+
+
+def freeze_lab_subprocess_detection_env(env: Dict[str, str]) -> None:
+    """Lab API: always apply master detection env to the child process (TensorRT path cleared)."""
+    for key, val in MASTER_LOCKED_DETECTION_ENV.items():
+        env[key] = val
+    env.pop("SWAY_YOLO_ENGINE", None)
+
+
+# Hybrid SAM overlap tab (BoxMOT path). Enforced after params YAML; Lab freezes subprocess env.
+# Set ``SWAY_UNLOCK_HYBRID_SAM_TUNING=1`` for smoke runs / A-B that disable SAM or use full-frame ROI.
+MASTER_LOCKED_HYBRID_SAM_ENV: Dict[str, str] = {
+    "SWAY_HYBRID_SAM_OVERLAP": "1",
+    "SWAY_HYBRID_SAM_ROI_CROP": "1",
+    "SWAY_HYBRID_SAM_ROI_PAD_FRAC": "0.1",
+}
+
+
+def apply_master_locked_hybrid_sam_env() -> None:
+    """Force ``MASTER_LOCKED_HYBRID_SAM_ENV`` on ``os.environ``."""
+    v = os.environ.get("SWAY_UNLOCK_HYBRID_SAM_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    for key, val in MASTER_LOCKED_HYBRID_SAM_ENV.items():
+        os.environ[key] = val
+
+
+def freeze_lab_subprocess_hybrid_sam_env(env: Dict[str, str]) -> None:
+    """Lab API: always apply master hybrid SAM env to the child process."""
+    for key, val in MASTER_LOCKED_HYBRID_SAM_ENV.items():
+        env[key] = val
+
+
+# Phase 3 global stitch / AFLink thresholds. ``sway_global_aflink_mode`` stays in the Lab UI.
+# Set ``SWAY_UNLOCK_PHASE3_STITCH_TUNING=1`` to allow smoke tests (e.g. global link off).
+MASTER_LOCKED_PHASE3_STITCH_ENV: Dict[str, str] = {
+    "SWAY_GLOBAL_LINK": "1",
+    "SWAY_AFLINK_THR_T0": "0",
+    "SWAY_AFLINK_THR_T1": "30",
+    "SWAY_AFLINK_THR_S": "75",
+    "SWAY_AFLINK_THR_P": "0.05",
+}
+
+
+def apply_master_locked_phase3_stitch_env() -> None:
+    """Force ``MASTER_LOCKED_PHASE3_STITCH_ENV`` on ``os.environ``."""
+    v = os.environ.get("SWAY_UNLOCK_PHASE3_STITCH_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    for key, val in MASTER_LOCKED_PHASE3_STITCH_ENV.items():
+        os.environ[key] = val
+
+
+def freeze_lab_subprocess_phase3_stitch_env(env: Dict[str, str]) -> None:
+    """Lab API: always apply master Phase 3 stitch env to the child process."""
+    for key, val in MASTER_LOCKED_PHASE3_STITCH_ENV.items():
+        env[key] = val
+
+
+# Phase 5 pose stack (ViTPose path + 3D lift). ``pose_model`` / visibility stay in the Lab UI; pose stride is fixed
+# to every frame for Lab (see ``pose_stride`` + ``lab_hidden`` in ``PIPELINE_PARAM_FIELDS``).
+# Set ``SWAY_UNLOCK_POSE_TUNING=1`` for smoke (3D off, chunked ViTPose) or FP32 A/B.
+def apply_master_locked_pose_env() -> None:
+    """Unset chunked ViTPose cap; FP32 off; 3D lift on."""
+    v = os.environ.get("SWAY_UNLOCK_POSE_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    os.environ.pop("SWAY_VITPOSE_MAX_PER_FORWARD", None)
+    os.environ["SWAY_VITPOSE_FP32"] = "0"
+    os.environ["SWAY_3D_LIFT"] = "1"
+
+
+def freeze_lab_subprocess_pose_env(env: Dict[str, str]) -> None:
+    """Lab API: apply master pose env (0 = all people one ViTPose batch via unset cap)."""
+    env.pop("SWAY_VITPOSE_MAX_PER_FORWARD", None)
+    env["SWAY_VITPOSE_FP32"] = "0"
+    env["SWAY_3D_LIFT"] = "1"
+
+
+# Phase 4 YAML keys that ``main.py`` reads from ``params`` for pre-pose pruning. Pipeline Lab does
+# not expose these; values are merged into every ``params.yaml`` and forced after loading any YAML
+# unless ``SWAY_UNLOCK_PRE_POSE_PRUNE_TUNING=1``. (Bbox size / aspect / mirror rules in Phase 4
+# still use module constants only — not included here.)
+MASTER_LOCKED_PRE_POSE_PRUNE_PARAMS: Dict[str, Any] = {
+    "min_duration_ratio": 0.20,
+    "KINETIC_STD_FRAC": 0.02,
+    "SPATIAL_OUTLIER_STD_FACTOR": 2.0,
+    "SHORT_TRACK_MIN_FRAC": 0.15,
+    "AUDIENCE_REGION_X_MIN_FRAC": 0.75,
+    "AUDIENCE_REGION_Y_MIN_FRAC": 0.70,
+}
+
+
+def apply_master_locked_pre_pose_prune_params(params: Dict[str, Any]) -> None:
+    """Overwrite Phase 4 prune keys in ``params`` (mutates in place)."""
+    v = os.environ.get("SWAY_UNLOCK_PRE_POSE_PRUNE_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    params.update(MASTER_LOCKED_PRE_POSE_PRUNE_PARAMS)
+
+
+# Phase 6 occlusion re-ID + Phase 7 collocated-dedup distance gates (YAML via ``params``).
+# Set ``SWAY_UNLOCK_REID_DEDUP_TUNING=1`` for sweeps / deliberate overrides.
+# ``dedup_min_pair_oks`` and ``dedup_antipartner_min_iou`` remain Lab-tunable.
+MASTER_LOCKED_REID_DEDUP_PARAMS: Dict[str, Any] = {
+    "REID_MAX_FRAME_GAP": 90,
+    "REID_MIN_OKS": 0.35,
+    "COLLISION_KPT_DIST_FRAC": 0.26,
+    "COLLISION_CENTER_DIST_FRAC": 0.5,
+    "DEDUP_TORSO_MEDIAN_FRAC": 0.24,
+}
+
+
+def apply_master_locked_reid_dedup_params(params: Dict[str, Any]) -> None:
+    """Overwrite Phase 6–7 locked re-ID / dedup keys in ``params`` (mutates in place)."""
+    v = os.environ.get("SWAY_UNLOCK_REID_DEDUP_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    params.update(MASTER_LOCKED_REID_DEDUP_PARAMS)
+
+
+# Phase 8 post-pose prune: Tier C, Tier A span, Tier B garbage thresholds, and three vote weights.
+# Set ``SWAY_UNLOCK_POST_POSE_PRUNE_TUNING=1`` for sweeps. Remaining Lab fields: ``SYNC_SCORE_MIN``,
+# ``PRUNE_THRESHOLD``, ``pruning_w_low_sync``, ``pruning_w_smart_mirror``, ``pruning_w_low_conf``.
+MASTER_LOCKED_POST_POSE_PRUNE_SCALAR_PARAMS: Dict[str, Any] = {
+    "CONFIRMED_HUMAN_MIN_SPAN_FRAC": 0.10,
+    "TIER_C_SKELETON_MEAN": 0.15,
+    "TIER_C_LOW_FRAME_FRAC": 0.80,
+    "MEAN_CONFIDENCE_MIN": 0.45,
+    "EDGE_MARGIN_FRAC": 0.15,
+    "EDGE_PRESENCE_FRAC": 0.30,
+    "min_lower_body_conf": 0.30,
+    "JITTER_RATIO_MAX": 0.10,
+}
+
+MASTER_LOCKED_POST_POSE_PRUNE_WEIGHT_KEYS: Dict[str, float] = {
+    "prune_completeness_audit": 0.6,
+    "prune_head_only_tracks": 0.8,
+    "prune_jittery_tracks": 0.5,
+}
+
+
+def apply_master_locked_post_pose_prune_params(params: Dict[str, Any]) -> None:
+    """Overwrite Phase 8 locked keys in ``params`` and merge locked pruning weights (mutates in place)."""
+    v = os.environ.get("SWAY_UNLOCK_POST_POSE_PRUNE_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    params.update(MASTER_LOCKED_POST_POSE_PRUNE_SCALAR_PARAMS)
+    base_pw = params.get("PRUNING_WEIGHTS")
+    if isinstance(base_pw, dict):
+        merged = {str(k): float(v) for k, v in base_pw.items()}
+    else:
+        merged = {}
+    for k, val in MASTER_LOCKED_POST_POSE_PRUNE_WEIGHT_KEYS.items():
+        merged[k] = float(val)
+    params["PRUNING_WEIGHTS"] = merged
+
+
+# Phase 9: 1-Euro min cutoff (YAML) + temporal keypoint refine radius (env overrides CLI in ``temporal_pose_radius()``).
+# Set ``SWAY_UNLOCK_SMOOTH_TUNING=1`` for sweeps / wider neighbor windows.
+MASTER_LOCKED_SMOOTH_PARAMS: Dict[str, Any] = {
+    "SMOOTHER_MIN_CUTOFF": 1.0,
+}
+
+MASTER_LOCKED_SMOOTH_ENV: Dict[str, str] = {
+    "SWAY_TEMPORAL_POSE_RADIUS": "2",
+}
+
+
+def apply_master_locked_smooth_params(params: Dict[str, Any]) -> None:
+    """Overwrite Phase 9 locked 1-Euro cutoff in ``params`` (mutates in place)."""
+    v = os.environ.get("SWAY_UNLOCK_SMOOTH_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    params.update(MASTER_LOCKED_SMOOTH_PARAMS)
+
+
+def apply_master_locked_smooth_env() -> None:
+    """Force neighbor-blend radius on ``os.environ`` (see ``temporal_pose_radius()``)."""
+    v = os.environ.get("SWAY_UNLOCK_SMOOTH_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    for key, val in MASTER_LOCKED_SMOOTH_ENV.items():
+        os.environ[key] = val
+
+
+def freeze_lab_subprocess_smooth_env(env: Dict[str, str]) -> None:
+    """Lab API: apply master Phase 9 env (temporal pose radius) to the child process."""
+    v = os.environ.get("SWAY_UNLOCK_SMOOTH_TUNING", "").strip().lower()
+    if v in ("1", "true", "yes"):
+        return
+    for key, val in MASTER_LOCKED_SMOOTH_ENV.items():
+        env[key] = val
+
+
+# Ordered stages: ``main_phases`` drives Lab flowchart captions (printed phase names + main.py
+# [n/11]) aligned with ``docs/MASTER_PIPELINE_GUIDELINE.md`` §5.
 PIPELINE_STAGES: List[Dict[str, Any]] = [
     {
         "id": "detection",
@@ -42,12 +268,6 @@ PIPELINE_STAGES: List[Dict[str, Any]] = [
         "label": "Merging broken IDs across the clip",
         "short": "Merge IDs",
         "main_phases": "3",
-    },
-    {
-        "id": "pre_pose_prune",
-        "label": "Removing obvious non-dancers early",
-        "short": "Early cuts",
-        "main_phases": "4",
     },
     {
         "id": "pose",
@@ -107,6 +327,7 @@ def _f(
     visible_when_value: Any = None,
     display: str = "",
     disabled_choices: Any = None,
+    lab_hidden: bool = False,
 ) -> Dict[str, Any]:
     d: Dict[str, Any] = {
         "id": id_,
@@ -133,6 +354,8 @@ def _f(
         d["display"] = display
     if disabled_choices is not None:
         d["disabled_choices"] = disabled_choices
+    if lab_hidden:
+        d["lab_hidden"] = True
     return d
 
 
@@ -155,16 +378,39 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
+        "info_detection_master_locked",
+        "detection",
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
+        description=(
+            "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
+            "``main.py`` reapplies them after ``params`` YAML. For engineering smoke tests that must override "
+            "(batch size, crowd off, etc.), set ``SWAY_UNLOCK_DETECTION_TUNING=1`` in the environment.\n\n"
+            "**Crowd mode (many people on screen):** On. Under the hood this makes the detector work harder for "
+            "smaller bodies; with crowd mode on, the runtime uses letterbox **max(640, 960)** (see ``tracker.py``) "
+            "even though the baseline width is **640**.\n\n"
+            "**Internal resize width for finding people:** **640** — safe baseline; crowd mode may bump effective size as above.\n\n"
+            "**Frames processed per memory chunk:** **300** — streaming memory only; does not change where boxes land.\n\n"
+            "**YOLO GPU batch size:** **1** — larger values feed the GPU faster but increase CUDA OOM risk without improving tracking accuracy.\n\n"
+            "**YOLO FP16 inference on CUDA:** **Full precision** (half precision off).\n\n"
+            "**TensorRT engine path (YOLO):** Unset — use standard ``.pt`` weights unless you have a matching engine for your GPU.\n\n"
+            "**GSI smoothness (time, normalized):** **0.35** — tuned lengthscale when optional GSI interpolation is used "
+            "(box stride gaps, stitch, pose gaps, export tween)."
+        ),
+    ),
+    _f(
         "sway_yolo_weights",
         "detection",
         "How sharp the person finder is",
         "enum",
-        "yolo26l",
+        "yolo26l_dancetrack",
         binding="env",
         key="SWAY_YOLO_WEIGHTS",
         choices=[
             "yolo26s",
-            "yolo26l",
             "yolo26l_dancetrack",
             "yolo26x",
         ],
@@ -196,38 +442,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "sway_group_video",
-        "detection",
-        "Crowd mode (many people on screen)",
-        "bool",
-        True,
-        binding="env",
-        key="SWAY_GROUP_VIDEO",
-        description=(
-            "On for dance lines and groups: looks at the frame in more detail so small bodies are less likely "
-            "to be missed. Slightly slower; turn off for solo or wide shots if you want maximum speed."
-        ),
-        advanced=True,
-        tier=3,
-    ),
-    _f(
-        "sway_chunk_size",
-        "detection",
-        "Frames processed per memory chunk",
-        "int",
-        300,
-        binding="env",
-        key="SWAY_CHUNK_SIZE",
-        min_=30,
-        max_=2000,
-        tier=3,
-        display="slider",
-        description=(
-            "Long videos are processed in chunks so memory stays stable. "
-            "Only change this if you know you are hitting RAM limits or want to tune streaming."
-        ),
-    ),
-    _f(
         "sway_yolo_conf",
         "detection",
         "Minimum “I’m sure this is a person” score",
@@ -243,24 +457,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "Higher = fewer boxes, less junk, but you might miss dim or distant dancers. "
             "Lower = more boxes, more risk of random objects being treated as people."
         ),
-    ),
-    _f(
-        "sway_detect_size",
-        "detection",
-        "Internal resize width for finding people (pixels)",
-        "int",
-        640,
-        binding="env",
-        key="SWAY_DETECT_SIZE",
-        min_=320,
-        max_=1920,
-        description=(
-            "Larger = finer detail, slower. Crowd mode may bump this automatically. "
-            "Leave at default unless you are tuning speed vs. small-figure detection."
-        ),
-        advanced=True,
-        tier=3,
-        display="slider",
     ),
     _f(
         "sway_yolo_detection_stride",
@@ -280,6 +476,24 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=3,
         display="slider",
     ),
+    _f(
+        "sway_box_interp_mode",
+        "detection",
+        "Box path between YOLO stride anchors",
+        "enum",
+        "linear",
+        binding="env",
+        key="SWAY_BOX_INTERP_MODE",
+        choices=["linear", "gsi"],
+        advanced=True,
+        tier=3,
+        display="segmented",
+        description=(
+            "When YOLO runs every Nth frame, skipped frames get filled boxes before pose. "
+            "Linear is the long-standing default. GSI uses a light Gaussian (RBF) smoother between anchors "
+            "(also used when stitching track fragments). Off by default path = linear."
+        ),
+    ),
     # --- tracking (main.py phase 2) ---
     _f(
         "info_tracking_backends",
@@ -291,25 +505,56 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         key="",
         description=(
             "After each frame knows where people are, this step decides “this box is still dancer 3.” "
-            "The default engine is tuned for dance; you can switch to another engine for comparison. "
-            "Overlap sharpening (next tab) only applies on the default path—not when using the alternate engine."
+            "Deep OC-SORT is tuned for dance. You can add track-time OSNet appearance matching when outfits differ. "
+            "Overlap sharpening (next tab) runs on this path."
         ),
     ),
     _f(
         "tracker_technology",
         "tracking",
-        "Which engine tracks IDs frame to frame",
+        "How IDs are carried frame to frame",
         "enum",
-        "BoxMOT",
+        "deep_ocsort",
         binding="none",
         key="",
-        choices=["BoxMOT", "BoT-SORT", "ByteTrack", "OC-SORT", "StrongSORT"],
-        disabled_choices=["ByteTrack", "OC-SORT", "StrongSORT"],
+        choices=["deep_ocsort", "deep_ocsort_osnet"],
         tier=1,
         display="tracker_strip",
         description=(
-            "Today you can run the built-in tracker or the alternate one from the same family as YOLO. "
-            "The grayed-out names are placeholders for future work—you can’t run them yet."
+            "**Default:** Deep OC-SORT with motion/IoU association (no track-time Re-ID). "
+            "**+ OSNet:** same tracker with OSNet embeddings during tracking — better through crosses/occlusions "
+            "when outfits look different; prefetch ``models/osnet_x0_25_msmt17.pt`` (or set weights via advanced preset)."
+        ),
+    ),
+    _f(
+        "sway_bidirectional_track_pass",
+        "tracking",
+        "Extra pass: track reversed video and merge IDs",
+        "bool",
+        False,
+        binding="env",
+        key="SWAY_BIDIRECTIONAL_TRACK_PASS",
+        advanced=True,
+        tier=3,
+        description=(
+            "Off by default. When on, ffmpeg reverses the clip, the pipeline runs Phases 1–2 again, "
+            "then merges boxes with the forward pass (IoU + minimum matched frames). "
+            "Roughly doubles tracking time; needs ffmpeg on PATH."
+        ),
+    ),
+    _f(
+        "sway_gnn_track_refine",
+        "tracking",
+        "GNN-style track refine pass (after Phase 3 stitch)",
+        "bool",
+        False,
+        binding="env",
+        key="SWAY_GNN_TRACK_REFINE",
+        advanced=True,
+        tier=3,
+        description=(
+            "Default off. When on, ``main.py`` runs an optional post-stitch hook (identity today — logs once). "
+            "Reserved for future graph-based ID association inside the pipeline."
         ),
     ),
     _f(
@@ -348,51 +593,43 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "sway_boxmot_reid_on",
-        "tracking",
-        "Use clothing / body look to tell dancers apart",
-        "bool",
-        False,
-        binding="env",
-        key="SWAY_BOXMOT_REID_ON",
-        tier=1,
-        description=(
-            "Turn on when outfits look different—helps after crosses or occlusions. "
-            "Turn off for identical costumes or uniforms so the pipeline doesn’t over-trust appearance."
-        ),
-    ),
-    _f(
         "sway_boxmot_reid_model",
         "tracking",
-        "Quality of the “who looks like who” model",
+        "OSNet checkpoint for track-time Re-ID",
         "enum",
         "osnet_x0_25",
         binding="reid_model_preset",
         key="",
         choices=["osnet_x0_25", "osnet_x1_0"],
-        visible_when_field="sway_boxmot_reid_on",
-        visible_when_value=True,
+        visible_when_field="tracker_technology",
+        visible_when_value="deep_ocsort_osnet",
         advanced=True,
-        tier=3,
+        tier=2,
         description=(
-            "Larger preset = heavier and usually better at telling similar people apart. "
-            "Only matters when appearance matching above is on and you are not using a custom weights file."
+            "Used only when **+ OSNet** is selected. ``osnet_x0_25`` is the default download from "
+            "``python -m tools.prefetch_models``; ``osnet_x1_0`` is heavier if you place "
+            "``models/osnet_x1_0_msmt17.pt`` on disk."
         ),
     ),
     # --- hybrid_sam (runs inside the phase 1–2 pass; BoxMOT only) ---
     _f(
-        "sway_hybrid_sam_overlap",
+        "info_hybrid_sam_master_locked",
         "hybrid_sam",
-        "Refine boxes when people overlap",
-        "bool",
-        True,
-        binding="env",
-        key="SWAY_HYBRID_SAM_OVERLAP",
-        tier=1,
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
         description=(
-            "When two dancers’ boxes sit heavily on top of each other, an extra segmentation pass tightens each box "
-            "so poses don’t bleed together. Expect roughly 15–20% longer runs on clips with lots of contact. "
-            "Only applies with the built-in tracker; the alternate engine path skips this step."
+            "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
+            "``main.py`` reapplies them after ``params`` YAML. For fast smoke tests or deliberate A/B "
+            "(e.g. SAM off), set ``SWAY_UNLOCK_HYBRID_SAM_TUNING=1`` in the environment.\n\n"
+            "**Refine boxes when people overlap:** On — this is the main reason to use the BoxMOT path with hybrid SAM; "
+            "turning it off skips this entire refinement path except for intentional draft runs.\n\n"
+            "**Run SAM on overlap union crop (not full frame):** On — SAM runs on a tight crop around touching dancers, "
+            "not the full 1920×1080 frame; same tracker math, far less VRAM. Do not use full-frame SAM in production.\n\n"
+            "**ROI margin around overlapped dancers:** **0.1** — padding fraction on the union crop so SAM sees a little "
+            "context; tuned default; not a tracking-accuracy knob."
         ),
     ),
     _f(
@@ -405,7 +642,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         key="SWAY_HYBRID_SAM_IOU_TRIGGER",
         min_=0.25,
         max_=0.65,
-        tier=2,
+        tier=1,
         display="slider",
         description=(
             "Higher = only very overlapped pairs get fixed (faster, less segmentation). "
@@ -414,34 +651,67 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "sway_hybrid_sam_roi_crop",
+        "sway_hybrid_sam_weak_cues",
         "hybrid_sam",
-        "Run SAM on overlap union crop (not full frame)",
+        "Skip SAM when overlap is high but boxes match the last frame",
         "bool",
-        True,
+        False,
         binding="env",
-        key="SWAY_HYBRID_SAM_ROI_CROP",
-        tier=2,
+        key="SWAY_HYBRID_SAM_WEAK_CUES",
         advanced=True,
+        tier=2,
         description=(
-            "When on, segmentation sees only a padded union of overlapped dancers — faster and "
-            "usually the same accuracy. Turn off to force legacy full-frame SAM (debug / A-B)."
+            "Optional Hybrid-SORT–style gate: after IoU says “maybe run SAM,” compare detections to the "
+            "previous output. If the worst-overlap pair is height- and confidence-stable, SAM is skipped."
         ),
     ),
     _f(
-        "sway_hybrid_sam_roi_pad_frac",
+        "sway_hybrid_weak_conf_delta",
         "hybrid_sam",
-        "ROI margin around overlapped dancers",
+        "Weak cue: max |Δ confidence| vs matched previous box",
         "float",
-        0.10,
+        0.08,
         binding="env",
-        key="SWAY_HYBRID_SAM_ROI_PAD_FRAC",
-        min_=0.0,
+        key="SWAY_HYBRID_WEAK_CONF_DELTA",
+        min_=0.02,
         max_=0.35,
         advanced=True,
         tier=3,
         display="slider",
-        description="Extra padding around the union box, as a fraction of union width/height.",
+        visible_when_field="sway_hybrid_sam_weak_cues",
+        visible_when_value=True,
+    ),
+    _f(
+        "sway_hybrid_weak_height_frac",
+        "hybrid_sam",
+        "Weak cue: max relative height change vs matched previous box",
+        "float",
+        0.12,
+        binding="env",
+        key="SWAY_HYBRID_WEAK_HEIGHT_FRAC",
+        min_=0.03,
+        max_=0.45,
+        advanced=True,
+        tier=3,
+        display="slider",
+        visible_when_field="sway_hybrid_sam_weak_cues",
+        visible_when_value=True,
+    ),
+    _f(
+        "sway_hybrid_weak_match_iou",
+        "hybrid_sam",
+        "Weak cue: min IoU to match a box to the previous frame",
+        "float",
+        0.25,
+        binding="env",
+        key="SWAY_HYBRID_WEAK_MATCH_IOU",
+        min_=0.10,
+        max_=0.55,
+        advanced=True,
+        tier=3,
+        display="slider",
+        visible_when_field="sway_hybrid_sam_weak_cues",
+        visible_when_value=True,
     ),
     # --- phase3_stitch (main.py phase 3) ---
     _f(
@@ -460,17 +730,23 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "sway_global_link",
+        "info_phase3_master_locked",
         "phase3_stitch",
-        "Try to reconnect IDs across long gaps",
-        "bool",
-        True,
-        binding="env",
-        key="SWAY_GLOBAL_LINK",
-        tier=2,
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
         description=(
-            "On: look across the whole video for “probably the same person” after shorter-range fixes. "
-            "Off: skip that pass—faster, but more duplicate IDs on messy footage."
+            "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
+            "``main.py`` reapplies them after ``params`` YAML. For smoke tests that disable long-range merge, "
+            "set ``SWAY_UNLOCK_PHASE3_STITCH_TUNING=1`` in the environment.\n\n"
+            "**Try to reconnect IDs across long gaps:** On — skipping this removes the whole long-range safety net; "
+            "keep it on unless the clip is unnaturally clean.\n\n"
+            "**AFLink advanced sliders (min gap, max gap, max spatial distance, link probability):** Locked to "
+            "StrongSORT-style defaults **0, 30, 75, 0.05**. These bound the neural linker’s search; changing them "
+            "during baseline A/B makes failures ambiguous (model vs. choked radius). Use the **smart linker** "
+            "switch below to test neural vs. heuristic, not these internal thresholds."
         ),
     ),
     _f(
@@ -500,152 +776,12 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         binding="none",
         key="",
         choices=["neural_if_available", "force_heuristic"],
-        tier=2,
+        tier=1,
         display="segmented",
         description=(
             "Use the learned linker when its weights are present (recommended). "
             "Or always use simple geometry-based rules if you want predictable, lighter behavior."
         ),
-    ),
-    # --- pre_pose_prune (main.py phase 4, YAML) ---
-    _f(
-        "info_pre_pose_prune",
-        "pre_pose_prune",
-        "What this step does",
-        "info",
-        None,
-        binding="none",
-        key="",
-        description=(
-            "Before estimating joints, the pipeline drops tracks that are almost certainly not real dancers—"
-            "too short on screen, barely moving, stuck in the crowd edge, etc. "
-            "That saves time and keeps pose focused on people you care about. "
-            "Fine tuning is through the numbers below, not a single on/off switch."
-        ),
-    ),
-    _f(
-        "min_duration_ratio",
-        "pre_pose_prune",
-        "Minimum fraction of the video a track must span",
-        "float",
-        0.20,
-        binding="yaml",
-        key="min_duration_ratio",
-        description=(
-            "Baseline 0.20 matches the pipeline default. "
-            "Higher = only keep people visible for a larger share of the clip; lower = allow shorter appearances."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "kinetic_std_frac",
-        "pre_pose_prune",
-        "How much motion counts as “alive”",
-        "float",
-        0.02,
-        binding="yaml",
-        key="KINETIC_STD_FRAC",
-        min_=0.005,
-        max_=0.08,
-        description=(
-            "Baseline 0.02 matches the pipeline default (fraction of typical box height). "
-            "Raise if still objects are kept; lower if real dancers get cut as “not moving enough.”"
-        ),
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "spatial_outlier_std_factor",
-        "pre_pose_prune",
-        "Max allowed distance from group center (Std Devs)",
-        "float",
-        2.0,
-        binding="yaml",
-        key="SPATIAL_OUTLIER_STD_FACTOR",
-        min_=1.0,
-        max_=5.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Tracks further than this from the overall group are pruned as outliers. 2.0 = default.",
-    ),
-    _f(
-        "bbox_size_min_frac",
-        "pre_pose_prune",
-        "Minimum allowed bounding box size",
-        "float",
-        0.40,
-        binding="yaml",
-        key="BBOX_SIZE_MIN_FRAC",
-        min_=0.10,
-        max_=1.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Relative height against group median. Lower = keeps smaller boxes.",
-    ),
-    _f(
-        "bbox_size_max_frac",
-        "pre_pose_prune",
-        "Maximum allowed bounding box size",
-        "float",
-        2.00,
-        binding="yaml",
-        key="BBOX_SIZE_MAX_FRAC",
-        min_=1.0,
-        max_=4.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Relative height against group median. Higher = keeps larger boxes.",
-    ),
-    _f(
-        "short_track_min_frac",
-        "pre_pose_prune",
-        "Minimum track lifespan (fraction of video)",
-        "float",
-        0.15,
-        binding="yaml",
-        key="SHORT_TRACK_MIN_FRAC",
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Any track shorter than this fraction of the video is removed as a ghost or passerby.",
-    ),
-    _f(
-        "audience_region_x_min_frac",
-        "pre_pose_prune",
-        "Audience Corner X Start",
-        "float",
-        0.75,
-        binding="yaml",
-        key="AUDIENCE_REGION_X_MIN_FRAC",
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Left barrier for audience corner auto-delete (default 0.75 = right 25%).",
-    ),
-    _f(
-        "audience_region_y_min_frac",
-        "pre_pose_prune",
-        "Audience Corner Y Start",
-        "float",
-        0.70,
-        binding="yaml",
-        key="AUDIENCE_REGION_Y_MIN_FRAC",
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Top barrier for audience corner auto-delete (default 0.70 = bottom 30%).",
     ),
     # --- pose (main.py phase 5) ---
     _f(
@@ -670,13 +806,19 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         "ViTPose-Base",
         binding="cli",
         key="pose_model",
-        choices=["ViTPose-Base", "ViTPose-Large", "ViTPose-Huge", "RTMPose-L"],
+        choices=[
+            "ViTPose-Base",
+            "ViTPose-Large",
+            "ViTPose-Huge",
+            "RTMPose-L",
+            "Sapiens (ViTPose-Base fallback)",
+        ],
         tier=1,
         display="model_cards",
         description=(
             "ViTPose+: larger = usually better on hard motion, slower. "
-            "RTMPose-L needs a separate MMPose install (see docs/PIPELINE_IMPROVEMENTS_ROADMAP.md) "
-            "and targets speed vs ViTPose-Base."
+            "RTMPose-L needs MMPose (see requirements-rtmpose.txt). "
+            "**Sapiens** slot uses ViTPose-Base keypoints until a native Sapiens backend is added in code."
         ),
     ),
     _f(
@@ -688,8 +830,9 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         binding="none",
         key="",
         description=(
-            "Sapiens / HMR / GNN tracking are roadmap experiments — not wired in the lab yet. "
-            "RTMPose-L is available when MMPose is installed locally."
+            "**Sapiens** is selectable as a pose card (runs ViTPose-Base until native Sapiens is wired). "
+            "**GNN** refine flag lives under Tracking. **HMR** mesh placeholder JSON is under Export. "
+            "Regression tests: ``python -m tools.golden_bench`` from a terminal (not a Lab toggle)."
         ),
     ),
     _f(
@@ -703,9 +846,53 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         choices=[1, 2],
         tier=1,
         display="segmented",
+        lab_hidden=True,
         description=(
             "Every frame = smoothest overlays, slowest. "
             "Every other frame = about twice as fast; missing frames are filled in later so playback still looks continuous."
+        ),
+    ),
+    _f(
+        "sway_pose_gap_interp_mode",
+        "pose",
+        "How to fill skipped pose frames (stride 2)",
+        "enum",
+        "linear",
+        binding="env",
+        key="SWAY_POSE_GAP_INTERP_MODE",
+        choices=["linear", "gsi"],
+        advanced=True,
+        tier=3,
+        display="segmented",
+        visible_when_field="pose_stride",
+        visible_when_value=2,
+        description=(
+            "Only matters with “every other frame” pose. Linear is the long-standing default. "
+            "GSI uses the same RBF smoother as optional box paths; lengthscale is SWAY_GSI_LENGTHSCALE "
+            "(detection advanced when box mode is GSI), or set SWAY_POSE_GSI_LENGTHSCALE in params YAML "
+            "to override for pose gaps only."
+        ),
+    ),
+    _f(
+        "info_pose_master_locked",
+        "pose",
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
+        description=(
+            "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
+            "``main.py`` reapplies them after ``params`` YAML. For fast smoke (no 3D, chunked ViTPose) or "
+            "deliberate FP32 tests, set ``SWAY_UNLOCK_POSE_TUNING=1``.\n\n"
+            "**Skeleton cadence:** **every frame** (``pose_stride`` **1**) — the Lab does not expose stride; "
+            "use ``--pose-stride 2`` from CLI or batch matrices if you need every-other-frame pose.\n\n"
+            "**Max people per ViTPose GPU forward:** **0** (cap **unset**) — one natural batch per frame; "
+            "only raise the cap if 40+ people routinely OOM your GPU.\n\n"
+            "**Force ViTPose float32 on GPU:** **Off** — FP16 when the device allows; FP32 is much slower/heavier "
+            "for negligible joint gains.\n\n"
+            "**Add a simple depth view (3D):** **On** — runs Phase 10 lifting for depth-aware scoring and the 3D viewer; "
+            "use ``SWAY_UNLOCK_POSE_TUNING=1`` and ``SWAY_3D_LIFT=0`` only if you truly want flat 2D-only export."
         ),
     ),
     _f(
@@ -726,20 +913,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=3,
         display="slider",
     ),
-    _f(
-        "sway_3d_lift",
-        "pose",
-        "Add a simple depth view (3D) for angles and viewer",
-        "bool",
-        True,
-        binding="env",
-        key="SWAY_3D_LIFT",
-        tier=2,
-        description=(
-            "When on, joints get a third dimension so angled moves score more fairly and the 3D viewer has data. "
-            "Needs the optional lift model and its folder installed; turn off if you only want flat 2D overlays."
-        ),
-    ),
     # --- reid_dedup (main.py phases 6–7) ---
     _f(
         "info_reid_actual",
@@ -756,83 +929,25 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "reid_max_frame_gap",
+        "info_reid_dedup_master_locked",
         "reid_dedup",
-        "Max frames apart to still consider “same person” after a gap",
-        "int",
-        90,
-        binding="yaml",
-        key="REID_MAX_FRAME_GAP",
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
         description=(
-            "Baseline 90 ≈ 3 s at 30 fps (pipeline default). "
-            "Larger = try harder to reconnect after long hides; smaller = fewer risky merges."
+            "The master pipeline fixes five deep math gates for every run — they are **not** in the Lab UI. "
+            "``main.py`` reapplies them after merging UI ``params``. For sweeps or deliberate experiments, set "
+            "``SWAY_UNLOCK_REID_DEDUP_TUNING=1``.\n\n"
+            "**Max frames apart to still consider “same person” after a gap:** **90** — let Phase 3 stitching "
+            "handle long disappearances; keep this for short occlusions (~3 s @ 30 fps).\n\n"
+            "**How similar poses must look to merge IDs:** **0.35** (OKS) — tested baseline for reconnecting a "
+            "broken ID without partner false merges.\n\n"
+            "**Max joint / bbox-center / torso distances for deduplication:** **0.26** / **0.5** / **0.24** "
+            "(fractions of bbox height). All three must agree before a duplicate skeleton is removed — "
+            "do not change one without re-tuning the set."
         ),
-        min_=1,
-        max_=500,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "reid_min_oks",
-        "reid_dedup",
-        "How similar poses must look to merge IDs",
-        "float",
-        0.35,
-        binding="yaml",
-        key="REID_MIN_OKS",
-        description=(
-            "Baseline 0.35 matches the pipeline default (0–1 similarity). "
-            "Higher = merge only when poses almost match; lower = merge more aggressively."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "collision_kpt_dist_frac",
-        "reid_dedup",
-        "Max joint distance to trigger deduplication",
-        "float",
-        0.26,
-        binding="yaml",
-        key="COLLISION_KPT_DIST_FRAC",
-        min_=0.10,
-        max_=0.50,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Fraction of bbox height. Median joint distance below this deletes one of the tracks.",
-    ),
-    _f(
-        "collision_center_dist_frac",
-        "reid_dedup",
-        "Max bbox center distance for deduplication",
-        "float",
-        0.50,
-        binding="yaml",
-        key="COLLISION_CENTER_DIST_FRAC",
-        min_=0.10,
-        max_=1.0,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Bbox centers must also be this close (fraction of height) for duplicate pose deletion.",
-    ),
-    _f(
-        "dedup_torso_median_frac",
-        "reid_dedup",
-        "Max torso joint distance for deduplication",
-        "float",
-        0.24,
-        binding="yaml",
-        key="DEDUP_TORSO_MEDIAN_FRAC",
-        min_=0.10,
-        max_=0.50,
-        advanced=True,
-        tier=3,
-        display="slider",
-        description="Stricter distance check specifically across shoulders and hips to prevent merging partners.",
     ),
     _f(
         "dedup_min_pair_oks",
@@ -881,139 +996,27 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
-        "confirmed_human_min_span_frac",
+        "info_post_pose_master_locked",
         "post_pose_prune",
-        "How much of the video someone must cover to be “protected”",
-        "float",
-        0.10,
-        binding="yaml",
-        key="CONFIRMED_HUMAN_MIN_SPAN_FRAC",
-        min_=0.05,
-        max_=0.25,
-        tier=2,
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
         description=(
-            "Long-running bodies are harder to auto-delete. "
-            "Lower = late joiners still count as protected; higher = only people who are on screen a lot get that safety net."
+            "The master pipeline fixes Tier C, Tier A protection span, core Tier B garbage thresholds, and three "
+            "vote weights — they are **not** in the Lab UI. ``main.py`` reapplies them after ``params`` YAML. "
+            "For sweeps, set ``SWAY_UNLOCK_POST_POSE_PRUNE_TUNING=1``.\n\n"
+            "**Tier C:** ``TIER_C_SKELETON_MEAN`` **0.15**, ``TIER_C_LOW_FRAME_FRAC`` **0.8** — drops near-empty "
+            "skeletons (mics, speakers, background mush).\n\n"
+            "**Mushy skeletons:** ``MEAN_CONFIDENCE_MIN`` **0.45**, ``min_lower_body_conf`` **0.3**.\n\n"
+            "**Compression noise:** ``JITTER_RATIO_MAX`` **0.1**; vote weight ``prune_jittery_tracks`` **0.5**.\n\n"
+            "**Missing limbs / floating heads:** ``PRUNING_WEIGHTS`` entries ``prune_completeness_audit`` **0.6**, "
+            "``prune_head_only_tracks`` **0.8**.\n\n"
+            "**Edge / wings:** ``EDGE_MARGIN_FRAC`` **0.15**, ``EDGE_PRESENCE_FRAC`` **0.3**.\n\n"
+            "**Tier A protected span:** ``CONFIRMED_HUMAN_MIN_SPAN_FRAC`` **0.1** — on-screen ~10%+ with a solid "
+            "skeleton exempts a track from harsh Tier B voting."
         ),
-    ),
-    _f(
-        "tier_c_skeleton_mean",
-        "post_pose_prune",
-        "Cutoff for “this skeleton is basically empty”",
-        "float",
-        0.15,
-        binding="yaml",
-        key="TIER_C_SKELETON_MEAN",
-        min_=0.05,
-        max_=0.45,
-        description=(
-            "Baseline 0.15 matches the pipeline default (mean joint confidence). "
-            "Lower = drop weak skeletons sooner; higher = keep borderline bodies longer."
-        ),
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "tier_c_low_frame_frac",
-        "post_pose_prune",
-        "How many weak frames before the harsh drop",
-        "float",
-        0.80,
-        binding="yaml",
-        key="TIER_C_LOW_FRAME_FRAC",
-        description=(
-            "Baseline 0.80 matches the pipeline default (share of weak frames needed to drop someone). "
-            "Higher = only remove if most frames look bad (more lenient). Lower = remove with fewer weak frames (stricter)."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "mean_confidence_min",
-        "post_pose_prune",
-        "Average joint strength must stay above this",
-        "float",
-        0.45,
-        binding="yaml",
-        key="MEAN_CONFIDENCE_MIN",
-        min_=0.2,
-        max_=0.85,
-        description=(
-            "Baseline 0.45 matches the pipeline default. "
-            "Higher = prune mushy skeletons faster; lower = keep softer estimates."
-        ),
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "edge_margin_frac",
-        "post_pose_prune",
-        "How deep the “edge of frame” band is",
-        "float",
-        0.15,
-        binding="yaml",
-        key="EDGE_MARGIN_FRAC",
-        description=(
-            "Baseline 0.15 matches the pipeline default. "
-            "Wider band = treat more of the border as “probably audience or mirror.”"
-        ),
-        min_=0.0,
-        max_=0.5,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "edge_presence_frac",
-        "post_pose_prune",
-        "How often someone must hug the edge to count as “edge person”",
-        "float",
-        0.30,
-        binding="yaml",
-        key="EDGE_PRESENCE_FRAC",
-        description=(
-            "Baseline 0.30 matches the pipeline default. "
-            "Works with the edge band to flag people who mostly stand at the sides."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "min_lower_body_conf_yaml",
-        "post_pose_prune",
-        "Legs and hips must be this confident",
-        "float",
-        0.30,
-        binding="yaml",
-        key="min_lower_body_conf",
-        description=(
-            "Baseline 0.30 matches the pipeline default. "
-            "Helps catch mirror doubles and half-visible bodies; raise if legs look trustworthy."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
-    ),
-    _f(
-        "jitter_ratio_max",
-        "post_pose_prune",
-        "Allowed fraction of “twitchy” frames",
-        "float",
-        0.10,
-        binding="yaml",
-        key="JITTER_RATIO_MAX",
-        description=(
-            "Baseline 0.10 matches the pipeline default. "
-            "Lower = stricter (noisy tracks drop sooner); higher = tolerate shaky video."
-        ),
-        min_=0.0,
-        max_=1.0,
-        advanced=True,
-        display="slider",
     ),
     _f(
         "sync_score_min",
@@ -1079,34 +1082,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         description="High for wall-to-wall mirrors; lower if you film intentional mirrored choreography.",
     ),
     _f(
-        "pruning_w_completeness",
-        "post_pose_prune",
-        "How much “missing body parts” counts against a track",
-        "float",
-        0.6,
-        binding="yaml_pruning_weight",
-        key="prune_completeness_audit",
-        min_=0.0,
-        max_=1.0,
-        tier=2,
-        display="pruning_weight",
-        description="Broken silhouettes (torso but no legs) look less like full dancers.",
-    ),
-    _f(
-        "pruning_w_head_only",
-        "post_pose_prune",
-        "How much “only a head visible” counts against a track",
-        "float",
-        0.8,
-        binding="yaml_pruning_weight",
-        key="prune_head_only_tracks",
-        min_=0.0,
-        max_=1.0,
-        tier=2,
-        display="pruning_weight",
-        description="Good for killing floating faces in the crowd; lower if your shot is honestly tight on faces.",
-    ),
-    _f(
         "pruning_w_low_conf",
         "post_pose_prune",
         "How much weak joints count against a track",
@@ -1119,20 +1094,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         tier=2,
         display="pruning_weight",
         description="Blurry or dark footage raises this if mushy skeletons should be dropped faster.",
-    ),
-    _f(
-        "pruning_w_jittery",
-        "post_pose_prune",
-        "How much shaky motion counts against a track",
-        "float",
-        0.5,
-        binding="yaml_pruning_weight",
-        key="prune_jittery_tracks",
-        min_=0.0,
-        max_=1.0,
-        tier=2,
-        display="pruning_weight",
-        description="TV noise or compression artifacts often look like jitter—tune if real dancers get unfairly cut.",
     ),
     # --- smooth (main.py phase 9) ---
     _f(
@@ -1150,6 +1111,24 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
+        "info_smooth_master_locked",
+        "smooth",
+        "Lock these down (set and forget)",
+        "info",
+        None,
+        binding="none",
+        key="",
+        description=(
+            "The master pipeline fixes two numbers for every run — they are **not** in the Lab UI. "
+            "``main.py`` reapplies them after ``params`` YAML / Lab build. For deliberate experiments "
+            "(e.g. wider neighbor blend), set ``SWAY_UNLOCK_SMOOTH_TUNING=1``.\n\n"
+            "**Baseline smoothness (**``SMOOTHER_MIN_CUTOFF``**):** **1.0** — tuned to kill micro-jitter when "
+            "someone is nearly still without freezing joints.\n\n"
+            "**Neighbor blend half-window:** radius **2** (``SWAY_TEMPORAL_POSE_RADIUS``) — if neighbor blend "
+            "is on, raising this smears many frames together (“underwater” motion); keep the default."
+        ),
+    ),
+    _f(
         "temporal_pose_refine",
         "smooth",
         "Blend each joint with nearby frames",
@@ -1162,34 +1141,6 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "Looks a few frames before/after and nudges shaky points toward a local average. "
             "Turn off for fastest runs or when you want maximum raw responsiveness."
         ),
-    ),
-    _f(
-        "temporal_pose_radius",
-        "smooth",
-        "How many frames on each side to blend",
-        "int",
-        2,
-        binding="cli",
-        key="temporal_pose_radius",
-        description="Bigger window = smoother, slightly “heavier” motion; 0–8 allowed.",
-        min_=0,
-        max_=8,
-        tier=1,
-        display="slider",
-    ),
-    _f(
-        "smoother_min_cutoff",
-        "smooth",
-        "Baseline smoothness (lower = more smoothing)",
-        "float",
-        1.0,
-        binding="yaml",
-        key="SMOOTHER_MIN_CUTOFF",
-        min_=0.01,
-        max_=10.0,
-        description="Small values drag joints more; large values stay closer to the raw estimate.",
-        advanced=True,
-        display="slider",
     ),
     _f(
         "smoother_beta",
@@ -1242,6 +1193,39 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         description=(
             "On by default in the lab: small MP4s per stage so you can scrub what changed without re-running everything. "
             "Turn off to save disk and a little export time."
+        ),
+    ),
+    _f(
+        "sway_vis_temporal_interp_mode",
+        "export",
+        "Smooth overlays between saved frames (video only)",
+        "enum",
+        "linear",
+        binding="env",
+        key="SWAY_VIS_TEMPORAL_INTERP_MODE",
+        choices=["linear", "gsi"],
+        advanced=True,
+        tier=3,
+        display="segmented",
+        description=(
+            "Final MP4s can run at native FPS while pose/boxes are stored at processed rate—this chooses how to blend "
+            "in between. Linear is default. GSI is optional; lengthscale uses SWAY_GSI_LENGTHSCALE or "
+            "SWAY_VIS_GSI_LENGTHSCALE in YAML."
+        ),
+    ),
+    _f(
+        "sway_hmr_mesh_sidecar",
+        "export",
+        "Write hmr_mesh_sidecar.json placeholder after export",
+        "bool",
+        False,
+        binding="env",
+        key="SWAY_HMR_MESH_SIDECAR",
+        advanced=True,
+        tier=3,
+        description=(
+            "Default off. When on, ``main.py`` writes ``hmr_mesh_sidecar.json`` in the output folder after rendering "
+            "(schema stub until HMR / mesh export exists). For experiments, see also ``tools/hmr_3d_optional_stub.py``."
         ),
     ),
 ]

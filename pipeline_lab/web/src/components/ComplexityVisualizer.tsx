@@ -1,5 +1,13 @@
 import { useEffect, useRef, useMemo } from 'react'
 
+const PALETTE = [
+  '#0ea5e9', // blue
+  '#06b6d4', // cyan
+  '#8b5cf6', // purple
+  '#ec4899', // pink
+  '#10b981'  // emerald
+]
+
 type Metrics = {
   numNodes: number
   nodeSpeed: number
@@ -22,18 +30,30 @@ function calculateComplexityMetrics(fields: Record<string, unknown>): Metrics {
   else if (pose === 'ViTPose-Large') score += 3
   else score += 1
 
-  // detection resolution
-  const detSize = Number(fields.sway_detect_size) || 1280
-  score += detSize > 1280 ? 4 : (detSize < 1280 ? 1 : 2)
+  // Master stack: SWAY_DETECT_SIZE=640 + SWAY_GROUP_VIDEO → effective letterbox ≥960 in tracker.py
+  const detLetterbox = 960
+  score += detLetterbox > 1280 ? 4 : detLetterbox > 960 ? 3 : detLetterbox > 640 ? 2 : 1
 
-  // tracker 
+  // tracker
   const track = String(fields.tracker_technology || '')
-  if (track === 'BoT-SORT') score += 3
-  else if (track === 'BoxMOT') score += 1
+  if (track === 'deep_ocsort_osnet' || track === 'StrongSORT') score += 2
+  else if (track === 'BoxMOT' || track === 'deep_ocsort') score += 1
 
-  // hybrid sam
-  if (fields.sway_hybrid_sam_overlap) score += 3
-  
+  // Master stack: hybrid SAM overlap always on in production
+  score += 3
+
+  const yoloStride = Number(fields.sway_yolo_detection_stride) || 1
+  if (yoloStride > 1) score += 1
+
+  if (Number(fields.pose_stride) === 2) score += 1
+
+  if (fields.sway_bidirectional_track_pass) score += 4
+
+  if (fields.sway_gnn_track_refine) score += 1
+  if (fields.sway_hmr_mesh_sidecar) score += 1
+
+  if (String(fields.pose_model || '').includes('Sapiens')) score += 1
+
   // temporal refine
   if (fields.temporal_pose_refine) score += 2
 
@@ -41,10 +61,10 @@ function calculateComplexityMetrics(fields: Record<string, unknown>): Metrics {
   const normalized = Math.max(0, Math.min(1, (score - 5) / 20)) // 0.0 to 1.0
   
   return {
-    numNodes: Math.floor(20 + normalized * 70), // 20 to 90 nodes
-    nodeSpeed: 0.2 + normalized * 0.8, // 0.2 to 1.0 speed
-    glowAlpha: 0.1 + normalized * 0.4, // brightens
-    linkDist: 100 + normalized * 60 // 100 to 160 link distance
+    numNodes: Math.floor(20 + normalized * 80), // 20 to 100 nodes
+    nodeSpeed: 0.15 + normalized * 0.85, 
+    glowAlpha: 0.15 + normalized * 0.45, 
+    linkDist: 110 + normalized * 70
   }
 }
 
@@ -56,6 +76,7 @@ class Node {
   radius: number
   pulseSpeed: number
   pulseOffset: number
+  colorIndex: number
   
   constructor(w: number, h: number, speed: number) {
     this.x = Math.random() * w
@@ -64,34 +85,91 @@ class Node {
     const s = (Math.random() * 0.5 + 0.5) * speed
     this.vx = Math.cos(angle) * s
     this.vy = Math.sin(angle) * s
-    this.radius = Math.random() * 2 + 1
-    this.pulseSpeed = Math.random() * 0.05 + 0.01
+    this.radius = Math.random() * 2 + 1.5
+    this.pulseSpeed = Math.random() * 0.03 + 0.01
     this.pulseOffset = Math.random() * Math.PI * 2
+    this.colorIndex = Math.floor(Math.random() * PALETTE.length)
   }
 
-  update(w: number, h: number, speedMult: number) {
+  update(w: number, h: number, speedMult: number, mouseX: number, mouseY: number) {
     this.x += this.vx * speedMult
     this.y += this.vy * speedMult
     
-    if (this.x < 0) { this.x = 0; this.vx *= -1 }
-    if (this.x > w) { this.x = w; this.vx *= -1 }
-    if (this.y < 0) { this.y = 0; this.vy *= -1 }
-    if (this.y > h) { this.y = h; this.vy *= -1 }
+    // Repel from mouse
+    if (mouseX > 0 && mouseY > 0) {
+      const dx = this.x - mouseX
+      const dy = this.y - mouseY
+      const distSq = dx*dx + dy*dy
+      if (distSq < 40000) { // 200px radius
+        const dist = Math.sqrt(distSq)
+        const force = (200 - dist) / 200
+        this.x += (dx / dist) * force * 2
+        this.y += (dy / dist) * force * 2
+      }
+    }
+    
+    // Bounce off walls smoothly (with a margin, so they don't pop instantly at edges)
+    const margin = 50
+    if (this.x < -margin) { this.x = -margin; this.vx *= -1 }
+    if (this.x > w + margin) { this.x = w + margin; this.vx *= -1 }
+    if (this.y < -margin) { this.y = -margin; this.vy *= -1 }
+    if (this.y > h + margin) { this.y = h + margin; this.vy *= -1 }
   }
+}
+
+class DataPacket {
+  progress: number
+  speed: number
+  sourceIdx: number
+  targetIdx: number
+  
+  constructor(sourceIdx: number, targetIdx: number) {
+    this.progress = 0
+    this.speed = Math.random() * 0.02 + 0.01 // 1% to 3% per frame
+    this.sourceIdx = sourceIdx
+    this.targetIdx = targetIdx
+  }
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result ? [
+    parseInt(result[1], 16),
+    parseInt(result[2], 16),
+    parseInt(result[3], 16)
+  ] : [0, 0, 0];
 }
 
 export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsState: Record<string, unknown>, className?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const metrics = useMemo(() => calculateComplexityMetrics(fieldsState), [fieldsState])
   
-  // Keep refs for animation loop
+  // Animation state references
   const nodesRef = useRef<Node[]>([])
+  const packetsRef = useRef<DataPacket[]>([])
   const metricsRef = useRef(metrics)
   const timeRef = useRef(0)
+  const mouseRef = useRef({ x: -1000, y: -1000 })
   
   useEffect(() => {
     metricsRef.current = metrics
   }, [metrics])
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      // Need bounding rect of canvas to get relative coords
+      const canvas = canvasRef.current
+      if (canvas) {
+        const rect = canvas.getBoundingClientRect()
+        mouseRef.current = {
+          x: e.clientX - rect.left,
+          y: e.clientY - rect.top
+        }
+      }
+    }
+    window.addEventListener('mousemove', handleMouseMove)
+    return () => window.removeEventListener('mousemove', handleMouseMove)
+  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -102,11 +180,19 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
     let w = canvas.width
     let h = canvas.height
     
+    const rgbCache = PALETTE.map(hexToRgb)
+    
     const resize = () => {
       const rect = canvas.parentElement?.getBoundingClientRect()
       if (rect) {
-        canvas.width = rect.width
-        canvas.height = rect.height
+        // High DPI canvas support
+        const dpr = window.devicePixelRatio || 1
+        canvas.width = rect.width * dpr
+        canvas.height = rect.height * dpr
+        ctx.scale(dpr, dpr)
+        canvas.style.width = `${rect.width}px`
+        canvas.style.height = `${rect.height}px`
+        
         w = rect.width
         h = rect.height
         
@@ -130,49 +216,131 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
       
       ctx.clearRect(0, 0, w, h)
       
-      // Draw a highly transparent background that glows
-      const cx = w * 0.8
-      const cy = h * 0.2
-      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h))
-      grad.addColorStop(0, `rgba(6, 182, 212, ${m.glowAlpha * 0.2})`)
+      // Draw background super subtle multi-color glow
+      const cx = w * 0.5
+      const cy = h * 0.5
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.8)
+      grad.addColorStop(0, `rgba(14, 165, 233, ${m.glowAlpha * 0.15})`)
+      grad.addColorStop(0.5, `rgba(139, 92, 246, ${m.glowAlpha * 0.05})`)
       grad.addColorStop(1, 'rgba(0,0,0,0)')
       
       ctx.fillStyle = grad
       ctx.fillRect(0, 0, w, h)
       
-      // We keep a pool of max nodes, but only render up to currentNodes
       const pool = nodesRef.current
+      const activeNodes = pool.slice(0, currentNodes)
+      const mouse = mouseRef.current
+      
+      // Update node positions
+      for (let i = 0; i < currentNodes; i++) {
+        activeNodes[i].update(w, h, m.nodeSpeed, mouse.x, mouse.y)
+      }
+      
+      // Build links dynamically based on proximity
+      const links: [number, number, number][] = [] // idxA, idxB, distance
+      const linkSq = m.linkDist * m.linkDist
       
       for (let i = 0; i < currentNodes; i++) {
-        const node = pool[i]
-        node.update(w, h, m.nodeSpeed)
-        
-        // pulsing radius
-        const r = node.radius + Math.sin(timeRef.current * node.pulseSpeed + node.pulseOffset) * 1.5
-        
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, Math.max(0.5, r), 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(14, 165, 233, ${0.4 + m.glowAlpha})`
-        ctx.fill()
-        
-        // draw links
+        const node = activeNodes[i]
         for (let j = i + 1; j < currentNodes; j++) {
-          const other = pool[j]
+          const other = activeNodes[j]
           const dx = node.x - other.x
           const dy = node.y - other.y
           const distSq = dx*dx + dy*dy
-          const linkSq = m.linkDist * m.linkDist
           
           if (distSq < linkSq) {
-            const alpha = 1 - Math.sqrt(distSq) / m.linkDist
-            ctx.beginPath()
-            ctx.moveTo(node.x, node.y)
-            ctx.lineTo(other.x, other.y)
-            ctx.strokeStyle = `rgba(6, 182, 212, ${alpha * (0.3 + m.glowAlpha * 0.5)})`
-            ctx.lineWidth = 1 + alpha
-            ctx.stroke()
+            links.push([i, j, Math.sqrt(distSq)])
           }
         }
+      }
+      
+      // Spawn data packets along active links randomly
+      // Packets spawn more often when network is denser / complex
+      if (links.length > 0 && Math.random() < (0.05 + m.glowAlpha * 0.1)) {
+        const link = links[Math.floor(Math.random() * links.length)]
+        if (Math.random() > 0.5) packetsRef.current.push(new DataPacket(link[0], link[1]))
+        else packetsRef.current.push(new DataPacket(link[1], link[0]))
+      }
+      
+      // Clean up packets that reached their destination or whose nodes were removed
+      packetsRef.current = packetsRef.current.filter(p => 
+        p.progress < 1 && p.sourceIdx < currentNodes && p.targetIdx < currentNodes
+      )
+      
+      // Rendering Layer 1: The connecting links
+      ctx.lineCap = 'round'
+      for (const [i, j, dist] of links) {
+        const node = activeNodes[i]
+        const other = activeNodes[j]
+        const alpha = Math.pow(1 - dist / m.linkDist, 1.5) // non-linear fade for organic feel
+        
+        ctx.beginPath()
+        ctx.moveTo(node.x, node.y)
+        ctx.lineTo(other.x, other.y)
+        
+        // Dynamic gradient between the two connected nodes' colors
+        const linkGrad = ctx.createLinearGradient(node.x, node.y, other.x, other.y)
+        const [r1, g1, b1] = rgbCache[node.colorIndex]
+        const [r2, g2, b2] = rgbCache[other.colorIndex]
+        
+        linkGrad.addColorStop(0, `rgba(${r1}, ${g1}, ${b1}, ${alpha * (0.2 + m.glowAlpha * 0.4)})`)
+        linkGrad.addColorStop(1, `rgba(${r2}, ${g2}, ${b2}, ${alpha * (0.2 + m.glowAlpha * 0.4)})`)
+        
+        ctx.strokeStyle = linkGrad
+        ctx.lineWidth = 1 + alpha * 1.5
+        ctx.stroke()
+      }
+      
+      // Rendering Layer 2: Moving data packets traversing the links
+      for (const packet of packetsRef.current) {
+        packet.progress += packet.speed * m.nodeSpeed
+        if (packet.progress > 1) continue
+        
+        const source = activeNodes[packet.sourceIdx]
+        const target = activeNodes[packet.targetIdx]
+        
+        const px = source.x + (target.x - source.x) * packet.progress
+        const py = source.y + (target.y - source.y) * packet.progress
+        
+        const [r, g, b] = rgbCache[target.colorIndex]
+        const alpha = Math.sin(packet.progress * Math.PI) // fade in and out at ends
+        
+        ctx.beginPath()
+        ctx.arc(px, py, 2.5, 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.9})`
+        ctx.fill()
+        
+        // Packet trails/glow
+        ctx.beginPath()
+        ctx.arc(px, py, 6, 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha * 0.8})`
+        ctx.fill()
+      }
+
+      // Rendering Layer 3: The nodes themselves
+      for (let i = 0; i < currentNodes; i++) {
+        const node = activeNodes[i]
+        const [r, g, b] = rgbCache[node.colorIndex]
+        
+        // Outer pulsing ring for aesthetic
+        const pulseR = node.radius * 2.5 + Math.sin(timeRef.current * node.pulseSpeed + node.pulseOffset) * 2
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, Math.max(0.1, pulseR), 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${0.15 + m.glowAlpha * 0.2})`
+        ctx.fill()
+        
+        // Inner bright solid core
+        const coreAlpha = 0.6 + m.glowAlpha * 0.4
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(255, 255, 255, ${coreAlpha})`
+        ctx.fill()
+
+        // Core secondary halo
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${coreAlpha * 0.8})`
+        ctx.fill()
       }
     }
     
@@ -192,9 +360,9 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
         top: 0,
         left: 0,
         pointerEvents: 'none',
-        opacity: 0.45,
+        opacity: 0.65,
         mixBlendMode: 'screen',
-        transition: 'opacity 0.5s ease',
+        transition: 'opacity 0.8s ease',
         zIndex: 0
       }} 
     />

@@ -8,6 +8,8 @@ inspired by the same ±window idea. Use when single-frame ViTPose is jittery.
 Default on (CLI). Disable with ``--no-temporal-pose-refine`` or ``SWAY_TEMPORAL_POSE_REFINE=0``.
 Explicit ``SWAY_TEMPORAL_POSE_REFINE=1`` forces on even if CLI disables.
 Radius: ``--temporal-pose-radius`` or ``SWAY_TEMPORAL_POSE_RADIUS`` (default 2).
+Production ``main.py`` / Lab set ``SWAY_TEMPORAL_POSE_RADIUS=2`` after params (§14.0.1) unless
+``SWAY_UNLOCK_SMOOTH_TUNING=1``.
 """
 
 from __future__ import annotations

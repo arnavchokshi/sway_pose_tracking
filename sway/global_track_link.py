@@ -6,6 +6,10 @@ Global appearance-free tracklet stitching after dormant merges.
   otherwise the legacy **heuristic** spatial/temporal stitch.
 - Set ``SWAY_GLOBAL_AFLINK=0`` (or ``heuristic``) to force the heuristic even when
   weights are present.
+
+Neural thresholds (defaults **0, 30, 75, 0.05**): ``SWAY_AFLINK_THR_T0``, ``SWAY_AFLINK_THR_T1``,
+``SWAY_AFLINK_THR_S``, ``SWAY_AFLINK_THR_P``. Production ``main.py`` reapplies these after params
+(§7.0.1) unless ``SWAY_UNLOCK_PHASE3_STITCH_TUNING=1``. Only read when the neural linker runs.
 """
 
 from __future__ import annotations
@@ -172,6 +176,16 @@ def mot_array_to_raw_tracks(
     return {k: sorted(out[k], key=lambda o: o.frame_idx) for k in sorted(out.keys())}
 
 
+def _aflink_thr_from_env() -> Tuple[Tuple[int, int], int, float]:
+    t0 = int(os.environ.get("SWAY_AFLINK_THR_T0", "0"))
+    t1 = int(os.environ.get("SWAY_AFLINK_THR_T1", "30"))
+    thr_s = int(os.environ.get("SWAY_AFLINK_THR_S", "75"))
+    thr_p = float(os.environ.get("SWAY_AFLINK_THR_P", "0.05"))
+    if t1 <= t0:
+        return (0, 30), thr_s, thr_p
+    return (t0, t1), thr_s, thr_p
+
+
 def neural_global_stitch(
     raw_tracks: Dict[int, List[TrackEntry]],
     total_frames: int,
@@ -214,7 +228,10 @@ def maybe_global_stitch(
     path = resolve_aflink_weights()
     if path.is_file() and not _force_heuristic_global_link():
         try:
-            return neural_global_stitch(raw_tracks, total_frames, str(path))
+            thr_t, thr_s, thr_p = _aflink_thr_from_env()
+            return neural_global_stitch(
+                raw_tracks, total_frames, str(path), thrT=thr_t, thrS=thr_s, thrP=thr_p
+            )
         except Exception as exc:
             warnings.warn(
                 f"SWAY_GLOBAL_LINK: AFLink failed ({exc}); falling back to heuristic_global_stitch.",

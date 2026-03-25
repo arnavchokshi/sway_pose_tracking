@@ -29,6 +29,7 @@ vw.release()
 print("Smoke clip:", out.resolve())
 PY
 
+export SWAY_UNLOCK_HYBRID_SAM_TUNING=1
 export SWAY_HYBRID_SAM_OVERLAP=0
 export SWAY_YOLO_DETECTION_STRIDE=2
 python3 main.py output/_pipeline_smoke/tiny.mp4 \

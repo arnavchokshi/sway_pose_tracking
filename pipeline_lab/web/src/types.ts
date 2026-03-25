@@ -21,6 +21,8 @@ export type SchemaField = {
   /** UI hint: slider | segmented | model_cards | pruning_weight | tracker_strip */
   display?: string
   disabled_choices?: (string | number)[]
+  /** When true, Pipeline Lab does not render this control (CLI/API may still set it). */
+  lab_hidden?: boolean
 }
 
 export type Schema = { stages: SchemaStage[]; fields: SchemaField[] }
@@ -43,6 +45,8 @@ export type RunInfo = {
   status: string
   recipe_name: string
   video_stem: string
+  /** Present when the run was part of a batch upload or batch_path matrix queue. */
+  batch_id?: string
   created?: string
   progress?: ProgressLine[]
   error?: string
@@ -52,6 +56,9 @@ export type RunInfo = {
   manifest?: {
     run_context_final?: Record<string, unknown> & {
       track_summary?: Record<string, unknown>
+      fields?: Record<string, unknown>
+      pipeline_diagnostics?: Record<string, unknown>
+      recipe_name?: string
     }
   }
 }

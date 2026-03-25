@@ -3,6 +3,9 @@ Temporal Smoothing Module — 1 Euro Filter (V3.0)
 
 Applies the 1 Euro Filter to (x, y) coordinates of each joint over time per track ID.
 V3.0: Suspended when keypoint confidence < 0.3 to prevent smoothing hallucinated geometry.
+
+``SMOOTHER_MIN_CUTOFF`` in ``params`` is master-locked to **1.0** (§14.0.1) unless
+``SWAY_UNLOCK_SMOOTH_TUNING=1``.
 """
 
 import math

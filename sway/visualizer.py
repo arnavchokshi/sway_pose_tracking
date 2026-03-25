@@ -5,6 +5,10 @@ Exports smoothed keypoint data to JSON and renders an MP4 video with
 bounding boxes, track IDs, and skeleton overlays. Supports Phase 3 & 4:
 joint angle deviation heatmap (Red/Yellow/Green per bone) and JSON export
 with angles and deviations.
+
+Export-time blend between processed_fps samples and native_fps (default **linear**).
+Optional: ``SWAY_VIS_TEMPORAL_INTERP_MODE=gsi`` and ``SWAY_VIS_GSI_LENGTHSCALE`` /
+``SWAY_GSI_LENGTHSCALE`` for smoother overlay motion in MP4s (does not change JSON samples).
 """
 
 import json
@@ -15,11 +19,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
 
+from .interp_utils import blend_scalar
 from .pose_estimator import COCO_KEYPOINT_NAMES, COCO_SKELETON_EDGES
 
 # Colors (BGR for OpenCV)
@@ -130,6 +135,109 @@ def draw_boxes_only(
             label = f"{label} {mc:.2f}"
         cv2.putText(out, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
                      0.6, TEXT_COLOR, 1, cv2.LINE_AA)
+    return out
+
+
+def _draw_dashed_rect_bgr(
+    img: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    color: Tuple[int, int, int],
+    thickness: int = 2,
+    dash: int = 14,
+    gap: int = 8,
+) -> None:
+    """Dashed axis-aligned rectangle (BGR)."""
+    if x2 <= x1 or y2 <= y1:
+        return
+    step = dash + gap
+
+    def hline(y: int, xa: int, xb: int) -> None:
+        x = xa
+        while x < xb:
+            xe = min(x + dash, xb)
+            cv2.line(img, (x, y), (xe, y), color, thickness, cv2.LINE_AA)
+            x += step
+
+    def vline(x: int, ya: int, yb: int) -> None:
+        y = ya
+        while y < yb:
+            ye = min(y + dash, yb)
+            cv2.line(img, (x, y), (x, ye), color, thickness, cv2.LINE_AA)
+            y += step
+
+    hline(y1, x1, x2)
+    hline(y2, x1, x2)
+    vline(x1, y1, y2)
+    vline(x2, y1, y2)
+
+
+def draw_tracks_post_stitch_preview(
+    frame: np.ndarray,
+    boxes: List[tuple],
+    track_ids: List[int],
+    sam2_input_roi_xyxy: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """
+    Phase 1–3 preview: boxes/IDs plus optional dashed rectangle for the image region fed to SAM2
+    when hybrid overlap refinement ran (ROI crop or full frame).
+    """
+    out = draw_boxes_only(frame, boxes, track_ids)
+    if sam2_input_roi_xyxy is None or len(sam2_input_roi_xyxy) < 4:
+        return out
+    h, w = out.shape[:2]
+    x1 = int(round(float(sam2_input_roi_xyxy[0])))
+    y1 = int(round(float(sam2_input_roi_xyxy[1])))
+    x2 = int(round(float(sam2_input_roi_xyxy[2])))
+    y2 = int(round(float(sam2_input_roi_xyxy[3])))
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
+    if x2 <= x1 or y2 <= y1:
+        return out
+    # Orange-cyan (BGR): visible on stage footage
+    col = (0, 165, 255)
+    _draw_dashed_rect_bgr(out, x1, y1, x2, y2, col, thickness=2)
+    label = "SAM2 input"
+    cv2.putText(
+        out,
+        label,
+        (x1, max(12, y1 - 6)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        col,
+        2,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+# Distinct from green track boxes in other phase previews (BGR).
+PHASE1_PREVIEW_BOX_BGR = (0, 220, 255)
+
+
+def draw_phase1_detection_preview(frame: np.ndarray, fd: Dict) -> np.ndarray:
+    """Draw every Phase-1 person box with detector confidence (no track IDs)."""
+    boxes = fd.get("phase1_boxes") or []
+    confs = fd.get("phase1_confs") or []
+    out = frame.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for box, cf in zip(boxes, confs):
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(out, (x1, y1), (x2, y2), PHASE1_PREVIEW_BOX_BGR, 2)
+        cv2.putText(
+            out,
+            f"{float(cf):.2f}",
+            (x1, max(18, y1 - 6)),
+            font,
+            0.55,
+            TEXT_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
     return out
 
 
@@ -694,10 +802,45 @@ def _frame_to_json_tracks(
     return frame_entry
 
 
+def read_export_temporal_interp_config() -> Tuple[str, float]:
+    """
+    Export / phase-preview temporal blend between processed_fps samples (default linear).
+    Env: SWAY_VIS_TEMPORAL_INTERP_MODE=linear|gsi, SWAY_VIS_GSI_LENGTHSCALE (else SWAY_GSI_LENGTHSCALE).
+    """
+    mode = os.environ.get("SWAY_VIS_TEMPORAL_INTERP_MODE", "linear").strip().lower() or "linear"
+    v = os.environ.get("SWAY_VIS_GSI_LENGTHSCALE", "").strip()
+    if v:
+        gsl = float(v)
+    else:
+        g = os.environ.get("SWAY_GSI_LENGTHSCALE", "").strip()
+        gsl = float(g) if g else 0.35
+    return mode, gsl
+
+
+def _pick_phase1_dets_for_interp(fd_lo: Dict, fd_hi: Dict, t: float) -> Tuple[List, List]:
+    """Nearest-neighbor blend for unordered detection lists (no stable per-det ID)."""
+    bl = fd_lo.get("phase1_boxes") or []
+    cl = fd_lo.get("phase1_confs") or []
+    bh = fd_hi.get("phase1_boxes") or []
+    ch = fd_hi.get("phase1_confs") or []
+    if not bl and not bh:
+        return [], []
+    if not bl:
+        return list(bh), list(ch)
+    if not bh:
+        return list(bl), list(cl)
+    if t < 0.5:
+        return list(bl), list(cl)
+    return list(bh), list(ch)
+
+
 def _interpolate_frame_data(
     fd_lo: Dict,
     fd_hi: Dict,
     t: float,
+    *,
+    temporal_mode: str = "linear",
+    gsi_lengthscale: float = 0.35,
 ) -> Dict:
     """Interpolate boxes, poses, deviations between two frame-data dicts. t in [0,1]."""
     all_tids = set(fd_lo.get("track_ids", [])) | set(fd_hi.get("track_ids", []))
@@ -722,7 +865,10 @@ def _interpolate_frame_data(
     for tid in sorted(all_tids):
         if tid in boxes_lo and tid in boxes_hi:
             b_lo, b_hi = boxes_lo[tid], boxes_hi[tid]
-            box = tuple(b_lo[i] + t * (b_hi[i] - b_lo[i]) for i in range(4))
+            box = tuple(
+                blend_scalar(t, float(b_lo[i]), float(b_hi[i]), mode=temporal_mode, gsi_l=gsi_lengthscale)
+                for i in range(4)
+            )
         elif tid in boxes_lo:
             box = boxes_lo[tid]
         elif tid in boxes_hi:
@@ -742,8 +888,22 @@ def _interpolate_frame_data(
                 sc_lo = np.full(17, float(sc_lo))
             if sc_hi.ndim == 0:
                 sc_hi = np.full(17, float(sc_hi))
-            kpt_interp = kpt_lo + t * (kpt_hi - kpt_lo)
-            sc_interp = np.maximum(sc_lo, sc_hi)  # keep higher confidence
+            kpt_lo_f = np.asarray(kpt_lo, dtype=np.float64)
+            kpt_hi_f = np.asarray(kpt_hi, dtype=np.float64)
+            if temporal_mode == "gsi":
+                kpt_interp = np.empty_like(kpt_lo_f, dtype=np.float64)
+                for ii in range(kpt_interp.size):
+                    kpt_interp.flat[ii] = blend_scalar(
+                        t,
+                        float(kpt_lo_f.flat[ii]),
+                        float(kpt_hi_f.flat[ii]),
+                        mode="gsi",
+                        gsi_l=gsi_lengthscale,
+                    )
+                kpt_interp = kpt_interp.astype(np.float32)
+            else:
+                kpt_interp = (kpt_lo_f + t * (kpt_hi_f - kpt_lo_f)).astype(np.float32)
+            sc_interp = np.maximum(sc_lo, sc_hi)  # keep higher confidence (same for linear / gsi export)
             poses_out[tid] = {"keypoints": kpt_interp, "scores": sc_interp}
             k3_lo = poses_lo[tid].get("keypoints_3d")
             k3_hi = poses_hi[tid].get("keypoints_3d")
@@ -751,7 +911,15 @@ def _interpolate_frame_data(
                 a = np.asarray(k3_lo, dtype=np.float64)
                 b = np.asarray(k3_hi, dtype=np.float64)
                 if a.shape == b.shape:
-                    poses_out[tid]["keypoints_3d"] = (a + t * (b - a)).astype(np.float32).tolist()
+                    if temporal_mode == "gsi":
+                        out3 = np.empty_like(a)
+                        for ii in range(out3.size):
+                            out3.flat[ii] = blend_scalar(
+                                t, float(a.flat[ii]), float(b.flat[ii]), mode="gsi", gsi_l=gsi_lengthscale
+                            )
+                        poses_out[tid]["keypoints_3d"] = out3.astype(np.float32).tolist()
+                    else:
+                        poses_out[tid]["keypoints_3d"] = (a + t * (b - a)).astype(np.float32).tolist()
             elif k3_lo is not None:
                 poses_out[tid]["keypoints_3d"] = k3_lo
             elif k3_hi is not None:
@@ -762,7 +930,15 @@ def _interpolate_frame_data(
                 L0 = np.asarray(lift_lo, dtype=np.float64)
                 L1 = np.asarray(lift_hi, dtype=np.float64)
                 if L0.shape == L1.shape:
-                    poses_out[tid]["lift_xyz"] = (L0 + t * (L1 - L0)).astype(np.float32)
+                    if temporal_mode == "gsi":
+                        out_l = np.empty_like(L0)
+                        for ii in range(out_l.size):
+                            out_l.flat[ii] = blend_scalar(
+                                t, float(L0.flat[ii]), float(L1.flat[ii]), mode="gsi", gsi_l=gsi_lengthscale
+                            )
+                        poses_out[tid]["lift_xyz"] = out_l.astype(np.float32)
+                    else:
+                        poses_out[tid]["lift_xyz"] = (L0 + t * (L1 - L0)).astype(np.float32)
             elif lift_lo is not None:
                 poses_out[tid]["lift_xyz"] = np.asarray(lift_lo, dtype=np.float32).copy()
             elif lift_hi is not None:
@@ -781,7 +957,9 @@ def _interpolate_frame_data(
                 v_hi = d_hi.get(k)
                 if v_lo is not None and v_hi is not None:
                     if not (math.isnan(v_lo) or math.isinf(v_lo) or math.isnan(v_hi) or math.isinf(v_hi)):
-                        deviations_out[tid][k] = v_lo + t * (v_hi - v_lo)
+                        deviations_out[tid][k] = blend_scalar(
+                            t, float(v_lo), float(v_hi), mode=temporal_mode, gsi_l=gsi_lengthscale
+                        )
                     else:
                         deviations_out[tid][k] = v_hi if t >= 0.5 else v_lo
                 elif v_lo is not None:
@@ -835,6 +1013,8 @@ def _interpolate_frame_data(
         is_sam_out.append(fb)
         seg_masks_out.append(mk)
 
+    p1b, p1c = _pick_phase1_dets_for_interp(fd_lo, fd_hi, t)
+
     return {
         "boxes": boxes_out,
         "track_ids": track_ids_out,
@@ -844,6 +1024,8 @@ def _interpolate_frame_data(
         "timing_errors": timing_out,
         "is_sam_refined": is_sam_out,
         "segmentation_masks": seg_masks_out,
+        "phase1_boxes": p1b,
+        "phase1_confs": p1c,
     }
 
 
@@ -1231,6 +1413,7 @@ def render_and_export(
         cv2.VideoWriter(str(part_p), fourcc, native_fps, (w, h)) for _, _, part_p, _ in variant_rows
     ]
     num_processed = len(all_frame_data)
+    vis_t_mode, vis_gsi_l = read_export_temporal_interp_config()
 
     cap = cv2.VideoCapture(str(video_path))
     total_native_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1249,7 +1432,9 @@ def render_and_export(
 
         fd_lo = all_frame_data[idx_lo]
         fd_hi = all_frame_data[idx_hi]
-        interp = _interpolate_frame_data(fd_lo, fd_hi, t)
+        interp = _interpolate_frame_data(
+            fd_lo, fd_hi, t, temporal_mode=vis_t_mode, gsi_lengthscale=vis_gsi_l
+        )
 
         for wr, (_, _, _, draw_fn) in zip(writers, variant_rows):
             wr.write(draw_fn(frame, interp, orig_idx))
@@ -1450,6 +1635,8 @@ def render_phase_clip(
     if not writer.isOpened():
         print(f"    Warning: VideoWriter failed for {output_path.name} (mp4v); phase clip may be empty.")
 
+    vis_t_mode, vis_gsi_l = read_export_temporal_interp_config()
+
     if show_title_card:
         for card in _make_title_card(phase_label, w, h, native_fps):
             writer.write(card)
@@ -1470,7 +1657,11 @@ def render_phase_clip(
 
         fd_lo = frame_data[idx_lo]
         fd_hi = frame_data[idx_hi]
-        interp = dict(_interpolate_frame_data(fd_lo, fd_hi, t))
+        interp = dict(
+            _interpolate_frame_data(
+                fd_lo, fd_hi, t, temporal_mode=vis_t_mode, gsi_lengthscale=vis_gsi_l
+            )
+        )
         interp["frame_idx"] = int(orig_idx)
 
         annotated = draw_fn(frame, interp)

@@ -4,6 +4,7 @@ import type { Schema, SchemaField } from '../types'
 import { API } from '../types'
 import {
   applyConfigPreset,
+  applyLabHiddenSchemaDefaults,
   CONFIG_PRESET_BLURBS,
   CONFIG_PRESET_LABELS,
   CONFIG_PRESET_ORDER,
@@ -13,6 +14,11 @@ import {
 import { HYBRID_SAM_PHASE_ID, hideHybridSamPhase } from '../lib/labFieldVisibility'
 import { effectiveFieldTier, isSchemaFieldVisible, tier1FieldSortKey } from '../lib/labFieldMeta'
 import { mainPyPhaseCaption } from '../lib/schemaStageCaption'
+import {
+  buildPipelineFlowchartRows,
+  flowchartRowIsActive,
+  flowchartRowIsDone,
+} from '../lib/flowchartRows'
 import { InlineFieldInput } from './InlineFieldInput'
 import { ConfigFieldWrap, ConfigInfoFold } from './ConfigFieldWrap'
 import { X, Zap, Scale, Trophy } from 'lucide-react'
@@ -65,7 +71,7 @@ export function RunEditorModal({
     if (!open || !draft) return
     setRecipeName(draft.recipeName)
     const base = defaultsFromSchema(schema.fields)
-    setFieldsState({ ...base, ...draft.fields })
+    setFieldsState(applyLabHiddenSchemaDefaults(schema.fields, { ...base, ...draft.fields }))
     setActivePhaseIndex(0)
   }, [open, draft?.clientId, draft?.recipeName, draft?.fields, schema.fields])
 
@@ -81,11 +87,13 @@ export function RunEditorModal({
   )
 
   const tier1Fields = useMemo(() => {
-    const skip = new Set(['temporal_pose_radius', 'temporal_pose_refine'])
+    const skip = new Set(['temporal_pose_refine'])
     return schema.fields
       .filter((f) => visible(f) && effectiveFieldTier(f) === 1 && !skip.has(f.id))
       .sort((a, b) => tier1FieldSortKey(a.id) - tier1FieldSortKey(b.id))
   }, [schema.fields, visible])
+
+  const flowchartRows = useMemo(() => buildPipelineFlowchartRows(schema.stages), [schema.stages])
 
   const applyPreset = (id: ConfigPresetId) => {
     setFieldsState(applyConfigPreset(schema, id))
@@ -93,7 +101,7 @@ export function RunEditorModal({
 
   if (!open || !draft) return null
 
-  const stages = schema.stages.filter((s) => s.id !== 'export')
+  const stages = schema.stages
   const activeStage = stages[activePhaseIndex]
 
   const tuneFieldsForPhase = (phaseId: string) =>
@@ -105,7 +113,7 @@ export function RunEditorModal({
           visible(f) &&
           effectiveFieldTier(f) === 2,
       )
-      .filter((f) => !['temporal_pose_refine', 'temporal_pose_radius'].includes(f.id))
+      .filter((f) => f.id !== 'temporal_pose_refine')
       .filter((f) => f.display !== 'pruning_weight')
 
   const advancedFieldsForPhase = (phaseId: string) =>
@@ -114,7 +122,6 @@ export function RunEditorModal({
     )
 
   const temporalRefineField = schema.fields.find((f) => f.id === 'temporal_pose_refine')
-  const temporalRadiusField = schema.fields.find((f) => f.id === 'temporal_pose_radius')
   const poseModelField = schema.fields.find((f) => f.id === 'pose_model')
 
   const pruningWeightFields = schema.fields.filter(
@@ -195,7 +202,9 @@ export function RunEditorModal({
         <div style={{ padding: '1rem 1.25rem', overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
             Big choices up top; open <strong style={{ color: '#e2e8f0' }}>Tune</strong> on each step for sliders.{' '}
-            File paths and expert overrides sit under <strong style={{ color: '#e2e8f0' }}>Advanced</strong> on the same step.
+            File paths and expert overrides sit under <strong style={{ color: '#e2e8f0' }}>Advanced</strong>.{' '}
+            <strong style={{ color: '#e2e8f0' }}>Export</strong> controls phase preview clips, final montage variants, and optional{' '}
+            HMR mesh sidecar JSON — enable those if you want them in Watch after the run.
           </div>
 
           <div>
@@ -242,7 +251,7 @@ export function RunEditorModal({
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.85rem' }}>
               {tier1Fields.map((f) => fieldShell(f, renderFieldInput(f)))}
-              {temporalRefineField && temporalRadiusField && visible(temporalRefineField) && (
+              {temporalRefineField && visible(temporalRefineField) && (
                 <div style={{ gridColumn: '1 / -1' }}>
                   <ConfigFieldWrap field={temporalRefineField}>
                     <InlineFieldInput
@@ -251,20 +260,6 @@ export function RunEditorModal({
                       onChange={(v) => setFieldsState((p) => ({ ...p, temporal_pose_refine: v }))}
                       allFields={fieldsState}
                     />
-                    {Boolean(fieldsState.temporal_pose_refine ?? temporalRefineField.default) && (
-                      <div
-                        style={{
-                          marginTop: '0.85rem',
-                          paddingTop: '0.85rem',
-                          borderTop: '1px solid rgba(148,163,184,0.2)',
-                        }}
-                      >
-                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: 8 }}>
-                          {temporalRadiusField.label}
-                        </div>
-                        {renderFieldInput(temporalRadiusField)}
-                      </div>
-                    )}
                   </ConfigFieldWrap>
                 </div>
               )}
@@ -306,47 +301,148 @@ export function RunEditorModal({
                     speed vs ViTPose-Base on the same clip. See docs/PIPELINE_IMPROVEMENTS_ROADMAP.md.
                   </div>
                 )}
+              {poseModelField &&
+                visible(poseModelField) &&
+                fieldsState.pose_model === 'Sapiens (ViTPose-Base fallback)' && (
+                  <div
+                    style={{
+                      gridColumn: '1 / -1',
+                      fontSize: '0.78rem',
+                      color: '#e9d5ff',
+                      padding: '0.5rem 0.75rem',
+                      borderRadius: 10,
+                      border: '1px solid rgba(192, 132, 252, 0.4)',
+                      background: 'rgba(46, 16, 101, 0.25)',
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    Set <strong style={{ color: '#f5f3ff' }}>SWAY_SAPIENS_TORCHSCRIPT</strong> on the API host to a COCO-17
+                    Sapiens lite <code style={{ color: '#e9d5ff' }}>.pt2</code> (e.g. from Hugging Face{' '}
+                    <code style={{ color: '#e9d5ff' }}>noahcao/sapiens-pose-coco</code>) for native Meta Sapiens inference.
+                    If unset or the file is missing, the pipeline uses <strong style={{ color: '#f5f3ff' }}>ViTPose-Base</strong>{' '}
+                    with the same COCO-17 output shape.
+                  </div>
+                )}
             </div>
           </div>
 
           <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            Phase flow · {mainPyPhaseCaption(activeStage, activePhaseIndex)}
+            {mainPyPhaseCaption(activeStage, activePhaseIndex)}
           </div>
 
           <div className="flowchart-board" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem' }}>
-            {stages.map((stage, idx) => {
-              const isActive = idx === activePhaseIndex
-              const isDone = idx < activePhaseIndex
-              return (
-                <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                  <button
-                    type="button"
-                    onClick={() => setActivePhaseIndex(idx)}
-                    className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
+            {flowchartRows.map((row, rowIdx) => {
+              const isRowActive = flowchartRowIsActive(row, activePhaseIndex)
+              const isRowDone = flowchartRowIsDone(row, activePhaseIndex)
+
+              const bar =
+                rowIdx < flowchartRows.length - 1 ? (
+                  <div
                     style={{
-                      border: isActive ? '2px solid var(--halo-cyan)' : '1px solid var(--glass-border)',
-                      background: isActive ? 'rgba(14, 165, 233, 0.15)' : 'rgba(15, 20, 30, 0.7)',
+                      width: 20,
+                      height: 2,
+                      background: isRowDone ? 'var(--halo-cyan)' : 'var(--glass-border)',
+                    }}
+                  />
+                ) : null
+
+              if (row.kind === 'single') {
+                const stage = stages[row.index]
+                const idx = row.index
+                const isActive = idx === activePhaseIndex
+                const isDone = idx < activePhaseIndex
+                return (
+                  <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => setActivePhaseIndex(idx)}
+                      className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
+                      style={{
+                        border: isActive ? '2px solid var(--halo-cyan)' : '1px solid var(--glass-border)',
+                        background: isActive ? 'rgba(14, 165, 233, 0.15)' : 'rgba(15, 20, 30, 0.7)',
+                        padding: '0.75rem 1rem',
+                        cursor: 'pointer',
+                        borderRadius: 12,
+                        color: 'inherit',
+                        font: 'inherit',
+                      }}
+                    >
+                      <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>
+                        {mainPyPhaseCaption(stage, idx)}
+                      </div>
+                      <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{stage.label}</div>
+                    </button>
+                    {bar}
+                  </div>
+                )
+              }
+
+              const track = stages[row.trackingIndex]
+              const overlap = stages[row.overlapIndex]
+              const linePick = (i: number) => i === activePhaseIndex
+              return (
+                <div key="merged-tracking-overlap" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <div
+                    className={`node-box ${isRowActive ? 'selected' : ''} ${isRowDone ? 'status-done' : ''}`}
+                    style={{
+                      border: isRowActive ? '2px solid var(--halo-cyan)' : '1px solid var(--glass-border)',
+                      background: isRowActive ? 'rgba(14, 165, 233, 0.15)' : 'rgba(15, 20, 30, 0.7)',
                       padding: '0.75rem 1rem',
-                      cursor: 'pointer',
                       borderRadius: 12,
-                      color: 'inherit',
-                      font: 'inherit',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'stretch',
+                      gap: '0.35rem',
+                      minWidth: '200px',
                     }}
                   >
-                    <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>
-                      {mainPyPhaseCaption(stage, idx)}
-                    </div>
-                    <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{stage.label}</div>
-                  </button>
-                  {idx < stages.length - 1 && (
                     <div
                       style={{
-                        width: 20,
-                        height: 2,
-                        background: isDone ? 'var(--halo-cyan)' : 'var(--glass-border)',
+                        fontSize: '0.68rem',
+                        color: 'var(--text-muted)',
+                        letterSpacing: '0.04em',
+                        textAlign: 'center',
                       }}
-                    />
-                  )}
+                    >
+                      {mainPyPhaseCaption(track, row.trackingIndex)}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActivePhaseIndex(row.trackingIndex)}
+                      style={{
+                        fontWeight: linePick(row.trackingIndex) ? 600 : 500,
+                        fontSize: '0.9rem',
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: '0.1rem 0',
+                        color: 'inherit',
+                        fontFamily: 'inherit',
+                        textAlign: 'center',
+                      }}
+                    >
+                      {track.label}
+                    </button>
+                    <div style={{ height: 1, background: 'rgba(148, 163, 184, 0.35)', margin: '0.05rem 0' }} />
+                    <button
+                      type="button"
+                      onClick={() => setActivePhaseIndex(row.overlapIndex)}
+                      style={{
+                        fontWeight: linePick(row.overlapIndex) ? 600 : 500,
+                        fontSize: '0.9rem',
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: '0.1rem 0',
+                        color: 'inherit',
+                        fontFamily: 'inherit',
+                        textAlign: 'center',
+                      }}
+                    >
+                      {overlap.label}
+                    </button>
+                  </div>
+                  {bar}
                 </div>
               )
             })}

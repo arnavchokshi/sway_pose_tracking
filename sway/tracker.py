@@ -24,6 +24,7 @@ from torchvision.ops import box_iou
 from ultralytics import YOLO
 
 from sway.hybrid_sam_refiner import HybridSamRefiner, load_hybrid_sam_config
+from sway.interp_utils import gsi_interp_scalar as _gsi_interp_scalar
 from sway.track_observation import (
     coerce_observation,
     TrackObservation,
@@ -42,7 +43,7 @@ DETECT_SIZE = 640
 YOLO_CONF = 0.22
 
 # YOLO detection stride: 1 = every frame, 2 = even frames only (2x speed, minimal accuracy loss)
-# Odd frames filled via linear interpolation before downstream phases.
+# Odd frames filled via interpolation (linear default; optional GSI — see SWAY_BOX_INTERP_MODE).
 YOLO_DETECTION_STRIDE = 1
 
 # Stitching params: occlusion drop-out recovery (V3.0: 180 frames = 6s @ 30 FPS, or 3s @ 15fps YOLO)
@@ -54,6 +55,55 @@ STITCH_MAX_PIXEL_RADIUS = 120.0
 STITCH_PREDICTED_RADIUS_FRAC = 0.75
 # Short-gap threshold: gaps this short use generous matching (no velocity check)
 SHORT_GAP_FRAMES = 20
+
+
+def yolo_infer_batch_size() -> int:
+    """
+    Ultralytics YOLO ``predict`` batch size on the BoxMOT path (Phases 1–2).
+    Default 1 = one letterboxed frame per GPU call. Larger values amortize host/GPU overhead;
+    tune down if VRAM is tight. Ignored on the BoT-SORT path (``model.track`` is per-frame).
+    Env: SWAY_YOLO_INFER_BATCH
+    """
+    v = os.environ.get("SWAY_YOLO_INFER_BATCH", "").strip()
+    if not v:
+        return 1
+    try:
+        return max(1, min(int(v), 32))
+    except ValueError:
+        return 1
+
+
+def yolo_half_env_requested() -> bool:
+    """True when user asked for FP16 YOLO inference (CUDA only at runtime). Env: SWAY_YOLO_HALF"""
+    v = os.environ.get("SWAY_YOLO_HALF", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def yolo_predict_use_half() -> bool:
+    """FP16 YOLO ``predict``/``track`` only when requested and CUDA is available (default: off)."""
+    return yolo_half_env_requested() and torch.cuda.is_available()
+
+
+def resolve_yolo_inference_weights() -> str:
+    """
+    Weights passed to ``ultralytics.YOLO()`` for Phases 1–2.
+
+    **TensorRT**: if ``SWAY_YOLO_ENGINE`` is set to a path, that file **must** exist or this raises
+    (clear failure instead of silent .pt fallback). Unset ``SWAY_YOLO_ENGINE`` to use ``.pt`` weights.
+    Export: ``python -m tools.export_models --tensorrt``.
+    """
+    eng = os.environ.get("SWAY_YOLO_ENGINE", "").strip()
+    if eng:
+        p = Path(eng).expanduser()
+        if p.is_file():
+            return str(p.resolve())
+        raise FileNotFoundError(
+            f"SWAY_YOLO_ENGINE is set but file not found: {eng}\n"
+            "Export a TensorRT engine for this GPU, e.g.:\n"
+            "  python -m tools.export_models --tensorrt --device 0\n"
+            "Or unset SWAY_YOLO_ENGINE to use .pt weights (SWAY_YOLO_WEIGHTS / default)."
+        )
+    return resolve_yolo_model_path()
 
 
 def load_tracking_runtime() -> Dict[str, Any]:
@@ -79,6 +129,8 @@ def load_tracking_runtime() -> Dict[str, Any]:
         "detect_size": _iget("SWAY_DETECT_SIZE", DETECT_SIZE),
         "yolo_conf": _fget("SWAY_YOLO_CONF", YOLO_CONF),
         "yolo_stride": _iget("SWAY_YOLO_DETECTION_STRIDE", YOLO_DETECTION_STRIDE),
+        "yolo_infer_batch": yolo_infer_batch_size(),
+        "yolo_predict_half": yolo_predict_use_half(),
         "stitch_max_gap": _iget("SWAY_STITCH_MAX_FRAME_GAP", STITCH_MAX_FRAME_GAP),
         "stitch_radius_bbox_frac": _fget("SWAY_STITCH_RADIUS_BBOX_FRAC", STITCH_RADIUS_BBOX_FRAC),
         "stitch_max_pixel_radius": _fget("SWAY_STITCH_MAX_PIXEL_RADIUS", STITCH_MAX_PIXEL_RADIUS),
@@ -89,6 +141,9 @@ def load_tracking_runtime() -> Dict[str, Any]:
         "coalescence_iou": _fget("SWAY_COALESCENCE_IOU_THRESH", 0.70),
         "coalescence_consecutive": _iget("SWAY_COALESCENCE_CONSECUTIVE_FRAMES", 8),
         "dormant_max_gap": _iget("SWAY_DORMANT_MAX_GAP", 150),
+        # Optional gap fill: linear (default) vs Gaussian-process-smoothed (RBF, 2-anchor).
+        "box_interp_mode": os.environ.get("SWAY_BOX_INTERP_MODE", "linear").strip().lower() or "linear",
+        "gsi_lengthscale": _fget("SWAY_GSI_LENGTHSCALE", 0.35),
     }
 
 
@@ -114,15 +169,26 @@ def apply_post_track_stitching(
         predicted_radius_frac=float(tr["stitch_predicted_radius_frac"]),
         fallback_radius=float(tr["stitch_max_pixel_radius"]),
         short_gap_frames=int(tr["short_gap_frames"]),
+        box_interp_mode=str(tr["box_interp_mode"]),
+        gsi_lengthscale=float(tr["gsi_lengthscale"]),
     )
     raw_tracks = coalescence_deduplicate(
         raw_tracks,
         iou_thresh=float(tr["coalescence_iou"]),
         consecutive_frames=int(tr["coalescence_consecutive"]),
     )
-    raw_tracks = merge_complementary_tracks(raw_tracks)
+    raw_tracks = merge_complementary_tracks(
+        raw_tracks,
+        box_interp_mode=str(tr["box_interp_mode"]),
+        gsi_lengthscale=float(tr["gsi_lengthscale"]),
+    )
     raw_tracks = merge_coexisting_fragments(raw_tracks)
-    _fill_stride_gaps(raw_tracks, ystride)
+    _fill_stride_gaps(
+        raw_tracks,
+        ystride,
+        box_interp_mode=str(tr["box_interp_mode"]),
+        gsi_lengthscale=float(tr["gsi_lengthscale"]),
+    )
     return raw_tracks
 
 
@@ -211,6 +277,109 @@ def _deepocsort_extra_from_env() -> Dict[str, Any]:
         "embedding_off": not reid_on,
         "asso_func": asso,
     }
+
+
+def _normalize_boxmot_tracker_kind(raw: Optional[str]) -> str:
+    """Map SWAY_BOXMOT_TRACKER / aliases to deepocsort | bytetrack | ocsort | strongsort."""
+    s = (raw or "deepocsort").strip().lower().replace("-", "").replace("_", "")
+    if s in ("deepocsort", "deepoc", "doc", "boxmot"):
+        return "deepocsort"
+    if s in ("bytetrack", "byte"):
+        return "bytetrack"
+    if s in ("ocsort", "oc"):
+        return "ocsort"
+    if s in ("strongsort", "strong"):
+        return "strongsort"
+    return "deepocsort"
+
+
+def boxmot_tracker_kind_from_env() -> str:
+    return _normalize_boxmot_tracker_kind(os.environ.get("SWAY_BOXMOT_TRACKER"))
+
+
+def _fps_from_video_capture(cap: cv2.VideoCapture) -> float:
+    """FPS from OpenCV metadata; sane fallback when missing or absurd."""
+    try:
+        raw = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    except (TypeError, ValueError):
+        return 30.0
+    if raw <= 1e-3 or raw > 480.0:
+        return 30.0
+    return raw
+
+
+def probe_video_fps(video_path: str) -> float:
+    """Read container FPS without decoding frames (short-lived VideoCapture)."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return 30.0
+    try:
+        return _fps_from_video_capture(cap)
+    finally:
+        cap.release()
+
+
+def _create_boxmot_tracker(
+    kind: str,
+    yconf: float,
+    dev: torch.device,
+    reid_w: Path,
+    doc_kw: Dict[str, Any],
+    *,
+    tracker_frame_rate: int = 30,
+) -> Any:
+    """Instantiate a BoxMOT tracker; ``kind`` from ``boxmot_tracker_kind_from_env()``."""
+    from boxmot import ByteTrack, DeepOcSort, OcSort, StrongSort
+
+    half_cuda = bool(dev.type == "cuda")
+    tr_fps = max(1, int(tracker_frame_rate))
+
+    if kind == "deepocsort":
+        return DeepOcSort(
+            reid_weights=reid_w,
+            device=dev,
+            half=half_cuda,
+            det_thresh=yconf,
+            max_age=int(doc_kw["max_age"]),
+            min_hits=2,
+            iou_threshold=float(doc_kw["iou_threshold"]),
+            asso_func=str(doc_kw["asso_func"]),
+            embedding_off=bool(doc_kw["embedding_off"]),
+        )
+    if kind == "bytetrack":
+        return ByteTrack(
+            min_conf=max(0.01, float(yconf) * 0.25),
+            track_thresh=float(yconf),
+            match_thresh=0.8,
+            track_buffer=25,
+            frame_rate=tr_fps,
+        )
+    if kind == "ocsort":
+        return OcSort(
+            min_conf=max(0.01, float(yconf) * 0.25),
+            use_byte=True,
+        )
+    if kind == "strongsort":
+        if not reid_w.is_file():
+            raise FileNotFoundError(
+                f"StrongSORT requires Re-ID weights on disk; missing: {reid_w}\n"
+                "Run: python -m tools.prefetch_models\n"
+                "Or set SWAY_BOXMOT_REID_WEIGHTS to an existing OSNet .pt file."
+            )
+        return StrongSort(
+            reid_weights=reid_w,
+            device=dev,
+            half=half_cuda,
+            min_conf=max(0.01, float(yconf) * 0.25),
+            max_cos_dist=0.2,
+            max_iou_dist=0.7,
+            max_age=int(doc_kw["max_age"]),
+            n_init=3,
+            nn_budget=100,
+        )
+    return _create_boxmot_tracker(
+        "deepocsort", yconf, dev, reid_w, doc_kw, tracker_frame_rate=tracker_frame_rate
+    )
 
 
 def classical_nms_indices(
@@ -378,14 +547,45 @@ def _compute_iou(box1: Tuple[float, float, float, float], box2: Tuple[float, flo
     return inter_area / union_area
 
 
+def _resolve_interp_kwargs(
+    box_interp_mode: Optional[str],
+    gsi_lengthscale: Optional[float],
+) -> Tuple[str, float]:
+    if box_interp_mode is not None and gsi_lengthscale is not None:
+        return str(box_interp_mode), float(gsi_lengthscale)
+    tr = load_tracking_runtime()
+    return str(tr["box_interp_mode"]), float(tr["gsi_lengthscale"])
+
+
+def _interp_box_at_t(
+    box_prev: Tuple[float, float, float, float],
+    box_next: Tuple[float, float, float, float],
+    t: float,
+    *,
+    mode: str,
+    gsi_lengthscale: float,
+) -> Tuple[float, float, float, float]:
+    m = (mode or "linear").strip().lower()
+    if m != "gsi":
+        return _interpolate_box(box_prev, box_next, t)
+    return tuple(
+        _gsi_interp_scalar(t, float(box_prev[i]), float(box_next[i]), gsi_lengthscale)
+        for i in range(4)
+    )
+
+
 def _fill_stride_gaps(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     stride: int,
+    *,
+    box_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
 ) -> None:
     """
     Fill missing frame entries when YOLO runs only every Nth frame.
-    Inserts linearly interpolated boxes for skipped frames. Modifies raw_tracks in place.
+    Inserts interpolated boxes for skipped frames (linear by default; optional GSI). Modifies in place.
     """
+    bim, gsl = _resolve_interp_kwargs(box_interp_mode, gsi_lengthscale)
     if stride <= 1:
         return
     for tid, entries in list(raw_tracks.items()):
@@ -404,7 +604,7 @@ def _fill_stride_gaps(
                 next_f, next_box = next_obs.frame_idx, next_obs.bbox
                 for gap_f in range(f + 1, next_f):
                     t = (gap_f - f) / (next_f - f)
-                    interp_box = _interpolate_box(box, next_box, t)
+                    interp_box = _interp_box_at_t(box, next_box, t, mode=bim, gsi_lengthscale=gsl)
                     new_entries.append(
                         TrackObservation(gap_f, tuple(interp_box), 0.5, False, None)
                     )
@@ -416,15 +616,19 @@ def _interpolate_box_sequence(
     box_first: Tuple,
     frame_last: int,
     frame_first: int,
+    *,
+    box_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
 ) -> List[Tuple[int, Tuple, float]]:
-    """Linearly interpolate boxes between frame_last and frame_first (exclusive)."""
+    """Interpolate boxes between frame_last and frame_first (exclusive)."""
+    bim, gsl = _resolve_interp_kwargs(box_interp_mode, gsi_lengthscale)
     if frame_first <= frame_last + 1:
         return []
     entries = []
     conf = 0.5  # Placeholder for interpolated frames
     for f in range(frame_last + 1, frame_first):
         t = (f - frame_last) / (frame_first - frame_last)
-        box = _interpolate_box(box_last, box_first, t)
+        box = _interp_box_at_t(box_last, box_first, t, mode=bim, gsi_lengthscale=gsl)
         entries.append(TrackObservation(f, tuple(box), float(conf), False, None))
     return entries
 
@@ -462,6 +666,9 @@ def stitch_fragmented_tracks(
     fallback_radius: float = STITCH_MAX_PIXEL_RADIUS,
     max_speed_bbox_frac: float = 0.25,
     short_gap_frames: int = SHORT_GAP_FRAMES,
+    *,
+    box_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     V3.4: Stitch tracks that fragmented due to occlusion. Uses relative stitch
@@ -470,6 +677,7 @@ def stitch_fragmented_tracks(
 
     Modifies raw_tracks in place and returns it.
     """
+    bim, gsl = _resolve_interp_kwargs(box_interp_mode, gsi_lengthscale)
     if total_frames <= 0 or not raw_tracks:
         return raw_tracks
 
@@ -569,7 +777,12 @@ def stitch_fragmented_tracks(
             box_a_last = info_a["last_box"]
             box_b_first = entries_b[0][1]
             gap_entries = _interpolate_box_sequence(
-                box_a_last, box_b_first, frame_a_last, entries_b[0][0]
+                box_a_last,
+                box_b_first,
+                frame_a_last,
+                entries_b[0][0],
+                box_interp_mode=bim,
+                gsi_lengthscale=gsl,
             )
             merged = sorted(entries_a + gap_entries + entries_b, key=lambda e: e[0])
 
@@ -666,6 +879,9 @@ def merge_complementary_tracks(
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]],
     max_center_dist_frac: float = 0.5,
     max_speed_bbox_frac: float = 0.25,
+    *,
+    box_interp_mode: Optional[str] = None,
+    gsi_lengthscale: Optional[float] = None,
 ) -> Dict[int, List[Tuple[int, Tuple, float]]]:
     """
     Merge track pairs that cover complementary (non-overlapping) time segments
@@ -681,6 +897,7 @@ def merge_complementary_tracks(
     The shorter track is merged into the longer one.
     Modifies raw_tracks in place and returns it.
     """
+    bim, gsl = _resolve_interp_kwargs(box_interp_mode, gsi_lengthscale)
     if len(raw_tracks) < 2:
         return raw_tracks
 
@@ -765,7 +982,14 @@ def merge_complementary_tracks(
                     f_nxt = merged[k + 1][0]
                     if f_nxt - f_cur > 1:
                         gap_entries.extend(
-                            _interpolate_box_sequence(merged[k][1], merged[k + 1][1], f_cur, f_nxt)
+                            _interpolate_box_sequence(
+                                merged[k][1],
+                                merged[k + 1][1],
+                                f_cur,
+                                f_nxt,
+                                box_interp_mode=bim,
+                                gsi_lengthscale=gsl,
+                            )
                         )
                 merged = sorted(merged + gap_entries, key=lambda e: e[0])
 
@@ -918,7 +1142,7 @@ def _iter_video_chunks(
     Yields: (chunk_frames, chunk_start_idx, native_fps, frame_width, frame_height)
     """
     cap = cv2.VideoCapture(video_path)
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    native_fps = _fps_from_video_capture(cap)
     w_f = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_f = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -952,50 +1176,63 @@ def _run_tracking_boxmot_diou(
     int,
     int,
     int,
+    Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
     """Phases 1–2: YOLO predict + pre-track NMS + BoxMOT Deep OC-SORT (no post-track stitch)."""
     from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
 
     apply_boxmot_kf_unfreeze_guard()
-    from boxmot import DeepOcSort
 
     tr = load_tracking_runtime()
     yconf = float(tr["yolo_conf"])
     ystride = int(tr["yolo_stride"])
+    yolo_bs = int(tr["yolo_infer_batch"])
     base_detect = int(tr["detect_size"])
 
-    model_path = resolve_yolo_model_path()
-    print(f"Loading detection model: {model_path} (BoxMOT Deep OC-SORT path)")
+    model_path = resolve_yolo_inference_weights()
+    bmk = boxmot_tracker_kind_from_env()
+    print(f"Loading detection model: {model_path} (BoxMOT path, tracker={bmk})")
+    if str(model_path).lower().endswith(".engine"):
+        print("  YOLO backend: TensorRT engine (SWAY_YOLO_ENGINE).", flush=True)
     if _yolo26_series_weights(model_path):
         print("  Pre-track: DIoU-NMS off for YOLO26 weights (classical IoU-NMS only).")
+    y_half = yolo_predict_use_half()
+    if y_half:
+        print("  YOLO inference FP16: SWAY_YOLO_HALF=1 (CUDA).", flush=True)
+    elif yolo_half_env_requested() and not torch.cuda.is_available():
+        print("  Note: SWAY_YOLO_HALF=1 ignored (CUDA not available).", flush=True)
     model = YOLO(model_path)
-    print("  YOLO weights loaded; building DeepOcSort tracker…", flush=True)
+    print(f"  YOLO weights loaded; building BoxMOT {bmk} tracker…", flush=True)
     reid_w = _resolve_boxmot_reid_weights()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _doc_kw = _deepocsort_extra_from_env()
-    tracker = DeepOcSort(
-        reid_weights=reid_w,
-        device=dev,
-        half=bool(dev.type == "cuda"),
-        det_thresh=yconf,
-        max_age=int(_doc_kw["max_age"]),
-        min_hits=2,
-        iou_threshold=float(_doc_kw["iou_threshold"]),
-        asso_func=str(_doc_kw["asso_func"]),
-        embedding_off=bool(_doc_kw["embedding_off"]),
+    src_fps = probe_video_fps(video_path)
+    tr_fps = max(1, int(round(src_fps)))
+    print(
+        f"  Video FPS (file metadata): {src_fps:.3f}"
+        + (f"; ByteTrack frame_rate={tr_fps}" if bmk == "bytetrack" else ""),
+        flush=True,
+    )
+    tracker = _create_boxmot_tracker(
+        bmk, yconf, dev, reid_w, _doc_kw, tracker_frame_rate=tr_fps
     )
     hybrid_cfg = load_hybrid_sam_config()
     hybrid_refiner: Optional[HybridSamRefiner] = None
     if hybrid_cfg["enabled"]:
         hybrid_refiner = HybridSamRefiner(hybrid_cfg)
+        wc = ", weak-cue SAM gate on" if hybrid_cfg.get("weak_cues") else ""
         print(
             f"  Hybrid SAM overlap refiner ON (IoU≥{hybrid_cfg['iou_trigger']}, "
-            f"min_dets={hybrid_cfg['min_dets']}, weights={hybrid_cfg['weights']})",
+            f"min_dets={hybrid_cfg['min_dets']}, weights={hybrid_cfg['weights']}{wc})",
             flush=True,
         )
     else:
         print("  Hybrid SAM overlap refiner OFF.", flush=True)
+
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
+    # frame_idx -> list of (xyxy high-res, detector confidence); pre–track-association dets.
+    phase1_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
     total_frames = 0
     native_fps = 30.0
     frame_width = 1920
@@ -1005,7 +1242,7 @@ def _run_tracking_boxmot_diou(
     yolo_infer_count = 0
     if dev.type == "cpu":
         print(
-            "  Note: CUDA not available — Phases 1–2 (YOLO + DeepOcSort) on CPU can take "
+            f"  Note: CUDA not available — Phases 1–2 (YOLO + BoxMOT {bmk}) on CPU can take "
             "**many minutes** per video with little console output between YOLO steps.",
             flush=True,
         )
@@ -1020,6 +1257,12 @@ def _run_tracking_boxmot_diou(
                 f"YOLO stride={ystride}, base detect {base_detect}px.",
                 flush=True,
             )
+            if yolo_bs > 1:
+                print(
+                    f"  YOLO infer batch size={yolo_bs} (SWAY_YOLO_INFER_BATCH); "
+                    "tracker still updated once per frame in order.",
+                    flush=True,
+                )
         native_fps = nfps
         frame_width = w_f
         frame_height = h_f
@@ -1030,6 +1273,131 @@ def _run_tracking_boxmot_diou(
         else:
             current_detect_size = base_detect
         max_dancers_this_chunk = 0
+        det_batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]] = []
+
+        def _flush_yolo_det_batch(
+            batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]],
+        ) -> None:
+            nonlocal yolo_infer_count, max_dancers_this_chunk
+            if not batch:
+                return
+            imgs = [b[4] for b in batch]
+            res_list = model.predict(
+                imgs,
+                classes=[0],
+                conf=yconf,
+                verbose=False,
+                half=y_half,
+            )
+            if not isinstance(res_list, (list, tuple)):
+                res_list = [res_list]
+            if len(res_list) != len(batch):
+                raise RuntimeError(
+                    f"YOLO infer batch: got {len(res_list)} result(s) for {len(batch)} image(s)"
+                )
+            for (frame_idx, frame, scale_x, scale_y, _rgb), r0 in zip(batch, res_list):
+                yolo_infer_count += 1
+                if yolo_infer_count == 1:
+                    print(
+                        f"  First YOLO inference (frame {frame_idx}, letterbox {current_detect_size})…",
+                        flush=True,
+                    )
+                elif yolo_infer_count % 25 == 0:
+                    print(
+                        f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}…",
+                        flush=True,
+                    )
+
+                if r0.boxes is None or len(r0.boxes) == 0:
+                    dets = np.empty((0, 6), dtype=np.float32)
+                else:
+                    xyxy = r0.boxes.xyxy.cpu().numpy()
+                    conf = r0.boxes.conf.cpu().numpy()
+                    xyxy[:, 0] *= scale_x
+                    xyxy[:, 1] *= scale_y
+                    xyxy[:, 2] *= scale_x
+                    xyxy[:, 3] *= scale_y
+                    if not _yolo26_series_weights(model_path):
+                        diou_keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
+                        xyxy = xyxy[diou_keep]
+                        conf = conf[diou_keep]
+                    keep2 = classical_nms_indices(xyxy, conf, iou_thresh=_pretrack_classical_nms_iou())
+                    xyxy = xyxy[keep2]
+                    conf = conf[keep2]
+                    cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
+                    dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
+
+                if hybrid_refiner is not None:
+                    dets, hmeta = hybrid_refiner.refine_person_dets(frame, dets)
+                else:
+                    hmeta = {}
+
+                det_pairs: List[Tuple[Tuple[float, float, float, float], float]] = []
+                if dets is not None and len(dets) > 0:
+                    for row in dets:
+                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                        cf = float(row[4])
+                        det_pairs.append(((x1, y1, x2, y2), cf))
+                phase1_dets_by_frame[frame_idx] = det_pairs
+
+                sam2_roi_tuple: Optional[tuple] = None
+                if hybrid_refiner is not None and hmeta.get("used_sam"):
+                    fh, fw = frame.shape[:2]
+                    rb = hmeta.get("roi_box")
+                    if rb is not None and len(rb) >= 4:
+                        sam2_roi_tuple = tuple(float(x) for x in rb[:4])
+                    else:
+                        sam2_roi_tuple = (0.0, 0.0, float(fw), float(fh))
+
+                per_det_masks = hmeta.get("per_det_masks")
+                if per_det_masks is None:
+                    per_det_masks = [None] * int(len(dets))
+
+                out = tracker.update(dets, frame)
+                valid_dancers_this_frame = 0
+                if out is not None and len(out) > 0:
+                    out_arr = np.atleast_2d(out)
+                    mask_assign = assign_sam_masks_to_tracker_output(dets, out_arr, per_det_masks)
+                    for row_idx, row in enumerate(out_arr):
+                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                        tid = int(row[4])
+                        cf = float(row[5]) if len(row) > 5 else float(yconf)
+                        if tid < 0:
+                            continue
+                        valid_dancers_this_frame += 1
+                        box_hr = (x1, y1, x2, y2)
+                        is_sam, msk = mask_assign[row_idx] if row_idx < len(mask_assign) else (False, None)
+                        msk_fit = resize_mask_to_bbox(msk, box_hr) if msk is not None else None
+                        has_mask = msk_fit is not None and bool(np.any(msk_fit))
+                        if tid not in raw_tracks:
+                            raw_tracks[tid] = []
+                        raw_tracks[tid].append(
+                            TrackObservation(
+                                frame_idx,
+                                box_hr,
+                                cf,
+                                is_sam_refined=bool(is_sam and has_mask),
+                                segmentation_mask=msk_fit if has_mask else None,
+                                sam2_input_roi_xyxy=sam2_roi_tuple,
+                            )
+                        )
+                max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
+                if frame_idx == 0 or frame_idx == 30:
+                    extra = ""
+                    if hybrid_refiner is not None:
+                        extra = f", maxIoU={hmeta.get('max_iou', 0):.2f}"
+                        if hmeta.get("used_sam"):
+                            extra += " (SAM refined dets)"
+                    print(
+                        f"  Frame {frame_idx}: {valid_dancers_this_frame} persons "
+                        f"(BoxMOT/{bmk}, YOLO {current_detect_size}{extra})",
+                        flush=True,
+                    )
+
+                if lab_on_infer is not None and (
+                    yolo_infer_count == 1 or yolo_infer_count % 25 == 0
+                ):
+                    lab_on_infer(frame_idx, yolo_infer_count, valid_dancers_this_frame)
 
         for frame_idx, frame in chunk_frames:
             if frame_idx % ystride != 0:
@@ -1039,107 +1407,21 @@ def _run_tracking_boxmot_diou(
             frame_low_rgb = frame_low[:, :, ::-1]
             scale_x = w_fr / current_detect_size
             scale_y = h_fr / current_detect_size
+            det_batch.append((frame_idx, frame, scale_x, scale_y, frame_low_rgb))
+            if len(det_batch) >= yolo_bs:
+                _flush_yolo_det_batch(det_batch)
+                det_batch.clear()
 
-            yolo_infer_count += 1
-            if yolo_infer_count == 1:
-                print(
-                    f"  First YOLO inference (frame {frame_idx}, letterbox {current_detect_size})…",
-                    flush=True,
-                )
-            elif yolo_infer_count % 25 == 0:
-                print(
-                    f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}…",
-                    flush=True,
-                )
-
-            res = model.predict(
-                frame_low_rgb,
-                classes=[0],
-                conf=yconf,
-                verbose=False,
-            )
-            r0 = res[0] if isinstance(res, list) else res
-            if r0.boxes is None or len(r0.boxes) == 0:
-                dets = np.empty((0, 6), dtype=np.float32)
-            else:
-                xyxy = r0.boxes.xyxy.cpu().numpy()
-                conf = r0.boxes.conf.cpu().numpy()
-                xyxy[:, 0] *= scale_x
-                xyxy[:, 1] *= scale_y
-                xyxy[:, 2] *= scale_x
-                xyxy[:, 3] *= scale_y
-                # YOLO26 already applies strong NMS; extra DIoU here removed valid dancers / caused duplicates.
-                if not _yolo26_series_weights(model_path):
-                    diou_keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
-                    xyxy = xyxy[diou_keep]
-                    conf = conf[diou_keep]
-                keep2 = classical_nms_indices(xyxy, conf, iou_thresh=_pretrack_classical_nms_iou())
-                xyxy = xyxy[keep2]
-                conf = conf[keep2]
-                # BoxMOT v16+ expects (x1,y1,x2,y2,conf,cls); class 0 = person
-                cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
-                dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
-
-            if hybrid_refiner is not None:
-                dets, hmeta = hybrid_refiner.refine_person_dets(frame, dets)
-            else:
-                hmeta = {}
-
-            per_det_masks = hmeta.get("per_det_masks")
-            if per_det_masks is None:
-                per_det_masks = [None] * int(len(dets))
-
-            out = tracker.update(dets, frame)
-            valid_dancers_this_frame = 0
-            if out is not None and len(out) > 0:
-                out_arr = np.atleast_2d(out)
-                mask_assign = assign_sam_masks_to_tracker_output(dets, out_arr, per_det_masks)
-                for row_idx, row in enumerate(out_arr):
-                    x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-                    tid = int(row[4])
-                    cf = float(row[5]) if len(row) > 5 else float(yconf)
-                    if tid < 0:
-                        continue
-                    valid_dancers_this_frame += 1
-                    box_hr = (x1, y1, x2, y2)
-                    is_sam, msk = mask_assign[row_idx] if row_idx < len(mask_assign) else (False, None)
-                    msk_fit = resize_mask_to_bbox(msk, box_hr) if msk is not None else None
-                    has_mask = msk_fit is not None and bool(np.any(msk_fit))
-                    if tid not in raw_tracks:
-                        raw_tracks[tid] = []
-                    raw_tracks[tid].append(
-                        TrackObservation(
-                            frame_idx,
-                            box_hr,
-                            cf,
-                            is_sam_refined=bool(is_sam and has_mask),
-                            segmentation_mask=msk_fit if has_mask else None,
-                        )
-                    )
-            max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
-            if frame_idx == 0 or frame_idx == 30:
-                extra = ""
-                if hybrid_refiner is not None:
-                    extra = f", maxIoU={hmeta.get('max_iou', 0):.2f}"
-                    if hmeta.get("used_sam"):
-                        extra += " (SAM refined dets)"
-                print(
-                    f"  Frame {frame_idx}: {valid_dancers_this_frame} persons "
-                    f"(BoxMOT, YOLO {current_detect_size}{extra})",
-                    flush=True,
-                )
-
-            if lab_on_infer is not None and (
-                yolo_infer_count == 1 or yolo_infer_count % 25 == 0
-            ):
-                lab_on_infer(frame_idx, yolo_infer_count, valid_dancers_this_frame)
+        _flush_yolo_det_batch(det_batch)
 
         max_dancers_last_chunk = max_dancers_this_chunk
         total_frames += len(chunk_frames)
         del chunk_frames
 
+    hybrid_stats: Dict[str, Any] = {}
     if hybrid_refiner is not None:
-        print(f"  Hybrid SAM summary: {hybrid_refiner.summary()}")
+        hybrid_stats = hybrid_refiner.summary()
+        print(f"  Hybrid SAM summary: {hybrid_stats}")
 
     output_fps = native_fps
     return (
@@ -1151,6 +1433,8 @@ def _run_tracking_boxmot_diou(
         frame_width,
         frame_height,
         int(ystride),
+        hybrid_stats,
+        phase1_dets_by_frame,
     )
 
 
@@ -1166,6 +1450,8 @@ def _run_tracking_botsort_pre_stitch(
     int,
     int,
     int,
+    Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
     """Phases 1–2: YOLO track() + BoT-SORT (no post-track stitch)."""
     tr = load_tracking_runtime()
@@ -1173,10 +1459,18 @@ def _run_tracking_botsort_pre_stitch(
     ystride = int(tr["yolo_stride"])
     base_detect = int(tr["detect_size"])
 
-    model_path = resolve_yolo_model_path()
+    model_path = resolve_yolo_inference_weights()
     print(f"Loading detection model: {model_path}")
+    if str(model_path).lower().endswith(".engine"):
+        print("  YOLO backend: TensorRT engine (SWAY_YOLO_ENGINE).", flush=True)
+    y_half = yolo_predict_use_half()
+    if y_half:
+        print("  YOLO inference FP16: SWAY_YOLO_HALF=1 (CUDA).", flush=True)
+    elif yolo_half_env_requested() and not torch.cuda.is_available():
+        print("  Note: SWAY_YOLO_HALF=1 ignored (CUDA not available).", flush=True)
     model = YOLO(model_path)
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
+    phase1_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
     total_frames = 0
     native_fps = 30.0
     frame_width = 1920
@@ -1220,12 +1514,25 @@ def _run_tracking_botsort_pre_stitch(
                 iou=0.5,
                 persist=True,
                 verbose=False,
+                half=y_half,
             )
             result = result[0] if isinstance(result, list) else result
             boxes_data = _extract_boxes_and_ids(result)
             boxes_low = boxes_data["boxes"]
             track_ids = boxes_data["track_ids"]
             confs = boxes_data["confs"]
+
+            det_pairs_bs: List[Tuple[Tuple[float, float, float, float], float]] = []
+            for box, conf in zip(boxes_low, confs):
+                x1, y1, x2, y2 = box
+                box_hr = (
+                    float(x1 * scale_x),
+                    float(y1 * scale_y),
+                    float(x2 * scale_x),
+                    float(y2 * scale_y),
+                )
+                det_pairs_bs.append((box_hr, float(conf)))
+            phase1_dets_by_frame[frame_idx] = det_pairs_bs
 
             valid_dancers_this_frame = 0
             for i, (box, tid, conf) in enumerate(zip(boxes_low, track_ids, confs)):
@@ -1268,6 +1575,8 @@ def _run_tracking_botsort_pre_stitch(
         frame_width,
         frame_height,
         int(ystride),
+        {},
+        phase1_dets_by_frame,
     )
 
 
@@ -1283,8 +1592,15 @@ def run_tracking_before_post_stitch(
     int,
     int,
     int,
+    Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
-    """Phases 1–2 only: streaming YOLO + tracker; caller runs apply_post_track_stitching for Phase 3."""
+    """Phases 1–2 only: streaming YOLO + tracker; caller runs apply_post_track_stitching for Phase 3.
+
+    The last return value maps ``frame_idx`` → list of ``(xyxy, conf)`` for every person detection
+    fed to the tracker that frame (post NMS / optional hybrid SAM on BoxMOT path), i.e. Phase-1-style
+    boxes without using track IDs.
+    """
     if _use_boxmot():
         return _run_tracking_boxmot_diou(video_path, lab_on_infer=lab_on_infer)
     return _run_tracking_botsort_pre_stitch(video_path, lab_on_infer=lab_on_infer)
@@ -1302,7 +1618,7 @@ def run_tracking(
     Returns:
         raw_tracks, total_frames, output_fps, frames_list (None), native_fps, frame_width, frame_height
     """
-    raw, tf, ofps, fl, nf, fw, fh, ys = run_tracking_before_post_stitch(video_path)
+    raw, tf, ofps, fl, nf, fw, fh, ys, _hy, _p1 = run_tracking_before_post_stitch(video_path)
     raw = apply_post_track_stitching(raw, tf, ystride=ys)
     return raw, tf, ofps, fl, nf, fw, fh
 

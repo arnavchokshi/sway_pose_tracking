@@ -1,0 +1,13 @@
+# Copy to golden_bench.yaml and customize. Used with:
+#   python -m tools.golden_bench --config benchmarks/golden_bench.yaml
+#
+# Paths are relative to the sway_pose_mvp repo root.
+
+tests:
+  - tests/test_hybrid_sam_roi.py
+  - tests/test_infer_batch_env.py
+  - tests/test_bidirectional_track_merge.py
+  - tests/test_yolo_runtime_env.py
+  - tests/test_track_stats_export.py
+  - tests/test_golden_bench_config.py
+  - tests/test_validate_pipeline_e2e_helpers.py

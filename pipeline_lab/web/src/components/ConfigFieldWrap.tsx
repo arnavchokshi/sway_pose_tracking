@@ -35,7 +35,26 @@ export function ConfigFieldWrap({
             marginBottom: '0.55rem',
           }}
         >
-          <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '0.88rem', lineHeight: 1.35 }}>{field.label}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap', minWidth: 0 }}>
+            <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '0.88rem', lineHeight: 1.35 }}>{field.label}</span>
+            {(field.advanced === true || field.tier === 3) && (
+              <span
+                style={{
+                  fontSize: '0.58rem',
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  color: '#a5b4fc',
+                  border: '1px solid rgba(165, 180, 252, 0.45)',
+                  borderRadius: 4,
+                  padding: '0.1rem 0.35rem',
+                  flexShrink: 0,
+                }}
+              >
+                Advanced
+              </span>
+            )}
+          </div>
           {field.description ? (
             <span
               className="config-field-help"

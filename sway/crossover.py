@@ -24,6 +24,10 @@ V3.6 (Acceleration Audit):
   and correct the ID assignment.
 
 Runs AFTER pose estimation (requires keypoints). All math vectorized with NumPy.
+
+Production ``main.py`` locks five YAML-driven gates (``REID_MAX_FRAME_GAP``, ``REID_MIN_OKS``,
+``COLLISION_KPT_DIST_FRAC``, ``COLLISION_CENTER_DIST_FRAC``, ``DEDUP_TORSO_MEDIAN_FRAC``) after
+merging ``params`` (see ``MASTER_PIPELINE_GUIDELINE.md`` §11.0.1) unless ``SWAY_UNLOCK_REID_DEDUP_TUNING=1``.
 """
 
 import logging

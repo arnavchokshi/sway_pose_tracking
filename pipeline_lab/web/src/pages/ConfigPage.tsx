@@ -10,7 +10,13 @@ import {
 import { InlineFieldInput } from '../components/InlineFieldInput'
 import { ConfigFieldWrap, ConfigInfoFold } from '../components/ConfigFieldWrap'
 import { HYBRID_SAM_PHASE_ID, hideHybridSamPhase } from '../lib/labFieldVisibility'
+import { isSchemaFieldVisible } from '../lib/labFieldMeta'
 import { mainPyPhaseCaption } from '../lib/schemaStageCaption'
+import {
+  buildPipelineFlowchartRows,
+  flowchartRowIsActive,
+  flowchartRowIsDone,
+} from '../lib/flowchartRows'
 import { ComplexityVisualizer } from '../components/ComplexityVisualizer'
 
 export function ConfigPage() {
@@ -19,6 +25,7 @@ export function ConfigPage() {
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
   const [configName, setConfigName] = useState('My Config')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
+  const [activePreset, setActivePreset] = useState<string | null>('standard')
 
   useEffect(() => {
     let cancelled = false
@@ -70,6 +77,8 @@ export function ConfigPage() {
     return m
   }, [schema])
 
+  const flowchartRows = useMemo(() => (schema ? buildPipelineFlowchartRows(schema.stages) : []), [schema])
+
   if (schemaError) {
     return (
       <div className="glass-panel" style={{ padding: '2rem 2.5rem', maxWidth: 640, margin: '0 auto' }}>
@@ -105,11 +114,14 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
     return <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>Loading schema...</div>
   }
 
-  const stages = schema.stages.filter(s => s.id !== 'export')
+  const stages = schema.stages
   const activeStage = stages[activePhaseIndex]
-  const activeFields = fieldsByPhase.get(activeStage?.id) || []
+  const activeFieldsRaw = fieldsByPhase.get(activeStage?.id) || []
   const hybridSamHidden =
     activeStage?.id === HYBRID_SAM_PHASE_ID && hideHybridSamPhase(fieldsState.tracker_technology)
+  const activeFields = hybridSamHidden
+    ? activeFieldsRaw
+    : activeFieldsRaw.filter((f) => f.type === 'info' || isSchemaFieldVisible(f, fieldsState))
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', height: '100%' }}>
@@ -126,8 +138,15 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
               key={id}
               type="button"
               className="btn"
-              style={{ whiteSpace: 'nowrap' }}
-              onClick={() => setFieldsState(applyConfigPreset(schema, id))}
+              style={{ 
+                whiteSpace: 'nowrap',
+                borderColor: activePreset === id ? '#fff' : undefined,
+                background: activePreset === id ? 'rgba(255,255,255,0.15)' : undefined
+              }}
+              onClick={() => {
+                setFieldsState(applyConfigPreset(schema, id))
+                setActivePreset(id)
+              }}
             >
               {CONFIG_PRESET_LABELS[id]}
             </button>
@@ -140,50 +159,135 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
         <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
           <div style={{ marginBottom: '1rem' }}>
             <h2 style={{ margin: 0, fontSize: '1.2rem', color: '#fff' }}>Pipeline Flow</h2>
-            <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-              Left to right is the order your video is processed. Numbers in the small caption align with the full pipeline
-              run log if you need to match a step in code.
+            <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.45, maxWidth: 820 }}>
+              Left to right is execution order. Captions line up with <code style={{ fontSize: '0.75rem' }}>main.py</code> phase
+              prints. This page is a reusable template — the Lab attaches a video per run. Use the Lab recipe&apos;s{' '}
+              <strong style={{ color: '#cbd5e1' }}>Export</strong> step for phase preview MP4s, final view variants, and optional
+              mesh sidecar flags.
             </p>
           </div>
           
           <div className="flowchart-board" style={{ position: 'relative', overflowX: 'auto', padding: '1rem 0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', minHeight: 'auto', background: 'transparent' }}>
             <ComplexityVisualizer fieldsState={fieldsState} />
-            {stages.map((stage, idx) => {
-              const isActive = idx === activePhaseIndex
-              const isDone = idx < activePhaseIndex
-              
+            {flowchartRows.map((row, rowIdx) => {
+              const isRowActive = flowchartRowIsActive(row, activePhaseIndex)
+              const isRowDone = flowchartRowIsDone(row, activePhaseIndex)
+
+              const connector = rowIdx < flowchartRows.length - 1 && (
+                <svg width="40" height="24" viewBox="0 0 40 24" style={{ overflow: 'visible', flexShrink: 0 }}>
+                  <path
+                    d="M 0 12 C 15 12, 25 12, 34 12"
+                    className={`flow-path ${isRowDone ? 'done' : ''} ${isRowActive ? 'active' : ''}`}
+                  />
+                  <polygon
+                    points="32,7 40,12 32,17"
+                    fill={isRowDone || isRowActive ? 'var(--halo-cyan)' : 'var(--glass-border)'}
+                    style={{ transition: 'fill 0.5s' }}
+                  />
+                </svg>
+              )
+
+              if (row.kind === 'single') {
+                const stage = stages[row.index]
+                const idx = row.index
+                const isActive = idx === activePhaseIndex
+                const isDone = idx < activePhaseIndex
+                return (
+                  <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
+                    <div
+                      onClick={() => setActivePhaseIndex(idx)}
+                      className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
+                      style={{
+                        padding: '1rem 1.2rem',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        minWidth: '180px',
+                      }}
+                    >
+                      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>
+                        {mainPyPhaseCaption(stage, idx)}
+                      </div>
+                      <div style={{ fontWeight: 600, color: isActive ? '#fff' : 'var(--text-main)', fontSize: '1rem' }}>
+                        {stage.label}
+                      </div>
+                    </div>
+                    {connector}
+                  </div>
+                )
+              }
+
+              const track = stages[row.trackingIndex]
+              const overlap = stages[row.overlapIndex]
+              const lineActive = (i: number) => i === activePhaseIndex
               return (
-                <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-                  <div 
-                    onClick={() => setActivePhaseIndex(idx)}
-                    className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
+                <div key="merged-tracking-overlap" style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
+                  <div
+                    className={`node-box ${isRowActive ? 'selected' : ''} ${isRowDone ? 'status-done' : ''}`}
                     style={{
                       padding: '1rem 1.2rem',
                       display: 'flex',
                       flexDirection: 'column',
-                      alignItems: 'center',
+                      alignItems: 'stretch',
                       gap: '0.35rem',
-                      minWidth: '180px'
+                      minWidth: '220px',
                     }}
                   >
-                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>{mainPyPhaseCaption(stage, idx)}</div>
-                    <div style={{ fontWeight: 600, color: isActive ? '#fff' : 'var(--text-main)', fontSize: '1rem' }}>{stage.label}</div>
+                    <div
+                      style={{
+                        fontSize: '0.72rem',
+                        color: 'var(--text-muted)',
+                        letterSpacing: '0.04em',
+                        textAlign: 'center',
+                      }}
+                    >
+                      {mainPyPhaseCaption(track, row.trackingIndex)}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActivePhaseIndex(row.trackingIndex)}
+                      style={{
+                        fontWeight: lineActive(row.trackingIndex) ? 600 : 500,
+                        color: lineActive(row.trackingIndex) ? '#fff' : 'var(--text-main)',
+                        fontSize: '1rem',
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: '0.15rem 0',
+                        textAlign: 'center',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      {track.label}
+                    </button>
+                    <div
+                      style={{
+                        height: 1,
+                        margin: '0.1rem 0',
+                        background: 'rgba(148, 163, 184, 0.35)',
+                        alignSelf: 'stretch',
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setActivePhaseIndex(row.overlapIndex)}
+                      style={{
+                        fontWeight: lineActive(row.overlapIndex) ? 600 : 500,
+                        color: lineActive(row.overlapIndex) ? '#fff' : 'var(--text-main)',
+                        fontSize: '1rem',
+                        background: 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: '0.15rem 0',
+                        textAlign: 'center',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      {overlap.label}
+                    </button>
                   </div>
-                  
-                  {/* Animated SVG Connector to next node */}
-                  {idx < stages.length - 1 && (
-                    <svg width="40" height="24" viewBox="0 0 40 24" style={{ overflow: 'visible', flexShrink: 0 }}>
-                      <path 
-                        d="M 0 12 C 15 12, 25 12, 34 12" 
-                        className={`flow-path ${isDone ? 'done' : ''} ${isActive ? 'active' : ''}`}
-                      />
-                      <polygon 
-                        points="32,7 40,12 32,17" 
-                        fill={isDone || isActive ? 'var(--halo-cyan)' : 'var(--glass-border)'} 
-                        style={{ transition: 'fill 0.5s' }}
-                      />
-                    </svg>
-                  )}
+                  {connector}
                 </div>
               )
             })}
@@ -227,7 +331,10 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
                         <InlineFieldInput
                           f={f}
                           value={fieldsState[f.id]}
-                          onChange={(v) => setFieldsState((prev) => ({ ...prev, [f.id]: v }))}
+                          onChange={(v) => {
+                            setFieldsState((prev) => ({ ...prev, [f.id]: v }))
+                            setActivePreset(null)
+                          }}
                           allFields={fieldsState}
                         />
                       </ConfigFieldWrap>

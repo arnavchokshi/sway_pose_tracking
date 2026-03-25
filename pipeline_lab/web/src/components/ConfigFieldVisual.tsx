@@ -387,62 +387,30 @@ export function renderConfigVisual(
       return <OverlapPairVisual value={value} min={min} max={max} invert />
     case 'sway_boxmot_max_age':
     case 'sway_stitch_max_frame_gap':
-    case 'sway_dormant_max_gap':
-    case 'reid_max_frame_gap':
       return <SpanBarVisual value={value} min={min} max={max} hue={195} />
-    case 'sway_chunk_size':
-      return <SpanBarVisual value={value} min={min} max={max} hue={265} />
     case 'sway_yolo_conf':
     case 'pose_visibility_threshold':
-    case 'mean_confidence_min':
-    case 'tier_c_skeleton_mean':
     case 'sway_hybrid_sam_mask_thresh':
-    case 'min_lower_body_conf_yaml':
-    case 'reid_min_oks':
       return <LevelMeterVisual value={value} min={min} max={max} lowLabel="looser" highLabel="stricter" />
     case 'sync_score_min':
       return <LevelMeterVisual value={value} min={min} max={max} lowLabel="forgiving" highLabel="tight" />
-    case 'edge_margin_frac':
-      return <EdgeFrameVisual value={value} min={min} max={max} />
-    case 'edge_presence_frac':
-      return <LevelMeterVisual value={value} min={min} max={max} lowLabel="rare" highLabel="often" />
-    case 'jitter_ratio_max':
-      return <JitterSparkVisual value={value} min={min} max={max} />
     case 'kinetic_std_frac':
       return <MotionWaveVisual value={value} min={min} max={max} />
     case 'prune_threshold':
       return <PruneStrengthVisual value={value} min={min} max={max} />
-    case 'confirmed_human_min_span_frac':
     case 'min_duration_ratio':
-    case 'tier_c_low_frame_frac':
       return <SpanBarVisual value={value} min={min} max={max} hue={160} />
     case 'sway_yolo_detection_stride':
       return <StrideTicksVisual stride={Math.round(value)} maxS={max} />
-    case 'sway_detect_size':
-      return <ResolutionBoxVisual value={value} min={min} max={max} />
-    case 'sway_hybrid_sam_min_dets':
-      return <MinPeopleVisual count={value} cap={max} />
-    case 'sway_hybrid_sam_bbox_pad':
-      return <EdgeFrameVisual value={value} min={0} max={Math.max(max, 1)} />
-    case 'sway_hybrid_sam_roi_pad_frac':
-      return <LevelMeterVisual value={value} min={min} max={max} lowLabel="tight" highLabel="loose" />
-    case 'temporal_pose_radius':
-      return <NeighborDotsVisual radius={value} maxR={max} />
-    case 'smoother_min_cutoff': {
-      const beta = typeof allFields?.smoother_beta === 'number' ? (allFields.smoother_beta as number) : 0.7
-      return (
-        <SmoothPathVisual
-          cutoff={value}
-          beta={beta}
-          cutoffMin={min}
-          cutoffMax={max}
-          betaMin={0}
-          betaMax={5}
-        />
-      )
-    }
+    case 'sway_hybrid_weak_conf_delta':
+    case 'sway_hybrid_weak_height_frac':
+    case 'sway_hybrid_weak_match_iou':
+      return <LevelMeterVisual value={value} min={min} max={max} lowLabel="looser gate" highLabel="tighter gate" />
+    case 'dedup_min_pair_oks':
+    case 'dedup_antipartner_min_iou':
+      return <SpanBarVisual value={value} min={min} max={max} hue={320} />
     case 'smoother_beta': {
-      const cut = typeof allFields?.smoother_min_cutoff === 'number' ? (allFields.smoother_min_cutoff as number) : 1
+      const cut = typeof allFields?.smoother_min_cutoff === 'number' ? (allFields.smoother_min_cutoff as number) : 1.0
       return (
         <SmoothPathVisual
           cutoff={cut}
