@@ -6,14 +6,14 @@
 #   bash scripts/phase2_public_training/download_lambda_weights.sh
 #
 # Override host or key:
-#   LAMBDA_HOST=ubuntu@132.145.211.165 PEM=~/.ssh/key.pem bash scripts/phase2_public_training/download_lambda_weights.sh
+#   LAMBDA_HOST=ubuntu@150.136.6.38 PEM=~/.ssh/key.pem bash scripts/phase2_public_training/download_lambda_weights.sh
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p "$ROOT/models"
 
 PEM="${PEM:-/Users/arnavchokshi/Downloads/pose-tracking.pem}"
-HOST="${LAMBDA_HOST:-ubuntu@132.145.211.165}"
+HOST="${LAMBDA_HOST:-ubuntu@150.136.6.38}"
 REMOTE="${REMOTE_PATH:-~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt}"
 OUT="$ROOT/models/yolo26l_dancetrack.pt"
 

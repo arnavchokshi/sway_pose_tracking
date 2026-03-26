@@ -412,8 +412,10 @@ After `params` YAML, `**apply_master_locked_pose_env()**` (`main.py`) runs unles
 
 | Effect                 | Env                            | Locked behavior                                                                                                           |
 | ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| ViTPose batch cap      | `SWAY_VITPOSE_MAX_PER_FORWARD` | **Unset** (treat as **0** = all people in one forward per frame; see `vitpose_max_per_forward()` in `pose_estimator.py`). |
+| ViTPose batch cap      | `SWAY_VITPOSE_MAX_PER_FORWARD` | Master lock **unsets** this (one forward on CUDA). **Apple MPS:** when unset, `vitpose_effective_max_per_forward()` uses **`SWAY_VITPOSE_MPS_CHUNK`** (default **4**) so crowded frames do not stall the first forward. Set `SWAY_VITPOSE_MAX_PER_FORWARD` (e.g. with `SWAY_UNLOCK_POSE_TUNING=1`) to override. |
 | ViTPose precision      | `SWAY_VITPOSE_FP32`            | **off** (`0`) — FP16 on GPU when supported.                                                                               |
+| ViTPose debug logs     | `SWAY_VITPOSE_DEBUG`           | **off by default** — set `1` / `true` / `on` for `[phase5_dbg]` + `[vitpose_dbg]` lines (embeddings time, hybrid plain vs masked split, per-forward processor/model/post ms). |
+| ViTPose HF processor   | `SWAY_VITPOSE_USE_FAST`        | **off** (unset = slow processor). HF defaults to a fast `VitPoseImageProcessor`; slow path avoids reported MPS / torch stalls. Set `1` to use the fast processor. |
 | 3D lift                | `SWAY_3D_LIFT`                 | **on** (`1`) — MotionAGFormer / viewer path unless `--no-pose-3d-lift` still disables at CLI.                             |
 | ViTPose smart bbox pad | `SWAY_VITPOSE_SMART_PAD`       | **on** (`1`) — `main.py` uses `smart_expand_bbox_xyxy` before ViTPose (motion lead, lift-aware top pad, aspect nudges); extra symmetric pad in the Phase 5 loop is **0** when this is on. |
 
@@ -454,7 +456,7 @@ If `--pose-stride 2`, `**_interpolate_pose_gaps`** fills skipped frames using `b
 
 ### 9.5 Pose logging throttles
 
-`SWAY_POSE_LOG_EVERY_SEC` (default 20), `SWAY_POSE_LOG_EVERY_N_PASSES` (8), `SWAY_POSE_SLOW_FORWARD_SEC` (4).
+`SWAY_POSE_LOG_EVERY_SEC` (default 5), `SWAY_POSE_LOG_EVERY_N_PASSES` (8), `SWAY_POSE_SLOW_FORWARD_SEC` (4). `SWAY_POSE_BUSY_HEARTBEAT_SEC` (default 5, `0` disables) prints/appends Lab progress **while** `estimate_poses` is inside ViTPose (long first MPS batch otherwise shows a frozen UI).
 
 ---
 
@@ -467,6 +469,10 @@ If `--pose-stride 2`, `**_interpolate_pose_gaps`** fills skipped frames using `b
 - **Backend:** `SWAY_LIFT_BACKEND` default `motionagformer`; optional `poseformerv2` / aliases per `lift_backend()` in `pose_lift_3d.py`.
 - **Depth:** `SWAY_DEPTH_DYNAMIC` default on; strided Depth Anything V2 via `collect_strided_depth_series`; stride from `SWAY_DEPTH_STRIDE_FRAMES` or default `max(1, round(output_fps))` in `main.py`. AugLift-style z blend: `SWAY_AUGLIFT_BLEND` default **0.3** (function default in `pose_lift_3d.py`).
 - **Export:** `export_3d_for_viewer` → `pose_3d` blob in `data.json`; unified world coords when `SWAY_UNIFIED_3D_EXPORT` on (default in `unified_export_enabled()`).
+- **World root Z (unified export):** Depth Anything maps are **min–max per frame**, not metric. By default **`SWAY_DEPTH_FOR_ROOT_Z` is off**; pelvis depth uses **`SWAY_DEFAULT_ROOT_Z`** (default `2.5`). Set `SWAY_DEPTH_FOR_ROOT_Z=1` to drive root Z from depth (experimental). Optional **`SWAY_ROOT_Z_EMA_ALPHA`** (0–1, default `0`) temporally smooths root Z when depth-for-root is on. **`SWAY_DEPTH_ROOT_ROI_RADIUS`** (pixels, default `3`) median-filters depth at the hips when depth-for-root is on.
+- **Intrinsics:** If ffprobe finds no 35mm-equivalent tags, the CLI prints a hint and **`SWAY_PINHOLE_FOV_DEG`** (default `70`) is used. Override with **`SWAY_FX`** and **`SWAY_FY`** (pixel focal lengths) for correct multi-person world layout.
+- **Lift 2D normalization:** Default **`SWAY_LIFT_INPUT_NORM=person`** (bbox from joints). For full-frame clips with unstable joint tails, try **`SWAY_LIFT_INPUT_NORM=screen`** (full-frame norm).
+- **pose_3d payload:** When lifts exist, **`SWAY_POSE_3D_INCLUDE_LIFT`** (default on) adds per-frame **`lift_xyz`** to each track for the Pipeline Lab viewer’s model-space (debug) mode. Set to `0` to omit and shrink JSON.
 - **Errors:** wrapped in `try`/`except` in `main.py`; failures print `[3D Lift] Skipped: …` and continue without `pose_3d`.
 
 Further env knobs (weights paths, vendor roots, Savitzky–Golay on lift export, etc.) are documented in `**sway/pose_lift_3d.py`**.

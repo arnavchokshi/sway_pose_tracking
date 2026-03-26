@@ -32,7 +32,7 @@ class MatrixRecipe(TypedDict, total=False):
     fields: Dict[str, Any]
 
 
-PIPELINE_MATRIX_VERSION = 11
+PIPELINE_MATRIX_VERSION = 13
 
 # Enforced on every row so matrix runs never swap detector weights.
 _PROVEN_DETECTION_SAM: Dict[str, Any] = {
@@ -163,6 +163,128 @@ PIPELINE_MATRIX_RECIPES: List[MatrixRecipe] = [
         "detection",
         "Stride-2 detection with GSI box gap fill — compare to recipe det_stride2 (linear) to isolate box interpolation.",
         {"sway_yolo_detection_stride": 2, "sway_box_interp_mode": "gsi"},
+    ),
+    # --- Phase-group preset combos (M17+): test full preset configurations end-to-end ---
+    _row(
+        "preset_dense_hifi",
+        "M17_preset_dense_crowd_high_fidelity",
+        "multi_phase",
+        "Dense Crowd (phases 1-3) + High Fidelity (phases 4-6) + Balanced Cleanup (phases 7-9). For packed formations needing quality skeletons.",
+        {
+            "sway_yolo_weights": "yolo26x",
+            "sway_pretrack_nms_iou": 0.60,
+            "sway_yolo_conf": 0.18,
+            "sway_hybrid_sam_iou_trigger": 0.30,
+            "sway_boxmot_max_age": 200,
+            "sway_boxmot_match_thresh": 0.25,
+            "pose_model": "ViTPose-Large",
+            "pose_visibility_threshold": 0.25,
+        },
+    ),
+    _row(
+        "preset_open_competition",
+        "M18_preset_open_floor_competition",
+        "multi_phase",
+        "Open Floor (phases 1-3) + Competition Grade (phases 4-6) + Sharp Hip-Hop (phases 7-9). For small group competitions.",
+        {
+            "sway_yolo_conf": 0.30,
+            "sway_pretrack_nms_iou": 0.80,
+            "sway_hybrid_sam_iou_trigger": 0.50,
+            "sway_boxmot_max_age": 120,
+            "sway_boxmot_match_thresh": 0.35,
+            "pose_model": "ViTPose-Large",
+            "temporal_pose_refine": True,
+            "pose_visibility_threshold": 0.22,
+            "dedup_min_pair_oks": 0.75,
+            "dedup_antipartner_min_iou": 0.15,
+            "smoother_beta": 0.55,
+            "prune_threshold": 0.60,
+            "sync_score_min": 0.12,
+        },
+    ),
+    _row(
+        "preset_open_competition_recovery",
+        "M23_preset_open_floor_competition_recovery",
+        "multi_phase",
+        "Open Floor + Competition + Sharp Hip-Hop with **recovery bias** (docs/PIPELINE_FINDINGS_AND_BEST_CONFIGS.md): "
+        "DanceTrack+CrowdHuman weights, hybrid SAM IoU 0.42, box match 0.29, max_age 165 — better ID re-attach after occlusion vs M18; more SAM cost.",
+        {
+            "sway_yolo_weights": "yolo26l_dancetrack_crowdhuman",
+            "sway_yolo_conf": 0.30,
+            "sway_pretrack_nms_iou": 0.80,
+            "sway_hybrid_sam_iou_trigger": 0.42,
+            "sway_boxmot_max_age": 165,
+            "sway_boxmot_match_thresh": 0.29,
+            "pose_model": "ViTPose-Large",
+            "temporal_pose_refine": True,
+            "pose_visibility_threshold": 0.22,
+            "dedup_min_pair_oks": 0.75,
+            "dedup_antipartner_min_iou": 0.15,
+            "smoother_beta": 0.55,
+            "prune_threshold": 0.60,
+            "sync_score_min": 0.12,
+        },
+    ),
+    _row(
+        "preset_ballet_fluid",
+        "M19_preset_standard_ballet",
+        "multi_phase",
+        "Standard (phases 1-3) + Balanced Pose (phases 4-6) + Fluid Ballet (phases 7-9). For ballet and contemporary dance.",
+        {
+            "temporal_pose_refine": True,
+            "smoother_beta": 0.85,
+            "prune_threshold": 0.65,
+            "sync_score_min": 0.08,
+            "pruning_w_low_sync": 0.5,
+            "pruning_w_smart_mirror": 0.7,
+            "pruning_w_low_conf": 0.4,
+        },
+    ),
+    _row(
+        "preset_mirror_studio",
+        "M20_preset_mirror_studio",
+        "multi_phase",
+        "Standard (phases 1-3) + Balanced Pose (phases 4-6) + Mirror Studio (phases 7-9). For studios with wall-to-wall mirrors.",
+        {
+            "pruning_w_smart_mirror": 1.0,
+            "prune_threshold": 0.60,
+            "pruning_w_low_sync": 0.75,
+        },
+    ),
+    _row(
+        "preset_wide_angle_maxprec",
+        "M21_preset_wide_angle_max_precision",
+        "multi_phase",
+        "Wide Angle (phases 1-3) + Maximum Precision (phases 4-6). For wide-angle stage shots needing best skeletons.",
+        {
+            "sway_yolo_weights": "yolo26x",
+            "sway_yolo_conf": 0.15,
+            "sway_pretrack_nms_iou": 0.70,
+            "sway_boxmot_max_age": 200,
+            "sway_hybrid_sam_iou_trigger": 0.35,
+            "pose_model": "ViTPose-Huge",
+            "temporal_pose_refine": True,
+            "pose_visibility_threshold": 0.20,
+            "dedup_min_pair_oks": 0.72,
+        },
+    ),
+    _row(
+        "preset_osnet_aggressive",
+        "M22_preset_osnet_lock_aggressive_clean",
+        "multi_phase",
+        "OSNet Identity Lock (phases 1-3) + High Fidelity (phases 4-6) + Aggressive Clean (phases 7-9). Maximum identity consistency with strict cleanup.",
+        {
+            "tracker_technology": "deep_ocsort_osnet",
+            "sway_boxmot_reid_model": "osnet_x0_25",
+            "sway_bidirectional_track_pass": True,
+            "sway_boxmot_max_age": 180,
+            "pose_model": "ViTPose-Large",
+            "pose_visibility_threshold": 0.25,
+            "prune_threshold": 0.55,
+            "sync_score_min": 0.15,
+            "pruning_w_low_sync": 0.85,
+            "pruning_w_low_conf": 0.7,
+        },
     ),
 ]
 

@@ -1,6 +1,10 @@
 # Sweep config for IMG_0256 ground truth
 # Priority: ID consistency — one person = one ID, no drops, no ghosts, merge occlusion fragments
 #
+# These param_sets tune Phase 6+ YAML keys (Re-ID, prune, etc.). Run with:
+#   python -m tools.run_sweep --no-stop-after-boundary
+# Default run_sweep uses --stop-after-boundary after_phase_3 (Phases 1–3 only).
+#
 # Optional TrackEval (add to the same ground-truth YAML):
 #   trackeval:
 #     gt_mot_file: benchmarks/my_seq_mot_gt.txt

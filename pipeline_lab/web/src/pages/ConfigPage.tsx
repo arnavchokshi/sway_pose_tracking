@@ -3,20 +3,15 @@ import { PIPELINE_LAB_LOCAL } from '../siteUrls'
 import { API } from '../types'
 import type { Schema, SchemaField } from '../types'
 import {
-  applyLabRecipe,
+  applyPhaseGroupPresets,
   defaultsFromSchema,
   phase13StrategyFromFields,
-  PHASE13_STRATEGY_BLURBS,
-  PHASE13_STRATEGY_LABELS,
-  PHASE13_STRATEGY_ORDER,
-  QUALITY_TIER_BLURBS,
-  QUALITY_TIER_LABELS,
-  QUALITY_TIER_ORDER,
-  type QualityTierId,
+  DEFAULT_PRESET_IDS,
+  type PhaseGroupId,
 } from '../configPresets'
 import { InlineFieldInput } from '../components/InlineFieldInput'
 import { ConfigFieldWrap } from '../components/ConfigFieldWrap'
-import { Phase13EffectivePanel } from '../components/Phase13EffectivePanel'
+import { PresetGroupSelector } from '../components/PresetGroupSelector'
 import { hideFieldForPhase13Strategy, PHASE13_MODE_FIELD_ID } from '../lib/labPhase13Ui'
 import { hideHybridSamPhase, isHybridSamOverlapField } from '../lib/labFieldVisibility'
 import { isSchemaFieldVisible } from '../lib/labFieldMeta'
@@ -35,8 +30,9 @@ export function ConfigPage() {
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
   const [configName, setConfigName] = useState('My Config')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
-  const [qualityTier, setQualityTier] = useState<QualityTierId>('standard')
-  /** When true, preset buttons are not highlighted (user diverged from last preset apply). */
+  const [selectedPresets, setSelectedPresets] = useState<Record<PhaseGroupId, string>>({
+    ...DEFAULT_PRESET_IDS,
+  })
   const [recipeCustom, setRecipeCustom] = useState(false)
 
   useEffect(() => {
@@ -79,6 +75,16 @@ export function ConfigPage() {
   }, [])
 
   const activePhase13 = useMemo(() => phase13StrategyFromFields(fieldsState), [fieldsState])
+
+  const handlePresetSelect = (groupId: PhaseGroupId, presetId: string) => {
+    if (!schema) return
+    const next = { ...selectedPresets, [groupId]: presetId }
+    setSelectedPresets(next)
+    setFieldsState(
+      applyPhaseGroupPresets(schema, next.phases_1_3, next.phases_4_6, next.phases_7_9, next.phases_10_11),
+    )
+    setRecipeCustom(false)
+  }
 
   if (schemaError) {
     return (
@@ -176,89 +182,17 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
         </header>
 
         <div className="config-page-preset-card">
-          <div className="config-page-preset-label">Recipe baseline</div>
+          <div className="config-page-preset-label">Pipeline presets</div>
           <p className="config-page-preset-blurb">
-            Two independent choices: <strong style={{ color: '#cbd5e1' }}>speed &amp; quality</strong> (weights, pose, scoring)
-            vs <strong style={{ color: '#cbd5e1' }}>Phases 1–3 strategy</strong> (early detection → track → stitch). Combine
-            them — e.g. Maximum accuracy + Sway handshake. Manual edits hide the highlights until you press a preset again.
-            Phases 1–3 strategy is only changed here (the handshake step no longer duplicates that enum).
+            Pick one preset per phase group. They combine independently — e.g. Dense Crowd detection + High Fidelity
+            pose + Sharp Hip-Hop smoothing.{' '}
+            {recipeCustom && (
+              <span style={{ color: '#fbbf24' }}>
+                Manual edits detected — preset highlights may not match current values.
+              </span>
+            )}
           </p>
-          <div className="config-page-preset-rows">
-            <div>
-              <div
-                style={{
-                  fontSize: '0.68rem',
-                  fontWeight: 700,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.06em',
-                  color: 'var(--text-muted)',
-                  marginBottom: '0.3rem',
-                }}
-              >
-                Speed &amp; quality
-              </div>
-              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                {QUALITY_TIER_ORDER.map((id) => (
-                  <button
-                    key={id}
-                    type="button"
-                    className="btn"
-                    title={QUALITY_TIER_BLURBS[id]}
-                    style={{
-                      whiteSpace: 'nowrap',
-                      borderColor: !recipeCustom && qualityTier === id ? '#fff' : undefined,
-                      background: !recipeCustom && qualityTier === id ? 'rgba(255,255,255,0.15)' : undefined,
-                    }}
-                    onClick={() => {
-                      setFieldsState(applyLabRecipe(schema, id, phase13StrategyFromFields(fieldsState)))
-                      setQualityTier(id)
-                      setRecipeCustom(false)
-                    }}
-                  >
-                    {QUALITY_TIER_LABELS[id]}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div>
-              <div
-                style={{
-                  fontSize: '0.68rem',
-                  fontWeight: 700,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.06em',
-                  color: 'var(--text-muted)',
-                  marginBottom: '0.3rem',
-                }}
-              >
-                Phases 1–3 strategy
-              </div>
-              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                {PHASE13_STRATEGY_ORDER.map((id) => (
-                  <button
-                    key={id}
-                    type="button"
-                    className="btn"
-                    title={PHASE13_STRATEGY_BLURBS[id]}
-                    style={{
-                      whiteSpace: 'nowrap',
-                      borderColor: activePhase13 === id ? '#fff' : undefined,
-                      background: activePhase13 === id ? 'rgba(255,255,255,0.15)' : undefined,
-                    }}
-                    onClick={() => {
-                      setFieldsState(applyLabRecipe(schema, qualityTier, id))
-                      setRecipeCustom(false)
-                    }}
-                  >
-                    {PHASE13_STRATEGY_LABELS[id]}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div style={{ marginTop: '0.85rem' }}>
-            <Phase13EffectivePanel strategy={activePhase13} fieldsState={fieldsState} />
-          </div>
+          <PresetGroupSelector selectedPresets={selectedPresets} onSelect={handlePresetSelect} />
         </div>
       </div>
 
@@ -350,8 +284,8 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
                 lineHeight: 1.55,
               }}
             >
-              Overlap refinement only applies on the default tracker path. These controls are hidden when an alternate engine
-              is selected.
+              Overlap refinement only applies on the default tracker path. These controls are hidden when ByteTrack
+              is selected (server disables SAM for that engine).
             </div>
           )}
           {activeStage?.id === 'handshake' && activePhase13 === 'sway_handshake' && !hideOverlapBecauseTracker && (
@@ -369,7 +303,6 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
             >
               <strong style={{ color: '#e2e8f0' }}>Sway handshake</strong> forces hybrid SAM IoU to{' '}
               <strong style={{ color: '#e2e8f0' }}>0.10</strong> and weak cues off at enqueue — overlap sliders are hidden.
-              See <strong style={{ color: '#e2e8f0' }}>Effective Phases 1–3 configuration</strong> above.
             </div>
           )}
 

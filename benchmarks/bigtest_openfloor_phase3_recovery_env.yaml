@@ -1,0 +1,13 @@
+# Open Floor (recovery bias) — Phases 1–3 env slice. Full recipe: docs/PIPELINE_FINDINGS_AND_BEST_CONFIGS.md
+# Lab: Phases 1–3 preset "Open Floor (recovery bias)" (p13_open_floor_recovery).
+# Matrix: M23_preset_open_floor_competition_recovery
+SWAY_YOLO_WEIGHTS: yolo26l_dancetrack_crowdhuman
+SWAY_YOLO_CONF: "0.30"
+SWAY_PRETRACK_NMS_IOU: "0.80"
+SWAY_HYBRID_SAM_IOU_TRIGGER: "0.42"
+SWAY_BOXMOT_MAX_AGE: "165"
+SWAY_BOXMOT_MATCH_THRESH: "0.29"
+SWAY_BOXMOT_TRACKER: deepocsort
+SWAY_BOXMOT_REID_ON: "0"
+SWAY_PHASE13_MODE: standard
+SWAY_USE_BOXMOT: "1"

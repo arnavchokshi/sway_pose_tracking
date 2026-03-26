@@ -6,12 +6,17 @@ Fully autonomous — no input required. Just run from sway_pose_mvp/:
 
   python -m tools.run_sweep
 
+By default passes ``--stop-after-boundary after_phase_3`` (Phases 1–3 only). For
+legacy sweeps that tune Phase 6+ params (e.g. benchmarks/sweep_config.yaml), use
+``--no-stop-after-boundary``.
+
 Uses benchmarks/sweep_config.yaml and IMG_0256 ground truth by default.
 On each failure, appends param sets from suggested_next_params (--adaptive, default).
 Stops on first PASS. Logs to output/sweep_log.jsonl.
 """
 
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -110,8 +115,19 @@ def main():
     parser.add_argument(
         "--config",
         type=Path,
-        default=SCRIPT_DIR / "benchmarks" / "sweep_config.yaml",
+        default=REPO_ROOT / "benchmarks" / "sweep_config.yaml",
         help="Path to sweep config YAML (default: benchmarks/sweep_config.yaml)",
+    )
+    parser.add_argument(
+        "--stop-after-boundary",
+        default="after_phase_3",
+        metavar="BOUNDARY",
+        help="Passed to main.py (default: after_phase_3). Ignored if --no-stop-after-boundary.",
+    )
+    parser.add_argument(
+        "--no-stop-after-boundary",
+        action="store_true",
+        help="Run full pipeline (omit --stop-after-boundary). Use for Phase 6+ param sweeps.",
     )
     parser.add_argument(
         "--exhaustive",
@@ -206,7 +222,9 @@ def main():
                 "--params",
                 params_path,
             ]
-            result = subprocess.run(cmd, cwd=SCRIPT_DIR)
+            if not args.no_stop_after_boundary:
+                cmd.extend(["--stop-after-boundary", args.stop_after_boundary])
+            result = subprocess.run(cmd, cwd=REPO_ROOT)
             if result.returncode != 0:
                 print(f"      Pipeline failed (exit {result.returncode})")
                 log_entry = {
@@ -335,6 +353,16 @@ def main():
 
         finally:
             Path(params_path).unlink(missing_ok=True)
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
         idx += 1
 

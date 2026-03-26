@@ -13,17 +13,23 @@ import {
   sessionHasCheckpointTree,
   subtreeRunIdsInSession,
 } from '../lib/batchTreeLayout'
+import {
+  allowedSchemaPhasesForTreeLevel,
+  descendantIdsIncludingRoot,
+  expandDraftsToBatchSpecs,
+  expandSimpleRootsToBatchSpecs,
+} from '../lib/runTreeDraft'
 import { compareViewModeForTreeColumn } from '../lib/treeColumnCompareView'
 import { BatchTreeView } from '../components/BatchTreeView'
 import { useLab } from '../context/LabContext'
+import { DraftRunTreePanel } from '../components/DraftRunTreePanel'
+import { DraftRunsSimplePanel } from '../components/DraftRunsSimplePanel'
 import { RunEditorModal } from '../components/RunEditorModal'
 import { RunConfigModal } from '../components/RunConfigModal'
 import { TrackQualitySummary, PipelineImpactSummary } from '../components/RunMetrics'
 import {
   Play,
   Plus,
-  Pencil,
-  Copy,
   Trash2,
   Clapperboard,
   Columns2,
@@ -361,7 +367,7 @@ export function LabPage() {
     setVideo,
     drafts,
     addDraft,
-    removeDraft,
+    setDrafts,
     duplicateDraft,
     updateDraft,
     sessionRunIds,
@@ -394,6 +400,8 @@ export function LabPage() {
 
   const [deletingAllRuns, setDeletingAllRuns] = useState(false)
   const [batchViewMode, setBatchViewMode] = useState<'list' | 'tree'>('list')
+  /** Step 2: classic full-pipeline rows vs checkpoint segment tree. */
+  const [draftPlanView, setDraftPlanView] = useState<'simple' | 'tree'>('simple')
   /** Batches on the API when this browser has no session yet (resume without ``?batch=``). */
   const [serverBatchesHint, setServerBatchesHint] = useState<BatchSummary[]>([])
   const [treeCompareSelected, setTreeCompareSelected] = useState<Set<string>>(() => new Set())
@@ -617,6 +625,24 @@ export function LabPage() {
   const editingDraft = useMemo(
     () => drafts.find((d) => d.clientId === editingId) ?? null,
     [drafts, editingId],
+  )
+
+  const rootDrafts = useMemo(() => drafts.filter((d) => d.parentRef.kind === 'none'), [drafts])
+  const hasHiddenCheckpointSegments = useMemo(
+    () => drafts.some((d) => d.parentRef.kind !== 'none'),
+    [drafts],
+  )
+
+  const removeRootBranch = useCallback(
+    (rootClientId: string) => {
+      setDrafts((prev) => {
+        const toDrop = descendantIdsIncludingRoot(rootClientId, prev)
+        const next = prev.filter((d) => !toDrop.has(d.clientId))
+        if (next.length === 0) return prev
+        return next
+      })
+    },
+    [setDrafts],
   )
 
   useEffect(() => {
@@ -904,10 +930,24 @@ export function LabPage() {
     if (!videoFile || !schema || drafts.length === 0 || starting) return
     setBatchError(null)
     setStarting(true)
-    const runsPayload = drafts.map((d) => ({
-      recipe_name: d.recipeName,
-      fields: d.fields,
-    }))
+    let runsPayload: ReturnType<typeof expandDraftsToBatchSpecs> | ReturnType<typeof expandSimpleRootsToBatchSpecs>
+    try {
+      runsPayload =
+        draftPlanView === 'simple' ? expandSimpleRootsToBatchSpecs(drafts) : expandDraftsToBatchSpecs(drafts)
+    } catch (e) {
+      setBatchError(e instanceof Error ? e.message : String(e))
+      setStarting(false)
+      return
+    }
+    if (runsPayload.length === 0) {
+      setBatchError(
+        draftPlanView === 'simple'
+          ? 'No runs to queue — add at least one run.'
+          : 'No runs to queue — add at least one Phase-1 node.',
+      )
+      setStarting(false)
+      return
+    }
     const body = new FormData()
     body.append('file', videoFile)
     body.append('runs_json', JSON.stringify(runsPayload))
@@ -1364,15 +1404,79 @@ export function LabPage() {
       {videoFile && sessionRunIds.length === 0 && (
         <div className="glass-panel" style={{ padding: '1.5rem' }}>
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
-            <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>2. Runs on this video</h2>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <button type="button" className="btn" onClick={() => addDraft()}>
-                <Plus size={16} /> Add run
+            <div>
+              <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>2. Runs on this video</h2>
+              <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', maxWidth: 560, lineHeight: 1.45 }}>
+                {draftPlanView === 'simple' ? (
+                  <>
+                    One row per <strong style={{ color: '#e2e8f0', fontWeight: 600 }}>full pipeline</strong> on this video — edit
+                    all stages, then start the batch.
+                  </>
+                ) : (
+                  <>
+                    Tree of <strong style={{ color: '#e2e8f0', fontWeight: 600 }}>checkpoint segments</strong> — edit each
+                    card, then start the batch.
+                  </>
+                )}
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <div
+                role="group"
+                aria-label="Plan layout"
+                style={{
+                  display: 'inline-flex',
+                  borderRadius: 10,
+                  border: '1px solid var(--glass-border)',
+                  overflow: 'hidden',
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setDraftPlanView('simple')}
+                  style={{
+                    borderRadius: 0,
+                    border: 'none',
+                    background: draftPlanView === 'simple' ? 'rgba(34, 211, 238, 0.2)' : 'transparent',
+                    color: draftPlanView === 'simple' ? '#e2e8f0' : 'var(--text-muted)',
+                  }}
+                >
+                  <LayoutGrid size={16} aria-hidden /> Simple
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setDraftPlanView('tree')}
+                  style={{
+                    borderRadius: 0,
+                    border: 'none',
+                    borderLeft: '1px solid var(--glass-border)',
+                    background: draftPlanView === 'tree' ? 'rgba(34, 211, 238, 0.2)' : 'transparent',
+                    color: draftPlanView === 'tree' ? '#e2e8f0' : 'var(--text-muted)',
+                  }}
+                >
+                  <GitBranch size={16} aria-hidden /> Tree
+                </button>
+              </div>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => addDraft()}
+                title={
+                  draftPlanView === 'simple'
+                    ? 'Add another full-pipeline run on the same video'
+                    : 'Add another Phase-1 root (same video, new detect branch)'
+                }
+              >
+                <Plus size={16} /> {draftPlanView === 'simple' ? 'Add run' : 'Add Phase-1 root'}
               </button>
               <button
                 type="button"
                 className="btn primary"
-                disabled={drafts.length === 0 || starting || !schema}
+                disabled={
+                  (draftPlanView === 'simple' ? rootDrafts.length === 0 : drafts.length === 0) || starting || !schema
+                }
                 onClick={startAll}
               >
                 <Clapperboard size={16} /> {starting ? 'Starting…' : 'Start all runs'}
@@ -1382,45 +1486,43 @@ export function LabPage() {
           {batchError && (
             <p style={{ color: '#f87171', marginTop: '1rem', marginBottom: 0 }}>{batchError}</p>
           )}
-          <div style={{ marginTop: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-            {drafts.map((d) => (
-              <div
-                key={d.clientId}
-                className="glass-panel"
-                style={{
-                  padding: '1rem 1.25rem',
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: '0.75rem',
-                  border: '1px solid var(--glass-border)',
-                }}
-              >
-                <div>
-                  <div style={{ fontWeight: 600, color: '#fff' }}>{d.recipeName}</div>
-                  <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Click edit to change pipeline parameters</div>
-                </div>
-                <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-                  <button type="button" className="btn" style={{ padding: '0.45rem 0.75rem' }} onClick={() => setEditingId(d.clientId)}>
-                    <Pencil size={14} /> Edit
-                  </button>
-                  <button type="button" className="btn" style={{ padding: '0.45rem 0.75rem' }} onClick={() => duplicateDraft(d.clientId)}>
-                    <Copy size={14} /> Duplicate
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    style={{ padding: '0.45rem 0.75rem', color: '#f87171', borderColor: 'rgba(248,113,113,0.35)' }}
-                    onClick={() => removeDraft(d.clientId)}
-                    disabled={drafts.length <= 1}
-                  >
-                    <Trash2 size={14} /> Remove
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+          {draftPlanView === 'simple' && hasHiddenCheckpointSegments && (
+            <div
+              style={{
+                marginTop: '1rem',
+                padding: '0.75rem 0.9rem',
+                borderRadius: 10,
+                background: 'rgba(245, 158, 11, 0.08)',
+                border: '1px solid rgba(251, 191, 36, 0.28)',
+                fontSize: '0.82rem',
+                color: 'var(--text-muted)',
+                lineHeight: 1.5,
+                maxWidth: 720,
+              }}
+            >
+              <strong style={{ color: '#fcd34d' }}>Checkpoint segments are hidden in Simple view.</strong> Switch to{' '}
+              <strong style={{ color: '#e2e8f0' }}>Tree</strong> to edit fan-out and child stages.{' '}
+              <strong style={{ color: '#e2e8f0' }}>Start all runs</strong> here only queues the root rows below as{' '}
+              <strong style={{ color: '#e2e8f0' }}>full pipelines</strong> (segment rows are not started from this view).
+            </div>
+          )}
+          {draftPlanView === 'simple' ? (
+            <DraftRunsSimplePanel
+              roots={rootDrafts}
+              onEdit={setEditingId}
+              onDuplicate={duplicateDraft}
+              onRemoveRootBranch={removeRootBranch}
+            />
+          ) : (
+            <DraftRunTreePanel
+              drafts={drafts}
+              setDrafts={setDrafts}
+              addDraft={addDraft}
+              duplicateDraft={duplicateDraft}
+              setEditingId={setEditingId}
+              totalDraftCount={drafts.length}
+            />
+          )}
         </div>
       )}
       {/* Step 3: active / completed batch */}
@@ -1921,6 +2023,12 @@ export function LabPage() {
         open={Boolean(editingId && editingDraft)}
         schema={schema}
         draft={editingDraft}
+        schemaPhaseAllowlist={
+          editingDraft &&
+          (draftPlanView === 'tree' || editingDraft.parentRef.kind !== 'none')
+            ? allowedSchemaPhasesForTreeLevel(editingDraft.treeLevel)
+            : null
+        }
         onClose={() => setEditingId(null)}
         onSave={(recipeName, fields) => {
           if (!editingId) return

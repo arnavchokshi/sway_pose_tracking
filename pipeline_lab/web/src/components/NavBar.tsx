@@ -39,6 +39,9 @@ export function NavBar() {
             <NavLink to="/compare" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Compare
             </NavLink>
+            <NavLink to="/scoring" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
+              Scoring UI
+            </NavLink>
           </nav>
         </div>
 

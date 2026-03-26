@@ -39,13 +39,23 @@ export function phase13EffectiveRows(
 ): Phase13EffectiveRow[] {
   const weakOn = Boolean(fieldsState.sway_hybrid_sam_weak_cues)
   const sliderIou = Number(fieldsState.sway_hybrid_sam_iou_trigger ?? 0.42)
+  const tt = String(fieldsState.tracker_technology ?? 'deep_ocsort')
+  const isByteTrack = tt === 'bytetrack'
 
   if (strategy === 'standard') {
     return [
       { label: 'Early pipeline', value: 'Default stack (standard)' },
       {
+        label: 'Tracking backend',
+        value: isByteTrack
+          ? 'BoxMOT ByteTrack (fast) — not Deep OC-SORT / OSNet'
+          : 'BoxMOT Deep OC-SORT (optional track-time OSNet via pill below)',
+      },
+      {
         label: 'Hybrid SAM (overlap refiner)',
-        value: `Runs when pairwise box IoU ≥ ${Number.isFinite(sliderIou) ? sliderIou.toFixed(2) : '0.42'} (from your slider below)`,
+        value: isByteTrack
+          ? 'Off — ByteTrack preview path disables SAM2 overlap refiner for speed'
+          : `Runs when pairwise box IoU ≥ ${Number.isFinite(sliderIou) ? sliderIou.toFixed(2) : '0.42'} (from your slider below)`,
       },
       {
         label: 'Weak SAM gate',
@@ -70,8 +80,16 @@ export function phase13EffectiveRows(
     return [
       { label: 'Early pipeline', value: 'Dancer registry (experimental)' },
       {
+        label: 'Tracking backend',
+        value: isByteTrack
+          ? 'BoxMOT ByteTrack (fast) — not Deep OC-SORT / OSNet'
+          : 'BoxMOT Deep OC-SORT (optional OSNet)',
+      },
+      {
         label: 'Hybrid SAM (overlap refiner)',
-        value: `Runs when pairwise box IoU ≥ ${Number.isFinite(sliderIou) ? sliderIou.toFixed(2) : '0.42'} (your slider still applies)`,
+        value: isByteTrack
+          ? 'Off — ByteTrack preview path disables SAM2 overlap refiner for speed'
+          : `Runs when pairwise box IoU ≥ ${Number.isFinite(sliderIou) ? sliderIou.toFixed(2) : '0.42'} (your slider still applies)`,
       },
       {
         label: 'Weak SAM gate',
@@ -99,8 +117,16 @@ export function phase13EffectiveRows(
   return [
     { label: 'Early pipeline', value: 'Sway handshake (experimental)' },
     {
+      label: 'Tracking backend',
+      value: isByteTrack
+        ? 'BoxMOT ByteTrack — handshake still runs registry/SAM verify when overlap SAM is on; ByteTrack forces overlap SAM off'
+        : 'BoxMOT Deep OC-SORT (optional OSNet)',
+    },
+    {
       label: 'Hybrid SAM (overlap refiner)',
-      value: `Runs when pairwise box IoU ≥ ${HANDSHAKE_ENFORCED_HYBRID_IOU.toFixed(2)} — fixed by Lab server (slider value is not used)`,
+      value: isByteTrack
+        ? 'Off — ByteTrack disables overlap SAM (handshake open-floor registry may still use other paths per main.py)'
+        : `Runs when pairwise box IoU ≥ ${HANDSHAKE_ENFORCED_HYBRID_IOU.toFixed(2)} — fixed by Lab server (slider value is not used)`,
     },
     {
       label: 'Weak SAM gate',

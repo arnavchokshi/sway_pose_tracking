@@ -114,13 +114,19 @@ def freeze_lab_subprocess_phase3_stitch_env(env: Dict[str, str]) -> None:
 # Set ``SWAY_UNLOCK_POSE_TUNING=1`` for smoke (3D off, chunked ViTPose) or FP32 A/B. Smart pad is not
 # then forced to ``1``; ``vitpose_smart_pad_enabled()`` still defaults on unless ``SWAY_VITPOSE_SMART_PAD=0``.
 def apply_master_locked_pose_env() -> None:
-    """Unset chunked ViTPose cap; FP32 off; 3D lift on; ViTPose smart bbox pad on."""
+    """Unset chunked ViTPose cap; FP32 off; 3D lift on; ViTPose smart bbox pad on.
+
+    Unset cap keeps one batched forward on CUDA. On MPS, ``pose_estimator`` applies a safe default
+    chunk size when the env var is absent (see ``vitpose_effective_max_per_forward``).
+    """
     v = os.environ.get("SWAY_UNLOCK_POSE_TUNING", "").strip().lower()
     if v in ("1", "true", "yes"):
         return
     os.environ.pop("SWAY_VITPOSE_MAX_PER_FORWARD", None)
     os.environ["SWAY_VITPOSE_FP32"] = "0"
-    os.environ["SWAY_3D_LIFT"] = "1"
+    lift = os.environ.get("SWAY_3D_LIFT", "").strip().lower()
+    if lift not in ("0", "false", "no"):
+        os.environ["SWAY_3D_LIFT"] = "1"
     os.environ["SWAY_VITPOSE_SMART_PAD"] = "1"
 
 
@@ -393,6 +399,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         choices=[
             "yolo26s",
             "yolo26l_dancetrack",
+            "yolo26l_dancetrack_crowdhuman",
             "yolo26x",
         ],
         tier=1,
@@ -498,13 +505,14 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         "deep_ocsort",
         binding="none",
         key="",
-        choices=["deep_ocsort", "deep_ocsort_osnet"],
+        choices=["deep_ocsort", "deep_ocsort_osnet", "bytetrack"],
         tier=1,
         display="tracker_strip",
         description=(
             "**Default:** Deep OC-SORT with motion/IoU association (no track-time Re-ID). "
             "**+ OSNet:** same tracker with OSNet embeddings during tracking — better through crosses/occlusions "
-            "when outfits look different; prefetch ``models/osnet_x0_25_msmt17.pt`` (or set weights via advanced preset)."
+            "when outfits look different; prefetch ``models/osnet_x0_25_msmt17.pt`` (or set weights via advanced preset). "
+            "**ByteTrack:** faster motion-only association (no appearance embeddings); **Fast preview** uses this and turns overlap SAM off."
         ),
     ),
     _f(
@@ -892,6 +900,36 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
     _f(
+        "sway_pose_3d_lift",
+        "pose",
+        "Run 3D pose lift (MotionAGFormer / depth scoring)",
+        "bool",
+        True,
+        binding="env",
+        key="SWAY_3D_LIFT",
+        tier=2,
+        advanced=True,
+        description=(
+            "Default on for production. Turn **off** for fastest runs (2D-only; skips Phase 10 lift work). "
+            "The Lab **Fast preview** recipe sets this off; ``main.py`` honors ``SWAY_3D_LIFT=0`` when the subprocess env sets it."
+        ),
+    ),
+    _f(
+        "sway_vitpose_use_fast",
+        "pose",
+        "Use Hugging Face fast ViTPose image processor",
+        "bool",
+        False,
+        binding="env",
+        key="SWAY_VITPOSE_USE_FAST",
+        tier=3,
+        advanced=True,
+        description=(
+            "When on, uses the faster HF ``VitPoseImageProcessor`` path (see ``SWAY_VITPOSE_USE_FAST``). "
+            "Fast preview turns this on; on some devices the default slow processor avoids MPS stalls."
+        ),
+    ),
+    _f(
         "info_pose_master_locked",
         "pose",
         "Lock these down (set and forget)",
@@ -903,9 +941,9 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
             "``main.py`` reapplies them after ``params`` YAML. For fast smoke (no 3D, chunked ViTPose) or "
             "deliberate FP32 tests, set ``SWAY_UNLOCK_POSE_TUNING=1``.\n\n"
-            "**Skeleton cadence:** **every frame** (``pose_stride`` **1**) — matches **The Lock** on the Pose tab; "
-            "the Lab does not expose stride. Use ``--pose-stride 2`` only from CLI or batch matrices for A/B tests, "
-            "not as a production shortcut for fast choreography.\n\n"
+            "**Skeleton cadence:** Default **every frame** (``pose_stride`` **1**). **Fast preview** overrides to "
+            "stride **2** for speed (gaps filled per ``SWAY_POSE_GAP_INTERP_MODE``). Use ``--pose-stride 2`` from CLI "
+            "for the same idea outside the Fast recipe.\n\n"
             "**Max people per ViTPose GPU forward:** **0** (cap **unset**) — one natural batch per frame; "
             "only raise the cap if 40+ people routinely OOM your GPU.\n\n"
             "**Force ViTPose float32 on GPU:** **Off** — FP16 when the device allows; FP32 is much slower/heavier "
@@ -933,6 +971,89 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         advanced=True,
         tier=3,
         display="slider",
+    ),
+    _f(
+        "info_future_crop_modules",
+        "pose",
+        "Future-doc crop modules (identity + ViTPose crops)",
+        "info",
+        None,
+        binding="none",
+        key="",
+        advanced=True,
+        tier=3,
+        description=(
+            "Knobs aligned with ``docs/FUTURE_MODULES_IDENTITY_AND_POSE_CROPS.md`` Part F. "
+            "Applied **after** smart bbox pad and **before** ViTPose. "
+            "See ``sway/future_modules_registry.py`` for full catalog vs this doc."
+        ),
+    ),
+    _f(
+        "sway_pose_crop_smooth_alpha",
+        "pose",
+        "Temporal crop EMA (0 = off)",
+        "float",
+        0.0,
+        binding="yaml",
+        key="POSE_CROP_SMOOTH_ALPHA",
+        min_=0.0,
+        max_=1.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description=(
+            "**Part F — temporal crop smoothing.** 0 disables. Typical **0.15–0.35**: "
+            "each frame blends toward the new expanded box with this weight (higher = more responsive)."
+        ),
+    ),
+    _f(
+        "sway_pose_crop_foot_bias_frac",
+        "pose",
+        "Extra crop below feet (fraction of box height)",
+        "float",
+        0.0,
+        binding="yaml",
+        key="POSE_CROP_FOOT_BIAS_FRAC",
+        min_=0.0,
+        max_=0.35,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="**Part F — footprint prior.** Expands the bottom of the pose crop by this fraction of box height.",
+    ),
+    _f(
+        "sway_pose_crop_head_bias_frac",
+        "pose",
+        "Extra crop above head (fraction of box height)",
+        "float",
+        0.0,
+        binding="yaml",
+        key="POSE_CROP_HEAD_BIAS_FRAC",
+        min_=0.0,
+        max_=0.35,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description="**Part F — head room prior.** Expands the top of the pose crop by this fraction of box height.",
+    ),
+    _f(
+        "sway_pose_crop_anti_jitter_px",
+        "pose",
+        "Anti-jitter: damp big center jumps (px; 0 = off)",
+        "float",
+        0.0,
+        binding="yaml",
+        key="POSE_CROP_ANTI_JITTER_PX",
+        min_=0.0,
+        max_=120.0,
+        advanced=True,
+        tier=3,
+        display="slider",
+        description=(
+            "**Part F — anti-jitter gate.** Only applies when temporal crop EMA is **on**. "
+            "If the raw crop center jumps farther than this many pixels vs the previous smoothed crop, "
+            "blend extra toward the smoothed rectangle."
+        ),
     ),
     # --- reid_dedup (main.py phases 6–7) ---
     _f(
@@ -1282,11 +1403,11 @@ _LEGACY_PHASE_TO_INTENT = {
 
 # ``sway_phase13_mode`` is omitted: Lab API ``_effective_ui_fields`` applies these after client fields;
 # locking it to standard would ignore Dancer registry / Sway handshake on every enqueue.
+# ``tracker_technology`` is omitted: Fast preview sets ByteTrack; locking to deep_ocsort would undo it on enqueue.
+# ``sway_yolo_detection_stride`` / ``pose_stride`` / ``save_phase_previews`` omitted: Fast preview uses aggressive
+# stride + no phase MP4s; locking would undo super-fast enqueue.
 _UI_LOCK_DEFAULTS: Dict[str, Any] = {
-    "tracker_technology": "deep_ocsort",
     "sway_boxmot_reid_model": "osnet_x0_25",
-    "sway_yolo_detection_stride": 1,
-    "pose_stride": 1,
     "sway_box_interp_mode": "linear",
     "sway_vis_temporal_interp_mode": "linear",
     "sway_gnn_track_refine": False,
@@ -1294,6 +1415,10 @@ _UI_LOCK_DEFAULTS: Dict[str, Any] = {
     "sway_hybrid_weak_conf_delta": 0.08,
     "sway_hybrid_weak_height_frac": 0.12,
     "sway_hybrid_weak_match_iou": 0.25,
+    "sway_pose_crop_smooth_alpha": 0.0,
+    "sway_pose_crop_foot_bias_frac": 0.0,
+    "sway_pose_crop_head_bias_frac": 0.0,
+    "sway_pose_crop_anti_jitter_px": 0.0,
     # Post-pose cleanup vote + export outputs (no Lab sliders/toggles).
     "prune_threshold": 0.65,
     "montage": False,
@@ -1318,8 +1443,37 @@ for _row in PIPELINE_PARAM_FIELDS:
         _row["lab_hidden"] = True
 
 
+PIPELINE_PRESET_GROUPS: List[Dict[str, Any]] = [
+    {
+        "id": "phases_1_3",
+        "label": "Detection / Tracking / Stitching",
+        "phases_label": "Phases 1-3",
+        "default_preset": "p13_standard",
+    },
+    {
+        "id": "phases_4_6",
+        "label": "Pose / Association",
+        "phases_label": "Phases 4-6",
+        "default_preset": "p46_balanced",
+    },
+    {
+        "id": "phases_7_9",
+        "label": "Cleanup / Pruning / Smoothing",
+        "phases_label": "Phases 7-9",
+        "default_preset": "p79_balanced",
+    },
+    {
+        "id": "phases_10_11",
+        "label": "Scoring / Export",
+        "phases_label": "Phases 10-11",
+        "default_preset": "p1011_standard",
+    },
+]
+
+
 def schema_payload() -> Dict[str, Any]:
     return {
         "stages": PIPELINE_STAGES,
         "fields": PIPELINE_PARAM_FIELDS,
+        "preset_groups": PIPELINE_PRESET_GROUPS,
     }

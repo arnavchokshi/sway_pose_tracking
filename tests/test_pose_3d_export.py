@@ -79,6 +79,10 @@ def test_export_3d_unified_includes_camera(monkeypatch) -> None:
     assert "fx" in cam and "fy" in cam and cam["fx"] > 0
     assert "root_xyz" in blob["tracks"]["1"]
     assert len(blob["tracks"]["1"]["root_xyz"]) == 3
+    assert blob.get("include_lift_xyz") is True
+    t1 = blob["tracks"]["1"]
+    assert "lift_xyz" in t1
+    assert len(t1["lift_xyz"]) == len(t1["keypoints_3d"])
 
 
 def test_compute_joint_angles_3d_right_angle() -> None:

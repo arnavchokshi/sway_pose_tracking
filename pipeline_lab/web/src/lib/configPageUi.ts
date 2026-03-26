@@ -16,6 +16,9 @@ export function schemaPhasesForConfigStage(stageId: string): readonly string[] {
 }
 
 export function fieldBelongsToConfigStage(f: SchemaField, stageId: string): boolean {
+  // After Python schema rewrite, f.phase already contains intent names (e.g. 'handshake')
+  // that match stageId directly. Legacy lookup kept as fallback.
+  if (f.phase === stageId) return true
   return schemaPhasesForConfigStage(stageId).includes(f.phase)
 }
 

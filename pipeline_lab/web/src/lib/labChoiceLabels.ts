@@ -20,6 +20,7 @@ function labChoiceDisplayLabelCompare(fieldId: string, raw: string): string {
     case 'tracker_technology':
       if (raw === 'deep_ocsort') return 'Motion only (Deep OC-SORT)'
       if (raw === 'deep_ocsort_osnet') return 'Deep OC-SORT + in-track Re-ID (OSNet)'
+      if (raw === 'bytetrack') return 'ByteTrack (fast preview path)'
       if (raw === 'BoxMOT') return 'Motion only (Deep OC-SORT)'
       if (raw === 'StrongSORT') return 'Deep OC-SORT + in-track Re-ID (OSNet)'
       if (raw === 'BoT-SORT' || raw === 'ByteTrack' || raw === 'OC-SORT') return 'Motion only (Deep OC-SORT)'
@@ -77,6 +78,7 @@ function labChoiceDisplayLabelLab(fieldId: string, raw: string): string {
     case 'tracker_technology':
       if (raw === 'deep_ocsort') return 'Default (motion only)'
       if (raw === 'deep_ocsort_osnet') return 'Deep OC-SORT + OSNet'
+      if (raw === 'bytetrack') return 'ByteTrack (fast)'
       if (raw === 'BoxMOT') return 'Default (motion only)'
       if (raw === 'StrongSORT') return 'Deep OC-SORT + OSNet'
       if (raw === 'BoT-SORT' || raw === 'ByteTrack' || raw === 'OC-SORT') return 'Default (motion only)'

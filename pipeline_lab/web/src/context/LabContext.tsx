@@ -41,6 +41,7 @@ type LabContextValue = {
   videoLabel: string
   setVideo: (file: File | null) => void
   drafts: DraftRun[]
+  /** Replace or patch the full draft list (used by checkpoint tree UI). */
   setDrafts: React.Dispatch<React.SetStateAction<DraftRun[]>>
   updateDraft: (
     clientId: string,

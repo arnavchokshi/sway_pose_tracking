@@ -54,7 +54,7 @@ export const WATCH_PHASE_ROWS: {
     id: 'track',
     title: 'Phases 1–3 · Tracks after stitch',
     blurb:
-      'main.py [1–2/11] YOLO + BoxMOT Deep OC-SORT (optional track-time OSNet); Hybrid SAM when overlap refiner on. [3/11] post-track stitch / global link; optional SWAY_GNN_TRACK_REFINE hook after stitch. Orange dashed rectangle = SAM2 ROI that frame.',
+      'main.py [1–2/11] YOLO + BoxMOT (Deep OC-SORT + optional OSNet by default; Fast preview uses ByteTrack with hybrid SAM off). [3/11] post-track stitch / global link; optional SWAY_GNN_TRACK_REFINE hook after stitch. Orange dashed rectangle = SAM2 ROI when overlap refiner ran.',
   },
   {
     file: '02_pre_pose_prune.mp4',

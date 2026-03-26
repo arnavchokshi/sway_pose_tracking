@@ -40,6 +40,15 @@ def test_create_boxmot_tracker_lightweight(kind):
     assert tr is not None
 
 
+def test_deepocsort_assoc_eiou_maps_to_ciou():
+    os.environ["SWAY_BOXMOT_ASSOC_METRIC"] = "eiou"
+    try:
+        doc = _deepocsort_extra_from_env()
+        assert doc["asso_func"] == "ciou"
+    finally:
+        os.environ.pop("SWAY_BOXMOT_ASSOC_METRIC", None)
+
+
 def test_strongsort_requires_reid_file(tmp_path):
     import torch
 

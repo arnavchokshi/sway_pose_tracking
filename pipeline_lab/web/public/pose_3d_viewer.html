@@ -25,6 +25,12 @@
     .dancer-btn.active { border-color: #6366f1; color: #818cf8; background: #1e1e3a; }
     #view-label { position: absolute; top: 12px; left: 12px; font-size: 12px;
                   color: #666; text-transform: uppercase; letter-spacing: 1px; }
+    #debug-panel {
+      position: absolute; top: 12px; right: 12px; z-index: 2; max-width: 280px;
+      font-size: 11px; line-height: 1.45; color: #a1a1aa; background: rgba(0,0,0,0.55);
+      border: 1px solid #333; border-radius: 8px; padding: 10px 12px;
+    }
+    #debug-panel code { color: #c4b5fd; font-size: 10px; word-break: break-all; }
     #err { padding: 2rem; color: #fca5a5; max-width: 40rem; line-height: 1.5; }
     a { color: #818cf8; }
   </style>
@@ -42,6 +48,7 @@
 <div id="container" style="display:none">
   <div id="scene-view">
     <div id="view-label">All dancers</div>
+    <div id="debug-panel" style="display:none"></div>
     <canvas id="canvas-all"></canvas>
     <div id="timeline">
       <input type="range" id="scrubber" min="0" value="0" step="1" />
@@ -49,6 +56,9 @@
     <div class="controls">
       <button type="button" id="btn-play">Play</button>
       <button type="button" id="btn-reset-cam">Reset camera</button>
+      <button type="button" id="btn-fit-cam" title="Frame all skeletons in view">Fit scene</button>
+      <button type="button" id="btn-view-world" class="active">World</button>
+      <button type="button" id="btn-view-lift" style="display:none" title="Pelvis-centered lift_xyz (debug)">Lift</button>
       <span id="frame-label" style="padding: 6px 0; font-size: 12px; color: #666;">Frame 0</span>
     </div>
   </div>
@@ -101,8 +111,44 @@ document.getElementById('err').style.display = 'none';
 const { fps: fpsRaw, total_frames, bones, tracks, camera: poseCamera } = POSE_DATA;
 const fps = Number(fpsRaw) || 30;
 const trackIds = Object.keys(tracks || {}).map((k) => parseInt(k, 10)).filter((n) => !Number.isNaN(n));
-/** v2 export: unified world XYZ (Y-up) from pinhole + depth + lift; no fake side-by-side spread. */
-const useWorldXYZ = Number(POSE_DATA.version) >= 2 && poseCamera && poseCamera.fx;
+/** v2 export: unified world XYZ (Y-up); legacy v1 uses pixel×z heuristics + side-by-side spread. */
+const useWorldFromExport = Number(POSE_DATA.version) >= 2 && poseCamera && poseCamera.fx;
+
+const canLiftView = Boolean(POSE_DATA.include_lift_xyz) && trackIds.some((tid) => {
+  const t = tracks[String(tid)];
+  return t && Array.isArray(t.lift_xyz) && t.lift_xyz.length > 0;
+});
+
+let viewMode = 'world';
+const urlView = (params.get('view') || '').toLowerCase();
+if (urlView === 'lift' && canLiftView) viewMode = 'lift';
+else if (urlView === 'world') viewMode = 'world';
+
+function renderMode() {
+  if (!useWorldFromExport) return 'legacy';
+  if (viewMode === 'lift' && canLiftView) return 'lift';
+  return 'world';
+}
+
+(function initDebugPanel() {
+  const dbg = document.getElementById('debug-panel');
+  const parts = [`<div style="color:#e4e4e7;margin-bottom:6px"><strong>pose_3d</strong> v${POSE_DATA.version ?? '?'}</div>`];
+  if (poseCamera) {
+    parts.push(
+      `<div>FOV <code>${Number(poseCamera.fov_deg).toFixed(1)}°</code> · fx <code>${Number(poseCamera.fx).toFixed(1)}</code> fy <code>${Number(poseCamera.fy).toFixed(1)}</code></div>`,
+      `<div>Principal <code>cx ${Number(poseCamera.cx).toFixed(0)} cy ${Number(poseCamera.cy).toFixed(0)}</code></div>`,
+    );
+    if (poseCamera.intrinsics_source) {
+      parts.push(`<div>Intrinsics <code>${poseCamera.intrinsics_source}</code></div>`);
+    }
+  } else {
+    parts.push('<div>No <code>camera</code> block (legacy export)</div>');
+  }
+  parts.push(`<div>Lift arrays: <code>${canLiftView ? 'yes' : 'no'}</code> · World XYZ: <code>${useWorldFromExport ? 'yes' : 'no'}</code></div>`);
+  parts.push('<div style="margin-top:6px;opacity:0.85">Tuning: <code>SWAY_FX</code>/<code>SWAY_FY</code>, <code>SWAY_DEFAULT_ROOT_Z</code>, <code>SWAY_DEPTH_FOR_ROOT_Z</code></div>');
+  dbg.innerHTML = parts.join('');
+  dbg.style.display = 'block';
+})();
 
 const DANCER_COLORS = [
   0x6366f1, 0xf43f5e, 0x10b981, 0xf59e0b,
@@ -145,7 +191,7 @@ function createDancerSkeleton(color) {
   const jointMat = new THREE.MeshStandardMaterial({ color });
   const boneMat = new THREE.LineBasicMaterial({ color });
 
-  const jr = useWorldXYZ ? 0.055 : 0.025;
+  const jr = useWorldFromExport ? 0.055 : 0.025;
   const joints = Array.from({ length: 17 }, () => {
     const mesh = new THREE.Mesh(new THREE.SphereGeometry(jr, 8, 8), jointMat);
     group.add(mesh);
@@ -193,64 +239,92 @@ function getKptsAtFrame(tid, frameIdx) {
   return track.keypoints_3d[ni];
 }
 
-function updateSkeleton(skel, kpts3d) {
+function getLiftAtFrame(tid, frameIdx) {
+  const track = tracks[String(tid)];
+  if (!track || !track.frames || !track.lift_xyz) return null;
+  const idx = track.frames.indexOf(frameIdx);
+  if (idx !== -1) return track.lift_xyz[idx];
+  if (track.frames.length === 0) return null;
+  let nearest = track.frames[0];
+  let best = Math.abs(nearest - frameIdx);
+  for (const f of track.frames) {
+    const d = Math.abs(f - frameIdx);
+    if (d < best) { best = d; nearest = f; }
+  }
+  if (best > fps * 2) return null;
+  const ni = track.frames.indexOf(nearest);
+  return track.lift_xyz[ni];
+}
+
+function updateSkeleton(skel, kpts3d, liftOptional) {
+  const mode = renderMode();
   if (!kpts3d || kpts3d.length < 17) {
     skel.group.visible = false;
     return;
   }
+
+  const lift = liftOptional && liftOptional.length >= 17 ? liftOptional : null;
   skel.group.visible = true;
 
-  if (useWorldXYZ) {
+  if (mode === 'lift' && lift) {
+    const hip = [
+      (Number(lift[11][0]) + Number(lift[12][0])) * 0.5,
+      (Number(lift[11][1]) + Number(lift[12][1])) * 0.5,
+      (Number(lift[11][2] ?? 0) + Number(lift[12][2] ?? 0)) * 0.5,
+    ];
+    let maxD = 0.08;
+    for (let i = 0; i < 17; i++) {
+      const kp = lift[i];
+      const dx = Number(kp[0]) - hip[0];
+      const dy = Number(kp[1]) - hip[1];
+      const dz = Number(kp[2] ?? 0) - hip[2];
+      maxD = Math.max(maxD, Math.hypot(dx, dy, dz));
+    }
+    const sc = 1.35 / maxD;
+    skel.joints.forEach((joint, i) => {
+      const kp = lift[i];
+      joint.position.set(
+        (Number(kp[0]) - hip[0]) * sc,
+        (Number(kp[1]) - hip[1]) * sc,
+        (Number(kp[2] ?? 0) - hip[2]) * sc,
+      );
+    });
+  } else if (useWorldFromExport) {
     skel.joints.forEach((joint, i) => {
       const kp = kpts3d[i];
       joint.position.set(Number(kp[0]), Number(kp[1]), Number(kp[2] ?? 0));
     });
-    skel.boneLines.forEach(({ line, a, b }) => {
-      const posA = skel.joints[a].position;
-      const posB = skel.joints[b].position;
-      const positions = line.geometry.attributes.position;
-      positions.setXYZ(0, posA.x, posA.y, posA.z);
-      positions.setXYZ(1, posB.x, posB.y, posB.z);
-      positions.needsUpdate = true;
+  } else {
+    const hipMid = [
+      (kpts3d[11][0] + kpts3d[12][0]) / 2,
+      (kpts3d[11][1] + kpts3d[12][1]) / 2,
+      (kpts3d[11][2] + kpts3d[12][2]) / 2,
+    ];
+    const ankleY = Math.max(kpts3d[15][1], kpts3d[16][1]);
+    const noseY = kpts3d[0][1];
+    const rawHeight = Math.abs(ankleY - noseY) || 1.0;
+    const scale = 1.8 / rawHeight;
+    let xyExtent = 0.01;
+    let zExtent = 1e-6;
+    for (let i = 0; i < 17; i++) {
+      const kp = kpts3d[i];
+      const sx = (kp[0] - hipMid[0]) * scale;
+      const sy = -(kp[1] - hipMid[1]) * scale;
+      xyExtent = Math.max(xyExtent, Math.hypot(sx, sy));
+      zExtent = Math.max(zExtent, Math.abs((kp[2] ?? 0) - hipMid[2]));
+    }
+    const zScale = zExtent < 1e-7 ? 0 : (xyExtent / zExtent) * 0.9;
+
+    skel.joints.forEach((joint, i) => {
+      const kp = kpts3d[i];
+      const z = kp[2] ?? 0;
+      joint.position.set(
+        (kp[0] - hipMid[0]) * scale,
+        -(kp[1] - hipMid[1]) * scale,
+        (z - hipMid[2]) * zScale,
+      );
     });
-    return;
   }
-
-  const hipMid = [
-    (kpts3d[11][0] + kpts3d[12][0]) / 2,
-    (kpts3d[11][1] + kpts3d[12][1]) / 2,
-    (kpts3d[11][2] + kpts3d[12][2]) / 2,
-  ];
-  const ankleY = Math.max(kpts3d[15][1], kpts3d[16][1]);
-  const noseY = kpts3d[0][1];
-  const rawHeight = Math.abs(ankleY - noseY) || 1.0;
-  /** Maps pixel XY deltas to ~meters in scene (same as body height → ~1.8 units). */
-  const scale = 1.8 / rawHeight;
-  /**
-   * keypoints_3d from the pipeline is [pixel_x, pixel_y, model_z]. Applying `scale` to z
-   * crushes real depth (~0.1–1m) relative to XY. Center z on the hips and scale so the
-   * joint-to-joint depth range matches the horizontal extent of the skeleton in scene units.
-   */
-  let xyExtent = 0.01;
-  let zExtent = 1e-6;
-  for (let i = 0; i < 17; i++) {
-    const kp = kpts3d[i];
-    const sx = (kp[0] - hipMid[0]) * scale;
-    const sy = -(kp[1] - hipMid[1]) * scale;
-    xyExtent = Math.max(xyExtent, Math.hypot(sx, sy));
-    zExtent = Math.max(zExtent, Math.abs((kp[2] ?? 0) - hipMid[2]));
-  }
-  const zScale = zExtent < 1e-7 ? 0 : (xyExtent / zExtent) * 0.9;
-
-  skel.joints.forEach((joint, i) => {
-    const kp = kpts3d[i];
-    const z = kp[2] ?? 0;
-    joint.position.set(
-      (kp[0] - hipMid[0]) * scale,
-      -(kp[1] - hipMid[1]) * scale,
-      (z - hipMid[2]) * zScale,
-    );
-  });
 
   skel.boneLines.forEach(({ line, a, b }) => {
     const posA = skel.joints[a].position;
@@ -266,20 +340,22 @@ function updateAllScene(frameIdx) {
   trackIds.forEach((tid, i) => {
     const skel = allSceneSkeletons[tid];
     const kpts = getKptsAtFrame(tid, frameIdx);
-    updateSkeleton(skel, kpts);
-    if (useWorldXYZ) {
-      skel.group.position.set(0, 0, 0);
-    } else {
+    const lift = getLiftAtFrame(tid, frameIdx);
+    updateSkeleton(skel, kpts, lift);
+    const spreadLegacy = renderMode() === 'legacy';
+    if (spreadLegacy) {
       skel.group.position.x = (i - (trackIds.length - 1) / 2) * 2.5;
       skel.group.position.y = 0;
       skel.group.position.z = 0;
+    } else {
+      skel.group.position.set(0, 0, 0);
     }
   });
 }
 
 function updateIndividualScene(frameIdx) {
   if (selectedTid === null) return;
-  updateSkeleton(indSkel, getKptsAtFrame(selectedTid, frameIdx));
+  updateSkeleton(indSkel, getKptsAtFrame(selectedTid, frameIdx), getLiftAtFrame(selectedTid, frameIdx));
 }
 
 const dancerList = document.getElementById('dancer-list');
@@ -328,6 +404,65 @@ document.getElementById('btn-reset-cam').addEventListener('click', () => {
   controlsAll.target.set(0, 1, 0);
   controlsAll.update();
 });
+
+function fitCameraToScene() {
+  sceneAll.updateMatrixWorld(true);
+  const box = new THREE.Box3();
+  let any = false;
+  trackIds.forEach((tid) => {
+    const skel = allSceneSkeletons[tid];
+    if (!skel.group.visible) return;
+    skel.joints.forEach((mesh) => {
+      const v = new THREE.Vector3();
+      mesh.getWorldPosition(v);
+      if (Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z)) {
+        box.expandByPoint(v);
+        any = true;
+      }
+    });
+  });
+  if (!any) return;
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z, 0.35);
+  const dist = Math.max(2.0, maxDim * 2.8);
+  controlsAll.target.copy(center);
+  cameraAll.position.set(center.x + dist * 0.55, center.y + dist * 0.38, center.z + dist * 0.55);
+  cameraAll.near = Math.max(0.01, dist * 0.002);
+  cameraAll.far = Math.max(200, dist * 80);
+  cameraAll.updateProjectionMatrix();
+  controlsAll.update();
+}
+
+document.getElementById('btn-fit-cam').addEventListener('click', fitCameraToScene);
+
+const btnViewWorld = document.getElementById('btn-view-world');
+const btnViewLift = document.getElementById('btn-view-lift');
+
+function syncViewButtons() {
+  btnViewWorld.classList.toggle('active', viewMode === 'world');
+  btnViewLift.classList.toggle('active', viewMode === 'lift');
+}
+
+if (!useWorldFromExport) {
+  btnViewWorld.style.display = 'none';
+  btnViewLift.style.display = 'none';
+} else {
+  if (!canLiftView) btnViewLift.style.display = 'none';
+  btnViewWorld.addEventListener('click', () => {
+    viewMode = 'world';
+    syncViewButtons();
+  });
+  btnViewLift.addEventListener('click', () => {
+    if (canLiftView) {
+      viewMode = 'lift';
+      syncViewButtons();
+    }
+  });
+  syncViewButtons();
+}
 
 scrubber.addEventListener('input', () => {
   playhead = parseInt(scrubber.value, 10);

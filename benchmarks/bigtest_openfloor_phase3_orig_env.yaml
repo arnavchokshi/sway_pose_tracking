@@ -1,0 +1,13 @@
+# OpenFloor + Competition + SharpHipHop + Standard (tracking knobs only), DanceTrack+CrowdHuman weights.
+# Use with: python main.py <video> --params benchmarks/bigtest_openfloor_phase3_orig_env.yaml ...
+# Keys are SWAY_* as required by sway/pipeline_env_params.py
+SWAY_YOLO_WEIGHTS: yolo26l_dancetrack_crowdhuman
+SWAY_YOLO_CONF: "0.30"
+SWAY_PRETRACK_NMS_IOU: "0.80"
+SWAY_HYBRID_SAM_IOU_TRIGGER: "0.50"
+SWAY_BOXMOT_MAX_AGE: "120"
+SWAY_BOXMOT_MATCH_THRESH: "0.35"
+SWAY_BOXMOT_TRACKER: deepocsort
+SWAY_BOXMOT_REID_ON: "0"
+SWAY_PHASE13_MODE: standard
+SWAY_USE_BOXMOT: "1"

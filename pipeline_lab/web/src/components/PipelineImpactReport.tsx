@@ -34,6 +34,7 @@ export function PipelineImpactSummary({ diagnostics }: { diagnostics?: Diag | nu
   if (tp) {
     if (tp === 'boxmot:deepocsort+osnet') chips.push('BoxMOT · Deep OC-SORT + OSNet')
     else if (tp === 'boxmot:deepocsort') chips.push('BoxMOT · Deep OC-SORT')
+    else if (tp === 'boxmot:bytetrack') chips.push('BoxMOT · ByteTrack')
     else chips.push(tp.replace(/^boxmot:/, 'BoxMOT · ').replace(/^botsort$/, 'BoT-SORT'))
   }
   if (pct != null && refined != null && refined > 0) chips.push(`SAM ${pct}% of det frames`)
@@ -126,6 +127,8 @@ export function PipelineImpactReport({ diagnostics }: { diagnostics?: Diag | nul
     let body: string
     if (trackerPath === 'boxmot:deepocsort+osnet') {
       body = 'BoxMOT Deep OC-SORT with track-time OSNet; hybrid SAM when overlap refiner is on.'
+    } else if (trackerPath === 'boxmot:bytetrack') {
+      body = 'BoxMOT ByteTrack (motion-only, no appearance embeddings); hybrid SAM off for speed.'
     } else if (isBoxmot) {
       const label = variant === 'deepocsort' ? 'Deep OC-SORT (motion only)' : variant
       body = `BoxMOT (${label}) + hybrid SAM when overlap refiner is on.`

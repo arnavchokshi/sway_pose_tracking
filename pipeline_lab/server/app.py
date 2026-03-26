@@ -307,7 +307,7 @@ _REID_PRESET_FILES = {
 
 
 def _normalize_tracker_technology(raw: Any) -> str:
-    """Lab enum + legacy saved runs → ``deep_ocsort`` | ``deep_ocsort_osnet``."""
+    """Lab enum + legacy saved runs → ``deep_ocsort`` | ``deep_ocsort_osnet`` | ``bytetrack``."""
     legacy = {
         "BoxMOT": "deep_ocsort",
         "BoT-SORT": "deep_ocsort",
@@ -322,7 +322,7 @@ def _normalize_tracker_technology(raw: Any) -> str:
     s = raw.strip()
     if s in legacy:
         return legacy[s]
-    if s in ("deep_ocsort", "deep_ocsort_osnet"):
+    if s in ("deep_ocsort", "deep_ocsort_osnet", "bytetrack"):
         return s
     return "deep_ocsort"
 
@@ -345,17 +345,21 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
             env[key] = str(val)
     # Normalize association metric for tracker.py (case-insensitive)
     am = str(env.get("SWAY_BOXMOT_ASSOC_METRIC", "")).strip().lower()
-    if am in ("iou", "giou", "diou", "ciou"):
+    if am in ("iou", "giou", "diou", "ciou", "eiou"):
         env["SWAY_BOXMOT_ASSOC_METRIC"] = am
-    # tracker_technology → BoxMOT Deep OC-SORT, optional track-time OSNet (see pipeline_config_schema)
+    # tracker_technology → BoxMOT: Deep OC-SORT, optional track-time OSNet, or ByteTrack (see pipeline_config_schema)
     tt = _normalize_tracker_technology(fields.get("tracker_technology"))
     env["SWAY_USE_BOXMOT"] = "1"
-    env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
     custom_rw = str(fields.get("sway_boxmot_reid_weights") or "").strip()
     preset = fields.get("sway_boxmot_reid_model")
     if isinstance(preset, str) and preset.strip() == "osnet_x1_0":
         preset = "osnet_x0_25"  # legacy saved runs / presets
-    if tt == "deep_ocsort_osnet":
+    if tt == "bytetrack":
+        env["SWAY_BOXMOT_TRACKER"] = "bytetrack"
+        env["SWAY_BOXMOT_REID_ON"] = "0"
+        env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
+    elif tt == "deep_ocsort_osnet":
+        env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
         env["SWAY_BOXMOT_REID_ON"] = "1"
         if custom_rw:
             p = Path(custom_rw).expanduser()
@@ -372,6 +376,7 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
         else:
             env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
     else:
+        env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
         env["SWAY_BOXMOT_REID_ON"] = "0"
         env.pop("SWAY_BOXMOT_REID_WEIGHTS", None)
     # Aligns with global_track_link.py: unset SWAY_GLOBAL_AFLINK = allow neural when weights exist.
@@ -382,6 +387,8 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
         env.pop("SWAY_GLOBAL_AFLINK", None)
     freeze_lab_subprocess_detection_env(env)
     freeze_lab_subprocess_hybrid_sam_env(env)
+    if tt == "bytetrack":
+        env["SWAY_HYBRID_SAM_OVERLAP"] = "0"
     p13 = str(fields.get("sway_phase13_mode", "standard") or "standard").strip().lower()
     if p13 == "dancer_registry":
         env["SWAY_PHASE13_MODE"] = "dancer_registry"
@@ -391,6 +398,9 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
         env["SWAY_HYBRID_SAM_WEAK_CUES"] = "0"
     freeze_lab_subprocess_phase3_stitch_env(env)
     freeze_lab_subprocess_pose_env(env)
+    # Master pose freeze forces SWAY_3D_LIFT=1; honor explicit off for fast preview / drafts.
+    if fields.get("sway_pose_3d_lift") is False:
+        env["SWAY_3D_LIFT"] = "0"
     freeze_lab_subprocess_smooth_env(env, fields)
     return env
 
@@ -925,11 +935,19 @@ def _normalize_upload_checkpoint(ck: Dict[str, Any], prior_run_ids: List[str], r
     ``prior_run_ids`` are run UUIDs already created for earlier entries in this batch (same order as specs).
     """
     out = dict(ck)
-    pidx = out.pop("parent_batch_index", None)
+    pidx_raw = out.pop("parent_batch_index", None)
     rsub = out.pop("resume_checkpoint_subdir", None)
-    if pidx is None:
+    if pidx_raw is None:
         return out
-    if not isinstance(pidx, int) or pidx < 0 or pidx >= len(prior_run_ids):
+    if isinstance(pidx_raw, bool):
+        raise ValueError(f"invalid parent_batch_index {pidx_raw!r} for run index {run_index}")
+    if isinstance(pidx_raw, float) and pidx_raw.is_integer():
+        pidx = int(pidx_raw)
+    elif isinstance(pidx_raw, int):
+        pidx = pidx_raw
+    else:
+        raise ValueError(f"invalid parent_batch_index {pidx_raw!r} for run index {run_index} (need int)")
+    if pidx < 0 or pidx >= len(prior_run_ids):
         raise ValueError(f"invalid parent_batch_index {pidx!r} for run index {run_index} (need 0 <= i < {len(prior_run_ids)})")
     parent_id = prior_run_ids[pidx]
     sub = str(rsub or "after_phase_1").strip() or "after_phase_1"

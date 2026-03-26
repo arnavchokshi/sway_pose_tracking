@@ -138,7 +138,13 @@ def collect_strided_depth_series(
 
 
 def get_depth_array(frame_bgr: np.ndarray) -> Optional[np.ndarray]:
-    """Return depth map (H, W) float32 from Depth Anything V2, or None if unavailable."""
+    """Return depth map (H, W) float32 from Depth Anything V2, or None if unavailable.
+
+    Values are per-frame min–max normalized to approximately [0, 1] (relative within the
+    frame, not metric depth). For unified 3D world export, root Z from this map is opt-in
+    via ``SWAY_DEPTH_FOR_ROOT_Z`` (see ``sway.pose_lift_3d``); default pelvis depth uses
+    ``SWAY_DEFAULT_ROOT_Z``.
+    """
     if frame_bgr is None or frame_bgr.size == 0:
         return None
     pipe = _depth_pipeline()

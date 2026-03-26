@@ -4,11 +4,13 @@ Top-Down Pose Estimation Module — ViTPose (V3.0)
 V3.0: ViTPose-Large for high-fidelity pose estimation (15° wrist/elbow accuracy).
 Extracts 17 COCO keypoints per detected person. Batched [N, 3, 256, 192], fp16 on MPS unless
 ``SWAY_VITPOSE_FP32=1``. Production ``main.py`` reapplies ViTPose env (§9.0.1) after params unless
-``SWAY_UNLOCK_POSE_TUNING=1``.
+``SWAY_UNLOCK_POSE_TUNING=1``. Verbose Phase 5 / ViTPose timing logs are **off by default**; set ``SWAY_VITPOSE_DEBUG=1`` to enable.
+(processor vs model vs post-process; hybrid SAM masked per-person forwards).
 """
 
 import os
-from typing import Dict, List, Optional, Tuple, Union
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -136,11 +138,39 @@ def vitpose_force_fp32() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def vitpose_use_fast_image_processor() -> bool:
+    """
+    Hugging Face may default to a "fast" ``VitPoseImageProcessor`` (different outputs / code path).
+    Default **False** (slow processor) for stability; stalls on MPS + newer torch/transformers have
+    been reported on the fast path. Opt in: ``SWAY_VITPOSE_USE_FAST=1``.
+    """
+    v = os.environ.get("SWAY_VITPOSE_USE_FAST", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return False
+
+
+def _load_vitpose_processor(model_name: str, *, local_files_only: bool):
+    use_fast = vitpose_use_fast_image_processor()
+    try:
+        return AutoProcessor.from_pretrained(
+            model_name, local_files_only=local_files_only, use_fast=use_fast
+        )
+    except TypeError:
+        return AutoProcessor.from_pretrained(model_name, local_files_only=local_files_only)
+
+
 def vitpose_max_per_forward() -> int:
     """
     When > 0, split a single-frame multi-person ViTPose forward into chunks of at most this many
     boxes (VRAM / stability for crowded frames). 0 = one forward for all boxes (default).
     Env: SWAY_VITPOSE_MAX_PER_FORWARD
+
+    Note: ``apply_master_locked_pose_env`` unsets this var so CUDA can batch all people in one
+    forward. On Apple MPS, an unset cap plus many boxes can hang or take extreme time on the first
+    forward; see ``vitpose_effective_max_per_forward``.
     """
     v = os.environ.get("SWAY_VITPOSE_MAX_PER_FORWARD", "").strip()
     if not v:
@@ -149,6 +179,58 @@ def vitpose_max_per_forward() -> int:
         return max(1, int(v))
     except ValueError:
         return 0
+
+
+def vitpose_effective_max_per_forward(device: Union[torch.device, str]) -> int:
+    """Chunk size for ViTPose forward: explicit env, else a safe default on MPS only."""
+    cap = vitpose_max_per_forward()
+    if cap > 0:
+        return cap
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type == "mps":
+        try:
+            # Default 2: smaller per-forward batches reduce peak MPS memory / long first-compile stalls.
+            raw = int(os.environ.get("SWAY_VITPOSE_MPS_CHUNK", "2").strip())
+        except ValueError:
+            raw = 2
+        return max(1, min(raw, 32))
+    return 0
+
+
+def _mps_synchronize_if_needed(device: torch.device) -> None:
+    """Optional sync after MPS forwards (timing / ordering). Set SWAY_VITPOSE_MPS_SYNC=0 to skip."""
+    if device.type != "mps" or not torch.backends.mps.is_available():
+        return
+    v = os.environ.get("SWAY_VITPOSE_MPS_SYNC", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return
+    torch.mps.synchronize()
+
+
+def vitpose_debug_enabled() -> bool:
+    """Verbose ViTPose timing / tensor logs (processor → model → post). Default off; ``SWAY_VITPOSE_DEBUG=1`` enables."""
+    v = os.environ.get("SWAY_VITPOSE_DEBUG", "").strip().lower()
+    if not v:
+        return False
+    if v in ("0", "false", "no", "off"):
+        return False
+    return v in ("1", "true", "yes", "on")
+
+
+def _vitpose_dbg(msg: str) -> None:
+    if vitpose_debug_enabled():
+        print(f"  [vitpose_dbg] {msg}", flush=True)
+
+
+def _summarize_model_inputs(model_kwargs: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for k in sorted(model_kwargs.keys()):
+        v = model_kwargs[k]
+        if torch.is_tensor(v):
+            parts.append(f"{k}={tuple(v.shape)}/{v.dtype}/{v.device.type}")
+        else:
+            parts.append(f"{k}={type(v).__name__}")
+    return "; ".join(parts) if parts else "(empty)"
 
 
 def _to_float32(obj):
@@ -248,10 +330,13 @@ class PoseEstimator:
         self.model_name = model_name
 
         local_only = _local_files_only()
-        if local_only:
-            self.processor = AutoProcessor.from_pretrained(
-                model_name, local_files_only=True
+        if not vitpose_use_fast_image_processor():
+            print(
+                "  ViTPose: slow image processor (default; set SWAY_VITPOSE_USE_FAST=1 for HF fast path).",
+                flush=True,
             )
+        if local_only:
+            self.processor = _load_vitpose_processor(model_name, local_files_only=True)
             self.model = VitPoseForPoseEstimation.from_pretrained(
                 model_name, local_files_only=True
             )
@@ -259,9 +344,7 @@ class PoseEstimator:
             # Prefer disk cache only first so repeat runs do not hit the Hub for metadata
             # or "is there an update?" checks when weights already live under HF_HOME.
             try:
-                self.processor = AutoProcessor.from_pretrained(
-                    model_name, local_files_only=True
-                )
+                self.processor = _load_vitpose_processor(model_name, local_files_only=True)
                 self.model = VitPoseForPoseEstimation.from_pretrained(
                     model_name, local_files_only=True
                 )
@@ -271,9 +354,7 @@ class PoseEstimator:
                     "downloading / resolving from the Hub (needs network)…",
                     flush=True,
                 )
-                self.processor = AutoProcessor.from_pretrained(
-                    model_name, local_files_only=False
-                )
+                self.processor = _load_vitpose_processor(model_name, local_files_only=False)
                 self.model = VitPoseForPoseEstimation.from_pretrained(
                     model_name, local_files_only=False
                 )
@@ -288,6 +369,21 @@ class PoseEstimator:
         if use_fp16:
             self.model = self.model.to(torch.float16)
 
+        self._vitpose_chunk = vitpose_effective_max_per_forward(self.device)
+        if self.device.type == "mps" and self._vitpose_chunk > 0 and not os.environ.get(
+            "SWAY_VITPOSE_MAX_PER_FORWARD", ""
+        ).strip():
+            print(
+                f"  ViTPose: MPS multi-person chunk size {self._vitpose_chunk} "
+                f"(set SWAY_VITPOSE_MAX_PER_FORWARD or SWAY_VITPOSE_MPS_CHUNK to override).",
+                flush=True,
+            )
+        if vitpose_debug_enabled():
+            _vitpose_dbg(
+                f"init model={model_name!r} device={self.device} fp16={self.use_fp16} "
+                f"chunk_cap={self._vitpose_chunk} torch={torch.__version__}"
+            )
+
     def _estimate_poses_batch(
         self,
         frame: np.ndarray,
@@ -299,11 +395,16 @@ class PoseEstimator:
         if len(boxes) == 0:
             return {}
         assert len(boxes) == len(track_ids) == len(paddings)
-        cap = vitpose_max_per_forward()
+        cap = self._vitpose_chunk
         if cap and len(boxes) > cap:
+            _vitpose_dbg(
+                f"batch_split total_boxes={len(boxes)} cap={cap} -> "
+                f"{(len(boxes) + cap - 1) // cap} sub-forwards"
+            )
             out: Dict[int, Dict] = {}
             for start in range(0, len(boxes), cap):
                 sl = slice(start, start + cap)
+                _vitpose_dbg(f"batch_split chunk start={start} end={start + len(boxes[sl])} tids={list(track_ids[sl])}")
                 out.update(
                     self._estimate_poses_batch(
                         frame, boxes[sl], track_ids[sl], paddings[sl]
@@ -311,37 +412,53 @@ class PoseEstimator:
                 )
             return out
         img_h, img_w = frame.shape[:2]
+        _vitpose_dbg(
+            f"fullframe_batch begin n={len(boxes)} tids={list(track_ids)} "
+            f"frame_hw=({img_h},{img_w})"
+        )
         boxes_expanded = [
             _expand_bbox(b, img_w, img_h, pad) for b, pad in zip(boxes, paddings)
         ]
         boxes_coco = [xyxy_to_coco(b) for b in boxes_expanded]
         image = Image.fromarray(frame) if isinstance(frame, np.ndarray) else frame
+        t0 = time.perf_counter()
         inputs = self.processor(
             image,
             boxes=[boxes_coco],
             return_tensors="pt",
         )
+        _vitpose_dbg(f"processor done in {(time.perf_counter() - t0) * 1000:.1f}ms (CPU tensors)")
+        t0 = time.perf_counter()
         inputs = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
         if self.use_fp16:
             inputs = {
                 k: v.half() if isinstance(v, torch.Tensor) and v.is_floating_point() else v
                 for k, v in inputs.items()
             }
+        _vitpose_dbg(f"inputs moved in {(time.perf_counter() - t0) * 1000:.1f}ms")
         batch_size = len(boxes)
         if "plus" in self.model_name.lower():
             dataset_index = torch.tensor([0] * batch_size, device=self.device, dtype=torch.long)
             model_kwargs = {**inputs, "dataset_index": dataset_index}
         else:
             model_kwargs = inputs
+        _vitpose_dbg(f"model forward start | {_summarize_model_inputs(model_kwargs)}")
+        t_fwd = time.perf_counter()
         with torch.no_grad():
             outputs = self.model(**model_kwargs)
+        _mps_synchronize_if_needed(self.device)
+        _vitpose_dbg(
+            f"model forward end in {(time.perf_counter() - t_fwd) * 1000:.1f}ms (incl. MPS sync if mps)"
+        )
         if self.use_fp16:
             outputs = _to_float32(outputs)
         boxes_coco_arr = np.array(boxes_coco, dtype=np.float32)
+        t_post = time.perf_counter()
         pose_results = self.processor.post_process_pose_estimation(
             outputs,
             boxes=[boxes_coco_arr],
         )
+        _vitpose_dbg(f"post_process_pose_estimation in {(time.perf_counter() - t_post) * 1000:.1f}ms")
         image_pose_result = pose_results[0]
         result: Dict[int, Dict] = {}
         for i, pose_dict in enumerate(image_pose_result):
@@ -355,6 +472,7 @@ class PoseEstimator:
             else:
                 full_kpts = kpts
             result[int(tid)] = {"keypoints": full_kpts, "scores": scores}
+        _vitpose_dbg(f"fullframe_batch done n_out={len(result)}")
         return result
 
     def estimate_poses(
@@ -396,8 +514,14 @@ class PoseEstimator:
 
         plain_idx = [i for i, m in enumerate(segmentation_masks) if m is None]
         masked_idx = [i for i, m in enumerate(segmentation_masks) if m is not None]
+        _vitpose_dbg(
+            f"estimate_poses hybrid_masks total={len(boxes)} plain_n={len(plain_idx)} "
+            f"masked_n={len(masked_idx)} plain_tids={[int(track_ids[i]) for i in plain_idx]} "
+            f"masked_tids={[int(track_ids[i]) for i in masked_idx]}"
+        )
         out: Dict[int, Dict] = {}
         if plain_idx:
+            _vitpose_dbg("estimate_poses -> fullframe batch for plain (no SAM mask) boxes")
             out.update(
                 self._estimate_poses_batch(
                     frame,
@@ -407,35 +531,51 @@ class PoseEstimator:
                 )
             )
 
-        for i in masked_idx:
+        for mi, i in enumerate(masked_idx):
             tid = int(track_ids[i])
             box = boxes[i]
             pad = paddings[i]
             m = segmentation_masks[i]
             if m is None or m.size == 0:
+                _vitpose_dbg(f"masked[{mi}] tid={tid} empty mask -> fullframe single")
                 sub = self._estimate_poses_batch(frame, [box], [tid], [pad])
                 out.update(sub)
                 continue
             crop, ox, oy = _apply_sam_mask_gate_to_expanded_crop(frame, box, pad, m)
             if crop.size == 0:
+                _vitpose_dbg(f"masked[{mi}] tid={tid} empty crop after gate -> skip")
                 continue
             h, w = crop.shape[:2]
+            _vitpose_dbg(
+                f"masked[{mi}/{len(masked_idx)}] tid={tid} crop_hw=({h},{w}) oxoy=({ox},{oy}) "
+                f"mask_hw={tuple(m.shape)}"
+            )
             pil = Image.fromarray(crop)
             boxes_coco = [xyxy_to_coco((0.0, 0.0, float(w), float(h)))]
+            t0 = time.perf_counter()
             inputs = self.processor(pil, boxes=[boxes_coco], return_tensors="pt")
+            _vitpose_dbg(f"masked tid={tid} processor {((time.perf_counter() - t0) * 1000):.1f}ms")
+            t0 = time.perf_counter()
             inputs = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
             if self.use_fp16:
                 inputs = {
                     k: v.half() if isinstance(v, torch.Tensor) and v.is_floating_point() else v
                     for k, v in inputs.items()
                 }
+            _vitpose_dbg(f"masked tid={tid} to_device {((time.perf_counter() - t0) * 1000):.1f}ms")
             if "plus" in self.model_name.lower():
                 dataset_index = torch.tensor([0], device=self.device, dtype=torch.long)
                 model_kwargs = {**inputs, "dataset_index": dataset_index}
             else:
                 model_kwargs = inputs
+            _vitpose_dbg(f"masked tid={tid} model forward | {_summarize_model_inputs(model_kwargs)}")
+            t_fwd = time.perf_counter()
             with torch.no_grad():
                 outputs = self.model(**model_kwargs)
+            _mps_synchronize_if_needed(self.device)
+            _vitpose_dbg(
+                f"masked tid={tid} forward done {((time.perf_counter() - t_fwd) * 1000):.1f}ms"
+            )
             if self.use_fp16:
                 outputs = _to_float32(outputs)
             boxes_coco_arr = np.array(boxes_coco, dtype=np.float32)

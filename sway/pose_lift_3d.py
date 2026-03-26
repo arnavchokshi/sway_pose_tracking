@@ -80,6 +80,25 @@ def unified_export_enabled() -> bool:
     return _env_flag("SWAY_UNIFIED_3D_EXPORT", True)
 
 
+def depth_for_root_z_enabled() -> bool:
+    """Use depth maps for pelvis Z (off by default: Depth Anything output is min-max per frame, not metric)."""
+    return _env_flag("SWAY_DEPTH_FOR_ROOT_Z", False)
+
+
+def _root_z_ema_alpha() -> float:
+    """EMA on root Z when SWAY_DEPTH_FOR_ROOT_Z=1; 0 disables (default)."""
+    try:
+        a = float(os.environ.get("SWAY_ROOT_Z_EMA_ALPHA", "0").strip())
+    except ValueError:
+        return 0.0
+    return float(np.clip(a, 0.0, 1.0))
+
+
+def pose_3d_include_lift_in_export() -> bool:
+    """Include per-frame lift_xyz in pose_3d JSON for viewer lift-local / debug mode."""
+    return _env_flag("SWAY_POSE_3D_INCLUDE_LIFT", True)
+
+
 def lift_gap_mode() -> str:
     v = os.environ.get("SWAY_LIFT_GAP_MODE", "hold_zero").strip().lower()
     return v if v in ("hold_zero", "linear_interp") else "hold_zero"
@@ -186,6 +205,44 @@ def depth_map_for_frame_t(
     return resize(series[-1][1])
 
 
+def _depth_root_roi_radius() -> int:
+    r = int(os.environ.get("SWAY_DEPTH_ROOT_ROI_RADIUS", "3"))
+    return max(0, min(r, 32))
+
+
+def _median_depth_at_hip(depth_map: np.ndarray, uh: float, vh: float) -> float:
+    """Median normalized depth over a small square ROI around mid-hip (reduces single-pixel noise)."""
+    h, w = depth_map.shape[:2]
+    px = int(np.clip(round(uh), 0, w - 1))
+    py = int(np.clip(round(vh), 0, h - 1))
+    rad = _depth_root_roi_radius()
+    if rad <= 0:
+        return float(depth_map[py, px])
+    y0 = max(0, py - rad)
+    y1 = min(h, py + rad + 1)
+    x0 = max(0, px - rad)
+    x1 = min(w, px + rad + 1)
+    patch = depth_map[y0:y1, x0:x1].astype(np.float64).ravel()
+    if patch.size == 0:
+        return float(depth_map[py, px])
+    return float(np.median(patch))
+
+
+def _resolve_z_root_from_depth(
+    depth_map: Optional[np.ndarray],
+    uh: float,
+    vh: float,
+    z_near: float,
+    z_far: float,
+) -> float:
+    """Pelvis depth: constant default unless SWAY_DEPTH_FOR_ROOT_Z=1 (see depth_stage min-max caveat)."""
+    default_z = float(os.environ.get("SWAY_DEFAULT_ROOT_Z", "2.5"))
+    if not depth_for_root_z_enabled() or depth_map is None:
+        return default_z
+    d_hip = _median_depth_at_hip(depth_map, uh, vh)
+    return normalized_depth_to_z_cam(d_hip, z_near, z_far)
+
+
 def _compute_unified_world_keypoints(
     kpts_2d: np.ndarray,
     lift: np.ndarray,
@@ -198,24 +255,23 @@ def _compute_unified_world_keypoints(
     depth_map: Optional[np.ndarray],
     img_w: int,
     img_h: int,
+    z_root: Optional[float] = None,
 ) -> Tuple[List[List[float]], List[float]]:
     """Pelvis anchor from mid-hip un-projection + scaled lift relative to hip in lift space.
 
     World convention: X right, Y up, Z positive into the scene (away from camera / depth).
+
+    If ``z_root`` is set (e.g. after per-track temporal smoothing), it overrides depth/default.
     """
     k2 = np.asarray(kpts_2d, dtype=np.float64)
     lift_a = np.asarray(lift, dtype=np.float64).reshape(17, 3)
     uh = (float(k2[11, 0]) + float(k2[12, 0])) * 0.5
     vh = (float(k2[11, 1]) + float(k2[12, 1])) * 0.5
 
-    if depth_map is not None:
-        h, w = depth_map.shape[:2]
-        px = int(np.clip(round(uh), 0, w - 1))
-        py = int(np.clip(round(vh), 0, h - 1))
-        d_hip = float(depth_map[py, px])
-        Z_root = normalized_depth_to_z_cam(d_hip, z_near, z_far)
+    if z_root is not None:
+        Z_root = float(z_root)
     else:
-        Z_root = float(os.environ.get("SWAY_DEFAULT_ROOT_Z", "2.5"))
+        Z_root = _resolve_z_root_from_depth(depth_map, uh, vh, z_near, z_far)
 
     scale_mul = float(os.environ.get("SWAY_LIFT_WORLD_SCALE", "1.0"))
     Xr = (uh - cx) * Z_root / max(fx, 1e-6)
@@ -1017,6 +1073,9 @@ def lift_poses_to_3d(
 
     print(f"  [3D Lift] Lifting {len(all_tids)} tracks to 3D ({backend_name})…")
 
+    root_z_ema: Dict[int, float] = {}
+    z_ema_alpha = _root_z_ema_alpha()
+
     for tid in sorted(all_tids):
         seq = _build_keypoint_sequence_3ch(
             all_frame_data, tid, total_frames, frame_width, frame_height
@@ -1047,6 +1106,15 @@ def lift_poses_to_3d(
             pose["lift_xyz"] = lift.copy()
             if unified:
                 dmap = depth_map_for_frame_t(depth_series, fidx, frame_height, frame_width)
+                uh = (float(kpts_2d[11, 0]) + float(kpts_2d[12, 0])) * 0.5
+                vh = (float(kpts_2d[11, 1]) + float(kpts_2d[12, 1])) * 0.5
+                raw_z = _resolve_z_root_from_depth(dmap, uh, vh, z_near, z_far)
+                z_eff = raw_z
+                if depth_for_root_z_enabled() and z_ema_alpha > 0.0:
+                    prev = root_z_ema.get(tid)
+                    if prev is not None:
+                        z_eff = z_ema_alpha * raw_z + (1.0 - z_ema_alpha) * prev
+                    root_z_ema[tid] = z_eff
                 k3, root = _compute_unified_world_keypoints(
                     kpts_2d,
                     lift,
@@ -1059,6 +1127,7 @@ def lift_poses_to_3d(
                     dmap,
                     frame_width,
                     frame_height,
+                    z_root=z_eff,
                 )
                 pose["keypoints_3d"] = k3
                 pose["root_xyz"] = root
@@ -1183,16 +1252,27 @@ def refresh_keypoints_3d_from_lift(
         fx, fy, cx, cy, _fov = pinhole_intrinsics(frame_width, frame_height)
     z_near, z_far = depth_z_range()
     unified = unified_export_enabled()
+    root_z_ema: Dict[int, float] = {}
+    z_ema_alpha = _root_z_ema_alpha()
     for fd in all_frame_data:
         fidx = int(fd["frame_idx"])
         dmap = depth_map_for_frame_t(depth_series, fidx, frame_height, frame_width) if depth_series else None
-        for _tid, pose in fd.get("poses", {}).items():
+        for tid, pose in fd.get("poses", {}).items():
             lift = pose.get("lift_xyz")
             if lift is None:
                 continue
             kpts_2d = np.asarray(pose.get("keypoints"), dtype=np.float64)
             lift_a = np.asarray(lift, dtype=np.float64)
             if unified:
+                uh = (float(kpts_2d[11, 0]) + float(kpts_2d[12, 0])) * 0.5
+                vh = (float(kpts_2d[11, 1]) + float(kpts_2d[12, 1])) * 0.5
+                raw_z = _resolve_z_root_from_depth(dmap, uh, vh, z_near, z_far)
+                z_eff = raw_z
+                if depth_for_root_z_enabled() and z_ema_alpha > 0.0:
+                    prev = root_z_ema.get(tid)
+                    if prev is not None:
+                        z_eff = z_ema_alpha * raw_z + (1.0 - z_ema_alpha) * prev
+                    root_z_ema[tid] = z_eff
                 k3, root = _compute_unified_world_keypoints(
                     kpts_2d,
                     lift_a,
@@ -1205,6 +1285,7 @@ def refresh_keypoints_3d_from_lift(
                     dmap,
                     frame_width,
                     frame_height,
+                    z_root=z_eff,
                 )
                 pose["keypoints_3d"] = k3
                 pose["root_xyz"] = root
@@ -1227,11 +1308,14 @@ def export_3d_for_viewer(
     video_camera: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Compact pose_3d blob for Three.js (metadata.pose_3d in data.json)."""
+    include_lift = pose_3d_include_lift_in_export()
     tracks_out: Dict[str, Any] = {}
+    any_lift = False
     for tid in track_ids:
         frames_list: List[int] = []
         kpts_list: List[Any] = []
         roots_list: List[Any] = []
+        lift_list: List[Any] = []
         for fd in all_frame_data:
             pose = fd.get("poses", {}).get(tid)
             if pose is None:
@@ -1245,10 +1329,19 @@ def export_3d_for_viewer(
             frames_list.append(int(fd["frame_idx"]))
             kpts_list.append(kpts_3d)
             roots_list.append(pose.get("root_xyz"))
+            if include_lift:
+                lx = pose.get("lift_xyz")
+                if lx is not None:
+                    any_lift = True
+                    lift_list.append(lx.tolist() if hasattr(lx, "tolist") else lx)
+                else:
+                    lift_list.append(None)
         if frames_list:
             entry: Dict[str, Any] = {"frames": frames_list, "keypoints_3d": kpts_list}
             if unified_export_enabled() and any(r is not None for r in roots_list):
                 entry["root_xyz"] = roots_list
+            if include_lift and any(l is not None for l in lift_list):
+                entry["lift_xyz"] = lift_list
             tracks_out[str(tid)] = entry
 
     out: Dict[str, Any] = {
@@ -1258,6 +1351,8 @@ def export_3d_for_viewer(
         "bones": [[a, b] for a, b in COCO_BONES],
         "tracks": tracks_out,
     }
+    if include_lift and any_lift:
+        out["include_lift_xyz"] = True
     has_world = any(
         fd.get("poses", {}).get(tid, {}).get("root_xyz") is not None
         for tid in track_ids

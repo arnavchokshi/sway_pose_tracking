@@ -4,18 +4,12 @@ import type { Schema, SchemaField } from '../types'
 import { API } from '../types'
 import {
   applyLabHiddenSchemaDefaults,
-  applyLabRecipe,
+  applyPhaseGroupPresets,
   defaultsFromSchema,
   migrateLegacyPipelineFields,
   phase13StrategyFromFields,
-  PHASE13_STRATEGY_BLURBS,
-  PHASE13_STRATEGY_LABELS,
-  PHASE13_STRATEGY_ORDER,
-  QUALITY_TIER_BLURBS,
-  QUALITY_TIER_LABELS,
-  QUALITY_TIER_ORDER,
-  type Phase13StrategyId,
-  type QualityTierId,
+  DEFAULT_PRESET_IDS,
+  type PhaseGroupId,
 } from '../configPresets'
 import { hideHybridSamPhase, isHybridSamOverlapField } from '../lib/labFieldVisibility'
 import {
@@ -28,20 +22,8 @@ import { fieldBelongsToConfigStage } from '../lib/configPageUi'
 import { buildPipelineFlowchartRows, flowchartRowIsDone } from '../lib/flowchartRows'
 import { InlineFieldInput } from './InlineFieldInput'
 import { ConfigFieldWrap } from './ConfigFieldWrap'
-import { Phase13EffectivePanel } from './Phase13EffectivePanel'
-import { Handshake, Layers, Users, X, Zap, Scale, Trophy } from 'lucide-react'
-
-const QUALITY_ICONS: Record<QualityTierId, typeof Zap> = {
-  fast_preview: Zap,
-  standard: Scale,
-  maximum_accuracy: Trophy,
-}
-
-const PHASE13_ICONS: Record<Phase13StrategyId, typeof Layers> = {
-  standard: Layers,
-  dancer_registry: Users,
-  sway_handshake: Handshake,
-}
+import { PresetGroupSelector } from './PresetGroupSelector'
+import { X } from 'lucide-react'
 
 function fieldShell(f: SchemaField, inner: ReactNode) {
   return <ConfigFieldWrap field={f}>{inner}</ConfigFieldWrap>
@@ -51,19 +33,22 @@ export function RunEditorModal({
   open,
   schema,
   draft,
+  schemaPhaseAllowlist,
   onClose,
   onSave,
 }: {
   open: boolean
   schema: Schema
   draft: DraftRun | null
+  schemaPhaseAllowlist?: ReadonlySet<string> | null
   onClose: () => void
   onSave: (recipeName: string, fields: Record<string, unknown>) => void
 }) {
   const [recipeName, setRecipeName] = useState('')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
-  const [qualityTier, setQualityTier] = useState<QualityTierId>('standard')
-  const [recipeCustom, setRecipeCustom] = useState(true)
+  const [selectedPresets, setSelectedPresets] = useState<Record<PhaseGroupId, string>>({
+    ...DEFAULT_PRESET_IDS,
+  })
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
   const [modelsStatus, setModelsStatus] = useState<Record<string, boolean> | null>(null)
 
@@ -93,8 +78,7 @@ export function RunEditorModal({
     )
     setFieldsState(merged)
     setActivePhaseIndex(0)
-    setQualityTier('standard')
-    setRecipeCustom(true)
+    setSelectedPresets({ ...DEFAULT_PRESET_IDS })
   }, [open, draft?.clientId, draft?.recipeName, draft?.fields, schema.fields])
 
   const hybridHidden = hideHybridSamPhase(fieldsState.tracker_technology, fieldsState.sway_phase13_mode)
@@ -103,12 +87,13 @@ export function RunEditorModal({
 
   const visible = useMemo(
     () => (f: SchemaField) => {
+      if (schemaPhaseAllowlist && !schemaPhaseAllowlist.has(f.phase)) return false
       if (f.type === 'info') return false
       if (hybridHidden && isHybridSamOverlapField(f.id)) return false
       if (hideFieldForPhase13Strategy(f.id, activePhase13)) return false
       return isSchemaFieldVisible(f, fieldsState)
     },
-    [fieldsState, hybridHidden, activePhase13],
+    [fieldsState, hybridHidden, activePhase13, schemaPhaseAllowlist],
   )
 
   const tier1Fields = useMemo(() => {
@@ -120,18 +105,20 @@ export function RunEditorModal({
 
   const flowchartRows = useMemo(() => buildPipelineFlowchartRows(schema.stages), [schema.stages])
 
-  const applyQualityTier = (id: QualityTierId) => {
-    setFieldsState(applyLabRecipe(schema, id, phase13StrategyFromFields(fieldsState)))
-    setQualityTier(id)
-    setRecipeCustom(false)
-  }
-
-  const applyPhase13 = (id: Phase13StrategyId) => {
-    setFieldsState(applyLabRecipe(schema, qualityTier, id))
-    setRecipeCustom(false)
+  const handlePresetSelect = (groupId: PhaseGroupId, presetId: string) => {
+    const next = { ...selectedPresets, [groupId]: presetId }
+    setSelectedPresets(next)
+    setFieldsState(
+      applyPhaseGroupPresets(schema, next.phases_1_3, next.phases_4_6, next.phases_7_9, next.phases_10_11),
+    )
   }
 
   if (!open || !draft) return null
+
+  const hideRecipeBaselineStrip =
+    schemaPhaseAllowlist != null &&
+    schemaPhaseAllowlist.size === 1 &&
+    schemaPhaseAllowlist.has('detection')
 
   const stages = schema.stages
   const activeStage = stages[activePhaseIndex]
@@ -166,7 +153,6 @@ export function RunEditorModal({
       f={f}
       value={fieldsState[f.id]}
       onChange={(v) => {
-        setRecipeCustom(true)
         setFieldsState((prev) => ({ ...prev, [f.id]: v }))
       }}
       modelsStatus={modelsStatus}
@@ -237,93 +223,30 @@ export function RunEditorModal({
 
         <div style={{ padding: '1rem 1.25rem', overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-            Big choices up top; open <strong style={{ color: '#e2e8f0' }}>Tune</strong> on each step for sliders.{' '}
+            Pick presets per phase group, then open <strong style={{ color: '#e2e8f0' }}>Tune</strong> on each step for sliders.{' '}
             File paths and expert overrides sit under <strong style={{ color: '#e2e8f0' }}>Advanced</strong>.
+            {schemaPhaseAllowlist && (
+              <span>
+                {' '}
+                <strong style={{ color: '#7dd3fc' }}>Segment editor:</strong> only parameters for this checkpoint stage are
+                shown; other phases keep schema defaults until a later tree node changes them.
+              </span>
+            )}
           </div>
 
-          <div>
+          <div style={hideRecipeBaselineStrip ? { display: 'none' } : undefined}>
             <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>
-              Recipe baseline
+              Pipeline presets
             </div>
             <p style={{ margin: '0 0 0.65rem', fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-              Pick speed/quality and Phases 1–3 strategy separately; they combine. The panel below lists the exact early-pipeline
-              behavior for your strategy. Editing a field clears speed/quality highlights only.
+              Pick one preset per phase group. They combine independently — any combination is valid. Manual field edits
+              clear preset highlights.
             </p>
-            <div style={{ fontSize: '0.68rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: '0.4rem' }}>
-              Speed &amp; quality
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))', gap: '0.65rem', marginBottom: '0.85rem' }}>
-              {QUALITY_TIER_ORDER.map((pid) => {
-                const Icon = QUALITY_ICONS[pid]
-                const selected = !recipeCustom && qualityTier === pid
-                return (
-                  <button
-                    key={pid}
-                    type="button"
-                    className="btn"
-                    title={QUALITY_TIER_BLURBS[pid]}
-                    onClick={() => applyQualityTier(pid)}
-                    style={{
-                      textAlign: 'left',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'flex-start',
-                      gap: '0.35rem',
-                      padding: '0.85rem 1rem',
-                      borderRadius: 12,
-                      border: selected ? '1px solid rgba(255,255,255,0.55)' : '1px solid var(--glass-border)',
-                      background: selected ? 'rgba(255,255,255,0.1)' : 'rgba(15, 23, 42, 0.65)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-                      <Icon size={18} style={{ color: 'var(--halo-cyan)' }} />
-                      <span style={{ fontWeight: 700, color: '#f8fafc' }}>{QUALITY_TIER_LABELS[pid]}</span>
-                    </div>
-                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>{QUALITY_TIER_BLURBS[pid]}</span>
-                  </button>
-                )
-              })}
-            </div>
-            <div style={{ fontSize: '0.68rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: '0.4rem' }}>
-              Phases 1–3 strategy
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))', gap: '0.65rem' }}>
-              {PHASE13_STRATEGY_ORDER.map((pid) => {
-                const Icon = PHASE13_ICONS[pid]
-                const selected = activePhase13 === pid
-                return (
-                  <button
-                    key={pid}
-                    type="button"
-                    className="btn"
-                    title={PHASE13_STRATEGY_BLURBS[pid]}
-                    onClick={() => applyPhase13(pid)}
-                    style={{
-                      textAlign: 'left',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'flex-start',
-                      gap: '0.35rem',
-                      padding: '0.85rem 1rem',
-                      borderRadius: 12,
-                      border: selected ? '1px solid rgba(255,255,255,0.55)' : '1px solid var(--glass-border)',
-                      background: selected ? 'rgba(255,255,255,0.1)' : 'rgba(15, 23, 42, 0.65)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-                      <Icon size={18} style={{ color: 'var(--halo-cyan)' }} />
-                      <span style={{ fontWeight: 700, color: '#f8fafc' }}>{PHASE13_STRATEGY_LABELS[pid]}</span>
-                    </div>
-                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
-                      {PHASE13_STRATEGY_BLURBS[pid]}
-                    </span>
-                  </button>
-                )
-              })}
-            </div>
-            <div style={{ marginTop: '0.85rem' }}>
-              <Phase13EffectivePanel strategy={activePhase13} fieldsState={fieldsState} />
-            </div>
+            <PresetGroupSelector
+              selectedPresets={selectedPresets}
+              onSelect={handlePresetSelect}
+              compact
+            />
           </div>
 
           <div>
@@ -331,8 +254,17 @@ export function RunEditorModal({
               Main choices
             </div>
             <p style={{ margin: '0 0 0.55rem', fontSize: '0.7rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-              Phases 1–3 strategy is set only by the cards above (not repeated here). Remaining knobs are shared across strategies
-              except hybrid overlap sliders, which are hidden for Sway handshake because the server fixes them.
+              {hideRecipeBaselineStrip ? (
+                <>
+                  Detection-only segment: preset cards are hidden. Tracking / pose knobs apply on later tree nodes after this
+                  run writes the Phase-1 checkpoint.
+                </>
+              ) : (
+                <>
+                  These controls are the most impactful across strategies. Preset selections above set these values;
+                  you can override them here.
+                </>
+              )}
             </p>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))', gap: '0.85rem' }}>
               {tier1Fields.map((f) => fieldShell(f, renderFieldInput(f)))}
@@ -343,7 +275,6 @@ export function RunEditorModal({
                       f={temporalRefineField}
                       value={fieldsState.temporal_pose_refine}
                       onChange={(v) => {
-                        setRecipeCustom(true)
                         setFieldsState((p) => ({ ...p, temporal_pose_refine: v }))
                       }}
                       allFields={fieldsState}
@@ -366,8 +297,8 @@ export function RunEditorModal({
                       lineHeight: 1.45,
                     }}
                   >
-                    Large / huge skeleton models handle wild angles and speed better—closer to what pro sports research
-                    uses—but need more time and GPU memory.
+                    Large / huge skeleton models handle wild angles and speed better — closer to what pro sports research
+                    uses — but need more time and GPU memory.
                   </div>
                 )}
               {poseModelField &&
@@ -386,7 +317,7 @@ export function RunEditorModal({
                     }}
                   >
                     RTMPose-L runs through MMPose (not bundled). Install mmengine, mmcv, and mmpose locally, then compare
-                    speed vs ViTPose-Base on the same clip. See docs/PIPELINE_IMPROVEMENTS_ROADMAP.md.
+                    speed vs ViTPose-Base on the same clip.
                   </div>
                 )}
               {poseModelField &&
@@ -405,10 +336,8 @@ export function RunEditorModal({
                     }}
                   >
                     Set <strong style={{ color: '#f5f3ff' }}>SWAY_SAPIENS_TORCHSCRIPT</strong> on the API host to a COCO-17
-                    Sapiens lite <code style={{ color: '#e9d5ff' }}>.pt2</code> (e.g. from Hugging Face{' '}
-                    <code style={{ color: '#e9d5ff' }}>noahcao/sapiens-pose-coco</code>) for native Meta Sapiens inference.
-                    If unset or the file is missing, the pipeline uses <strong style={{ color: '#f5f3ff' }}>ViTPose-Base</strong>{' '}
-                    with the same COCO-17 output shape.
+                    Sapiens lite <code style={{ color: '#e9d5ff' }}>.pt2</code> for native Meta Sapiens inference.
+                    If unset, the pipeline uses <strong style={{ color: '#f5f3ff' }}>ViTPose-Base</strong>.
                   </div>
                 )}
             </div>
@@ -482,7 +411,7 @@ export function RunEditorModal({
                 }}
               >
                 Overlap sharpening only runs with the <strong style={{ color: '#e2e8f0' }}>built-in tracker</strong>.{' '}
-                Switch back from the alternate engine to change those options; tracking sliders below still apply.
+                Switch back from ByteTrack to see those options; tracking sliders below still apply.
               </div>
             )}
             {activeStage?.id === 'handshake' && activePhase13 === 'sway_handshake' && !hybridHidden && (
@@ -499,14 +428,13 @@ export function RunEditorModal({
                 }}
               >
                 <strong style={{ color: '#e2e8f0' }}>Sway handshake</strong> fixes hybrid SAM IoU at <strong style={{ color: '#e2e8f0' }}>0.10</strong> and turns{' '}
-                <strong style={{ color: '#e2e8f0' }}>weak cues off</strong> at enqueue — overlap sliders are hidden so the UI matches
-                the subprocess. Open-floor registry + SAM verify still run; see <strong style={{ color: '#e2e8f0' }}>Effective Phases 1–3</strong> above.
+                <strong style={{ color: '#e2e8f0' }}>weak cues off</strong> at enqueue — overlap sliders are hidden.
               </div>
             )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                 <details open style={{ borderRadius: 12, border: '1px solid var(--glass-border)', padding: '0.65rem 0.85rem', background: 'rgba(0,0,0,0.15)' }}>
                   <summary style={{ cursor: 'pointer', fontWeight: 600, color: '#e2e8f0', listStyle: 'none' }}>
-                    ⚙ Sliders · {activeStage?.short ?? 'phase'}
+                    Sliders · {activeStage?.short ?? 'phase'}
                   </summary>
                   <div style={{ marginTop: '0.85rem', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))', gap: '0.85rem' }}>
                     {tuneFieldsForStage(activeStage?.id ?? '').map((f) => fieldShell(f, renderFieldInput(f)))}
@@ -521,7 +449,7 @@ export function RunEditorModal({
                         }}
                       >
                         <summary style={{ cursor: 'pointer', fontWeight: 600, color: '#cbd5e1', fontSize: '0.88rem' }}>
-                          How strongly each “looks fake” rule counts
+                          How strongly each "looks fake" rule counts
                         </summary>
                         <div
                           style={{
@@ -538,7 +466,7 @@ export function RunEditorModal({
                     {tuneFieldsForStage(activeStage?.id ?? '').length === 0 &&
                       !(activeStage?.id === 'cleanup_export' && pruningWeightFields.length > 0) && (
                         <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                          Nothing to slide on this step—defaults are fine unless you open Expert below.
+                          Nothing to slide on this step — defaults are fine unless you open Expert below.
                         </div>
                       )}
                   </div>

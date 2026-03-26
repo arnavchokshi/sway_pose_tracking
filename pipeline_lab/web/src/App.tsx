@@ -6,6 +6,7 @@ import { ConfigPage } from './pages/ConfigPage'
 import { ComparePage } from './pages/ComparePage'
 import { WatchPage } from './pages/WatchPage'
 import { LiveSandboxPage } from './pages/LiveSandboxPage'
+import { SwayScoringPage } from './pages/SwayScoringPage'
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
               <Route path="/compare" element={<ComparePage />} />
               <Route path="/watch/:id/live" element={<LiveSandboxPage />} />
               <Route path="/watch/:id" element={<WatchPage />} />
+              <Route path="/scoring" element={<SwayScoringPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

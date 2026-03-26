@@ -204,8 +204,9 @@ def test_qa_3_2_probe_missing_exif_returns_none(tmp_path, monkeypatch) -> None:
     assert probe_intrinsics_from_video(str(p), 1920, 1080) is None
 
 
-def test_qa_3_3_depth_maps_world_z_ordering() -> None:
-    """3.3: Larger normalized depth at hips → larger world Z (farther into stage)."""
+def test_qa_3_3_depth_maps_world_z_ordering(monkeypatch) -> None:
+    """3.3: With SWAY_DEPTH_FOR_ROOT_Z=1, larger normalized depth at hips → larger world Z."""
+    monkeypatch.setenv("SWAY_DEPTH_FOR_ROOT_Z", "1")
     k2 = np.zeros((17, 2), dtype=np.float64)
     k2[:, 0] = 640.0
     k2[:, 1] = 360.0
@@ -231,6 +232,25 @@ def test_qa_3_3_depth_maps_world_z_ordering() -> None:
     assert root_b[2] > root_a[2]
     # Same lift relative shape: every world Z should scale with root depth
     assert float(w3_b[0][2] - w3_a[0][2]) == pytest.approx(root_b[2] - root_a[2], rel=0, abs=1e-4)
+
+
+def test_default_root_z_ignores_depth_map(monkeypatch) -> None:
+    """Without SWAY_DEPTH_FOR_ROOT_Z, depth maps do not move pelvis Z (stable export)."""
+    monkeypatch.delenv("SWAY_DEPTH_FOR_ROOT_Z", raising=False)
+    monkeypatch.setenv("SWAY_DEFAULT_ROOT_Z", "3.0")
+    k2 = np.zeros((17, 2), dtype=np.float64)
+    k2[:, 0] = 640.0
+    k2[:, 1] = 360.0
+    lift = np.zeros((17, 3), dtype=np.float64)
+    lift[:, 0] = 0.1
+    lift[:, 1] = 0.5
+    dm = np.full((720, 1280), 0.99, dtype=np.float32)
+    w3, root = pl3._compute_unified_world_keypoints(
+        k2, lift, 800.0, 800.0, 640.0, 360.0, 1.0, 8.0, dm, 1280, 720
+    )
+    assert root[2] == pytest.approx(3.0, abs=1e-5)
+    # If depth drove Z, root Z would be ~7.9 for d_norm=0.99, z_near=1, z_far=8
+    assert root[2] < 5.0
 
 
 def test_qa_3_4_savgol_reduces_z_jitter_preserves_slow_trend(monkeypatch) -> None:

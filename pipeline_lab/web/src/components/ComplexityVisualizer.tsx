@@ -32,10 +32,13 @@ function calculateComplexityMetrics(fields: Record<string, unknown>): Metrics {
   // tracker
   const track = String(fields.tracker_technology || '')
   if (track === 'deep_ocsort_osnet' || track === 'StrongSORT') score += 2
+  else if (track === 'bytetrack') score += 0
   else if (track === 'BoxMOT' || track === 'deep_ocsort') score += 1
 
-  // Master stack: hybrid SAM overlap always on in production
-  score += 3
+  // Hybrid SAM overlap refiner (master stack; off when ByteTrack fast path disables it)
+  if (track !== 'bytetrack') {
+    score += 3
+  }
 
   const yoloStride = Number(fields.sway_yolo_detection_stride) || 1
   if (yoloStride > 1) score += 1

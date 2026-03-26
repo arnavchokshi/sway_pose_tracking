@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
 import { API } from '../types'
 import type { Schema } from '../types'
@@ -20,6 +20,8 @@ type RunDetail = {
   run_id: string
   recipe_name?: string
   status?: string
+  /** Input clip stem from Lab request (same field as batch list). */
+  video_stem?: string
   manifest?: {
     final_video_relpath?: string
     view_variants?: Record<string, string>
@@ -36,9 +38,15 @@ type Slot = {
   label: string
   src: string | null
   error: string | null
+  video_stem: string
   fields?: Record<string, unknown>
   trackSummary?: Record<string, unknown>
   pipelineDiagnostics?: Record<string, unknown>
+}
+
+function slotVideoStemKey(s: Slot): string {
+  const t = (s.video_stem || '').trim()
+  return t || '__none__'
 }
 
 /** Rows that differ: show tracker / Re-ID / detector / pose first so the table reads like a model comparison. */
@@ -270,6 +278,215 @@ function useSyncedVideos(visibleRunOrder: string[], masterRunId: string | null) 
   }
 }
 
+/** One directed edge: winner ranks above loser (best → worst list). */
+type WinEdge = { w: string; l: string }
+
+type TinderGraphState = {
+  pool: string[]
+  edges: WinEdge[]
+  left: string
+  right: string
+  endedEarly: boolean
+}
+
+function buildWinAdj(edges: WinEdge[]): Map<string, Set<string>> {
+  const adj = new Map<string, Set<string>>()
+  for (const { w, l } of edges) {
+    if (!adj.has(w)) adj.set(w, new Set())
+    adj.get(w)!.add(l)
+  }
+  return adj
+}
+
+function canReachWinnerToLoser(a: string, b: string, adj: Map<string, Set<string>>): boolean {
+  if (a === b) return true
+  const seen = new Set<string>()
+  const stack = [a]
+  while (stack.length) {
+    const u = stack.pop()!
+    if (u === b) return true
+    if (seen.has(u)) continue
+    seen.add(u)
+    for (const v of adj.get(u) ?? []) stack.push(v)
+  }
+  return false
+}
+
+function knownComparable(a: string, b: string, edges: WinEdge[]): boolean {
+  const adj = buildWinAdj(edges)
+  return canReachWinnerToLoser(a, b, adj) || canReachWinnerToLoser(b, a, adj)
+}
+
+function pickNextIncomparablePair(pool: string[], edges: WinEdge[]): [string, string] | null {
+  for (let i = 0; i < pool.length; i++) {
+    for (let j = i + 1; j < pool.length; j++) {
+      const a = pool[i]
+      const b = pool[j]
+      if (!knownComparable(a, b, edges)) return [a, b]
+    }
+  }
+  return null
+}
+
+function countAmbiguousPairs(pool: string[], edges: WinEdge[]): number {
+  let n = 0
+  for (let i = 0; i < pool.length; i++) {
+    for (let j = i + 1; j < pool.length; j++) {
+      if (!knownComparable(pool[i], pool[j], edges)) n++
+    }
+  }
+  return n
+}
+
+function directWinLoss(pool: string[], edges: WinEdge[]) {
+  const wins = new Map<string, number>()
+  const loss = new Map<string, number>()
+  for (const id of pool) {
+    wins.set(id, 0)
+    loss.set(id, 0)
+  }
+  for (const { w, l } of edges) {
+    wins.set(w, (wins.get(w) ?? 0) + 1)
+    loss.set(l, (loss.get(l) ?? 0) + 1)
+  }
+  return { wins, loss }
+}
+
+/**
+ * Best → worst order from edges: Kahn topological peel; on cycles, break by (wins−losses) then pool order.
+ */
+function rankPoolFromEdges(pool: string[], edges: WinEdge[]): { order: string[]; approximated: boolean } {
+  const idx = new Map(pool.map((id, i) => [id, i]))
+  const { wins, loss } = directWinLoss(pool, edges)
+  const score = (id: string) => (wins.get(id) ?? 0) - (loss.get(id) ?? 0)
+  const tieBreak = (a: string, b: string) => {
+    const d = score(b) - score(a)
+    if (d !== 0) return d
+    return (idx.get(a) ?? 0) - (idx.get(b) ?? 0)
+  }
+
+  const order: string[] = []
+  let workPool = [...pool]
+  let workEdges = [...edges]
+  let approximated = false
+
+  while (workPool.length > 0) {
+    const inDeg = new Map<string, number>()
+    for (const id of workPool) inDeg.set(id, 0)
+    for (const { w, l } of workEdges) {
+      if (workPool.includes(w) && workPool.includes(l)) {
+        inDeg.set(l, (inDeg.get(l) ?? 0) + 1)
+      }
+    }
+    let zeros = workPool.filter((id) => (inDeg.get(id) ?? 0) === 0)
+    if (zeros.length === 0) {
+      approximated = true
+      zeros = [...workPool]
+    }
+    zeros.sort(tieBreak)
+    const pick = zeros[0]
+    order.push(pick)
+    workPool = workPool.filter((x) => x !== pick)
+    workEdges = workEdges.filter((e) => e.w !== pick && e.l !== pick)
+  }
+
+  return { order, approximated }
+}
+
+function initTinderGraph(ids: string[]): TinderGraphState {
+  if (ids.length < 2) {
+    return { pool: [...ids], edges: [], left: '', right: '', endedEarly: true }
+  }
+  const pool = [...ids]
+  const first = pickNextIncomparablePair(pool, [])
+  if (!first) {
+    return { pool, edges: [], left: '', right: '', endedEarly: true }
+  }
+  return { pool, edges: [], left: first[0], right: first[1], endedEarly: false }
+}
+
+type TinderGraphAction =
+  | { type: 'reset'; ids: string[] }
+  | { type: 'pick'; side: 'left' | 'right' }
+  | { type: 'finish' }
+  | { type: 'resume' }
+
+function tinderGraphReducer(state: TinderGraphState, action: TinderGraphAction): TinderGraphState {
+  if (action.type === 'reset') {
+    return initTinderGraph(action.ids)
+  }
+  if (action.type === 'finish') {
+    return { ...state, endedEarly: true, left: '', right: '' }
+  }
+  if (action.type === 'resume') {
+    if (state.pool.length < 2) return { ...state, endedEarly: true, left: '', right: '' }
+    const next = pickNextIncomparablePair(state.pool, state.edges)
+    return {
+      ...state,
+      endedEarly: false,
+      left: next?.[0] ?? '',
+      right: next?.[1] ?? '',
+    }
+  }
+  if (action.type !== 'pick' || state.endedEarly) return state
+  if (!state.left || !state.right) return state
+
+  const w = action.side === 'left' ? state.left : state.right
+  const l = action.side === 'left' ? state.right : state.left
+  const edges = [...state.edges, { w, l }]
+
+  const nextPair = pickNextIncomparablePair(state.pool, edges)
+  if (!nextPair) {
+    return { ...state, edges, left: '', right: '', endedEarly: false }
+  }
+  return { ...state, edges, left: nextPair[0], right: nextPair[1] }
+}
+
+function tinderPoolSetKey(ids: string[]): string {
+  if (ids.length === 0) return ''
+  return [...ids].sort().join('\0')
+}
+
+function useTinderPairwiseRank(orderedRunIds: string[]) {
+  const idsFingerprint = orderedRunIds.join('\x1e')
+  const poolKey = useMemo(() => tinderPoolSetKey(orderedRunIds), [idsFingerprint])
+  const [state, dispatch] = useReducer(tinderGraphReducer, orderedRunIds, initTinderGraph)
+
+  useEffect(() => {
+    dispatch({ type: 'reset', ids: orderedRunIds })
+  }, [poolKey])
+
+  const pairForSync = useMemo((): [string, string] | null => {
+    if (state.pool.length < 2 || state.endedEarly) return null
+    if (!state.left || !state.right) return null
+    return [state.left, state.right]
+  }, [state.pool.length, state.endedEarly, state.left, state.right])
+
+  const ambiguousPairs = useMemo(() => countAmbiguousPairs(state.pool, state.edges), [state.pool, state.edges])
+
+  const inferredRanking = useMemo(
+    () => rankPoolFromEdges(state.pool, state.edges),
+    [state.pool, state.edges],
+  )
+
+  const totalRuns = orderedRunIds.length
+  const comparisonsDone = state.edges.length
+  const noActivePair = !state.left || !state.right
+  /** Every pair is ordered by your picks or transitive inference; no more comparisons needed. */
+  const naturallyComplete = !state.endedEarly && noActivePair && state.pool.length >= 2 && ambiguousPairs === 0
+
+  return {
+    state,
+    dispatch,
+    pairForSync,
+    totalRuns,
+    ambiguousPairs,
+    inferredRanking,
+    comparisonsDone,
+    naturallyComplete,
+  }
+}
+
 export function ComparePage() {
   const [search] = useSearchParams()
   const raw = search.get('runs') || ''
@@ -344,11 +561,13 @@ export function ComparePage() {
             const fieldsFromConfig = cfg?.fields && typeof cfg.fields === 'object' ? cfg.fields : undefined
             const fields =
               fieldsFromConfig ?? (data.manifest?.run_context_final?.fields as Record<string, unknown> | undefined)
+            const stem = typeof data.video_stem === 'string' ? data.video_stem : ''
             return {
               run_id: id,
               label: data.recipe_name || id.slice(0, 8),
               src,
               error,
+              video_stem: stem,
               fields,
               trackSummary: data.manifest?.run_context_final?.track_summary,
               pipelineDiagnostics: data.manifest?.run_context_final?.pipeline_diagnostics,
@@ -359,6 +578,7 @@ export function ComparePage() {
             label: id.slice(0, 8),
             src: null,
             error: 'Could not load run.',
+            video_stem: '',
           })),
       ),
     ).then((rows) => {
@@ -438,16 +658,83 @@ export function ComparePage() {
   }, [assetCheckPending, eligibleRunIdsList, slots.length])
 
   const [configSlot, setConfigSlot] = useState<Slot | null>(null)
+  /** Empty string = all source videos; otherwise `slotVideoStemKey` value. */
+  const [compareVideoStemKey, setCompareVideoStemKey] = useState('')
+
+  const compareVideoStemOptions = useMemo(() => {
+    const rows: { key: string; label: string }[] = []
+    const seen = new Set<string>()
+    for (const s of slots) {
+      if (!eligibleSet.has(s.run_id)) continue
+      const key = slotVideoStemKey(s)
+      if (seen.has(key)) continue
+      seen.add(key)
+      rows.push({
+        key,
+        label: key === '__none__' ? '(Unknown source video)' : key,
+      })
+    }
+    rows.sort((a, b) => a.label.localeCompare(b.label))
+    return rows
+  }, [slots, eligibleSet])
+
+  useEffect(() => {
+    if (!compareVideoStemKey) return
+    if (compareVideoStemOptions.length === 0) return
+    if (!compareVideoStemOptions.some((o) => o.key === compareVideoStemKey)) {
+      setCompareVideoStemKey('')
+    }
+  }, [compareVideoStemOptions, compareVideoStemKey])
 
   const displaySlots = useMemo(() => {
-    return slots.filter((s) => eligibleSet.has(s.run_id) && visibleRunIds.has(s.run_id))
-  }, [slots, eligibleSet, visibleRunIds])
+    return slots.filter((s) => {
+      if (!eligibleSet.has(s.run_id) || !visibleRunIds.has(s.run_id)) return false
+      if (!compareVideoStemKey) return true
+      return slotVideoStemKey(s) === compareVideoStemKey
+    })
+  }, [slots, eligibleSet, visibleRunIds, compareVideoStemKey])
 
   const visibleOrder = useMemo(() => displaySlots.map((s) => s.run_id), [displaySlots])
-  const masterRunId = visibleOrder[0] ?? null
+  const orderedRunIdsForTinder = visibleOrder
+
+  const [compareLayout, setCompareLayout] = useState<'grid' | 'tinder'>('grid')
+  const tinderRank = useTinderPairwiseRank(orderedRunIdsForTinder)
+  const [tinderComments, setTinderComments] = useState<Record<string, string>>({})
+  const [tinderRankingOpen, setTinderRankingOpen] = useState(false)
+
+  const tinderPoolKeyForComments = useMemo(() => tinderPoolSetKey(orderedRunIdsForTinder), [orderedRunIdsForTinder.join('\x1e')])
+  useEffect(() => {
+    setTinderComments({})
+  }, [tinderPoolKeyForComments])
+
+  useEffect(() => {
+    if (tinderRank.naturallyComplete || tinderRank.state.endedEarly) setTinderRankingOpen(true)
+  }, [tinderRank.naturallyComplete, tinderRank.state.endedEarly])
+
+  const visibleOrderForSync = useMemo(() => {
+    if (compareLayout === 'tinder') {
+      return tinderRank.pairForSync ?? []
+    }
+    return visibleOrder
+  }, [compareLayout, tinderRank.pairForSync, visibleOrder])
+
+  const masterRunId = visibleOrderForSync[0] ?? null
 
   const { videoRefs, setVideoRef, scrubbing, playing, duration, current, syncTime, onMeta, togglePlay, onTimeUpdateMaster, setPlaying } =
-    useSyncedVideos(visibleOrder, masterRunId)
+    useSyncedVideos(visibleOrderForSync, masterRunId)
+
+  const tinderPairSlots = useMemo(() => {
+    if (!tinderRank.pairForSync) return []
+    return tinderRank.pairForSync
+      .map((id) => displaySlots.find((s) => s.run_id === id))
+      .filter((s): s is Slot => Boolean(s))
+  }, [tinderRank.pairForSync, displaySlots])
+
+  const slotByRunId = useMemo(() => {
+    const m = new Map<string, Slot>()
+    for (const s of displaySlots) m.set(s.run_id, s)
+    return m
+  }, [displaySlots])
 
   const toggleRunVisible = useCallback((id: string) => {
     if (!eligibleSet.has(id)) return
@@ -481,17 +768,62 @@ export function ComparePage() {
     )
   }
 
-  const ready = displaySlots.length > 0 && displaySlots.every((s) => s.src)
+  const transportReady =
+    compareLayout === 'tinder'
+      ? tinderPairSlots.length === 2 && tinderPairSlots.every((s) => s.src && !s.error)
+      : displaySlots.length > 0 && displaySlots.every((s) => s.src)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
       <div className="glass-panel" style={{ padding: '1rem 1.5rem' }}>
         <h1 style={{ fontSize: '1.5rem', margin: 0 }}>Compare</h1>
         <p className="sub" style={{ margin: 0, fontSize: '0.9rem' }}>
-          One playhead scrubs and plays every output together.
+          {compareLayout === 'tinder'
+            ? 'Two clips at a time: pick the better one, add notes, then see a full ranking when you finish.'
+            : 'One playhead scrubs and plays every output together.'}
         </p>
         <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>View:</span>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Layout:</span>
+          <div
+            style={{
+              display: 'inline-flex',
+              borderRadius: 8,
+              border: '1px solid var(--glass-border)',
+              overflow: 'hidden',
+              fontSize: '0.82rem',
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setCompareLayout('grid')}
+              style={{
+                padding: '0.35rem 0.65rem',
+                border: 'none',
+                cursor: 'pointer',
+                background: compareLayout === 'grid' ? 'rgba(34, 211, 238, 0.2)' : 'rgba(0,0,0,0.35)',
+                color: compareLayout === 'grid' ? '#e0f7fa' : 'var(--text-muted)',
+                fontWeight: compareLayout === 'grid' ? 600 : 500,
+              }}
+            >
+              Grid
+            </button>
+            <button
+              type="button"
+              onClick={() => setCompareLayout('tinder')}
+              style={{
+                padding: '0.35rem 0.65rem',
+                border: 'none',
+                borderLeft: '1px solid var(--glass-border)',
+                cursor: 'pointer',
+                background: compareLayout === 'tinder' ? 'rgba(34, 211, 238, 0.2)' : 'rgba(0,0,0,0.35)',
+                color: compareLayout === 'tinder' ? '#e0f7fa' : 'var(--text-muted)',
+                fontWeight: compareLayout === 'tinder' ? 600 : 500,
+              }}
+            >
+              Tinder
+            </button>
+          </div>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginLeft: '0.25rem' }}>View:</span>
           <select
             value={viewMode}
             onChange={(e) => {
@@ -515,6 +847,30 @@ export function ComparePage() {
               <option key={r.id} value={r.id}>Phase: {r.title}</option>
             ))}
           </select>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Source video:</span>
+          <select
+            value={compareVideoStemKey}
+            onChange={(e) => setCompareVideoStemKey(e.target.value)}
+            disabled={compareVideoStemOptions.length === 0}
+            style={{
+              background: 'rgba(0,0,0,0.4)',
+              color: '#fff',
+              border: '1px solid var(--glass-border)',
+              borderRadius: 6,
+              padding: '0.35rem 0.5rem',
+              fontSize: '0.85rem',
+              outline: 'none',
+              maxWidth: 'min(100%, 280px)',
+            }}
+            title="Filter runs by Lab input clip (video_stem)"
+          >
+            <option value="">All</option>
+            {compareVideoStemOptions.map((o) => (
+              <option key={o.key} value={o.key}>
+                {o.label}
+              </option>
+            ))}
+          </select>
         </div>
         {viewMode === 'track' && (
           <p style={{ margin: '0.5rem 0 0', fontSize: '0.76rem', color: 'var(--text-muted)', maxWidth: 720, lineHeight: 1.45 }}>
@@ -522,20 +878,27 @@ export function ComparePage() {
             <code style={{ fontSize: '0.65rem' }}>prune_log.json</code> includes <code style={{ fontSize: '0.65rem' }}>hybrid_sam_frame_rois</code>, the same ROI is drawn here in letterbox sync with the shared playhead (per-run timing).
           </p>
         )}
-        <p style={{ margin: '0.45rem 0 0', fontSize: '0.76rem', color: 'var(--text-muted)', maxWidth: 560, lineHeight: 1.45 }}>
-          Click a run name on a tile (e.g. <code style={{ fontSize: '0.7rem' }}>tree_p2_motion_neural_sam30</code>) to see that run&apos;s Lab configuration.
-        </p>
+        {compareLayout === 'grid' && (
+          <p style={{ margin: '0.45rem 0 0', fontSize: '0.76rem', color: 'var(--text-muted)', maxWidth: 560, lineHeight: 1.45 }}>
+            Click a run name on a tile (e.g. <code style={{ fontSize: '0.7rem' }}>tree_p2_motion_neural_sam30</code>) to see that run&apos;s Lab configuration.
+          </p>
+        )}
         <div style={{ marginTop: '0.6rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
             {assetCheckPending ? (
               <>Checking which runs have this clip…</>
             ) : (
               <>
-                Videos: {visibleRunIds.size} of {eligibleRunIdsList.length} with this clip
+                Shown: {displaySlots.length} run{displaySlots.length === 1 ? '' : 's'} (with clip, visible,{' '}
+                {compareVideoStemKey ? 'matching source filter' : 'all sources'})
+                <span style={{ color: '#94a3b8' }}>
+                  {' '}
+                  · {visibleRunIds.size} of {eligibleRunIdsList.length} eligible checked &ldquo;Show&rdquo;
+                </span>
                 {skippedNoFileCount > 0 && (
                   <span style={{ color: '#94a3b8' }}>
                     {' '}
-                    ({skippedNoFileCount} run{skippedNoFileCount === 1 ? '' : 's'} hidden — no file for this view)
+                    ({skippedNoFileCount} run{skippedNoFileCount === 1 ? '' : 's'} missing this view file)
                   </span>
                 )}
               </>
@@ -552,9 +915,19 @@ export function ComparePage() {
             Verifying which runs have this view&apos;s file on disk…
           </p>
         )}
-        {!assetCheckPending && !ready && displaySlots.length > 0 && (
+        {!assetCheckPending && !transportReady && displaySlots.length > 0 && compareLayout === 'grid' && (
           <p style={{ margin: '0.75rem 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
             Waiting for players to load…
+          </p>
+        )}
+        {!assetCheckPending &&
+          compareLayout === 'tinder' &&
+          tinderPairSlots.length < 2 &&
+          !tinderRank.state.endedEarly &&
+          !tinderRank.naturallyComplete &&
+          orderedRunIdsForTinder.length >= 2 && (
+          <p style={{ margin: '0.75rem 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+            Preparing pairwise view…
           </p>
         )}
         {!assetCheckPending && eligibleRunIdsList.length === 0 && slots.length > 0 && (
@@ -581,7 +954,7 @@ export function ComparePage() {
           <button type="button" className="btn" onClick={() => syncTime(0)} aria-label="Seek start" style={{ padding: '0.5rem' }}>
             <SkipBack size={18} />
           </button>
-          <button type="button" className="btn primary" onClick={togglePlay} disabled={!ready} style={{ padding: '0.5rem 1rem' }}>
+          <button type="button" className="btn primary" onClick={togglePlay} disabled={!transportReady} style={{ padding: '0.5rem 1rem' }}>
             {playing ? <Pause size={18} /> : <Play size={18} />}
           </button>
           <button
@@ -600,7 +973,7 @@ export function ComparePage() {
             max={duration > 0 ? duration : 1}
             step={0.01}
             value={duration > 0 ? Math.min(current, duration) : 0}
-            disabled={!ready || duration <= 0}
+            disabled={!transportReady || duration <= 0}
             onMouseDown={() => {
               scrubbing.current = true
             }}
@@ -619,9 +992,351 @@ export function ComparePage() {
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', minWidth: '80px', textAlign: 'right' }}>
             {formatTime(current)} / {formatTime(duration)}
           </span>
+          {compareLayout === 'tinder' && (
+            <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', width: '100%', textAlign: 'right' }}>
+              {orderedRunIdsForTinder.length < 2
+                ? 'Need at least two visible clips with this view.'
+                : tinderRank.state.endedEarly
+                  ? 'Finished early — ranking uses your picks + inference (see below).'
+                  : tinderRank.naturallyComplete
+                    ? 'No ambiguous pairs left — order is fully determined by your comparisons.'
+                    : tinderRank.pairForSync
+                      ? `${tinderRank.comparisonsDone} comparison${tinderRank.comparisonsDone === 1 ? '' : 's'} · ${tinderRank.ambiguousPairs} pair${tinderRank.ambiguousPairs === 1 ? '' : 's'} still need a direct look (or use Finish early)`
+                      : ''}
+            </span>
+          )}
         </div>
       </div>
 
+      {compareLayout === 'tinder' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          {orderedRunIdsForTinder.length < 2 ? (
+            <div className="glass-panel" style={{ padding: '1.5rem', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+              Tinder mode needs at least two runs that have this clip and are checked &ldquo;Show&rdquo; in the grid. Switch to Grid,
+              enable at least two tiles, then return here.
+            </div>
+          ) : (
+            <>
+              <div
+                className="glass-panel"
+                style={{
+                  padding: '0.85rem 1.25rem',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '0.65rem',
+                  alignItems: 'center',
+                }}
+              >
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '0.35rem 0.75rem', fontSize: '0.82rem' }}
+                  onClick={() => setTinderRankingOpen((o) => !o)}
+                >
+                  {tinderRankingOpen ? 'Hide ranking' : 'Show ranking'}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '0.35rem 0.75rem', fontSize: '0.82rem' }}
+                  onClick={() => {
+                    tinderRank.dispatch({ type: 'reset', ids: orderedRunIdsForTinder })
+                    setTinderRankingOpen(false)
+                  }}
+                >
+                  Restart ranking
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  style={{ padding: '0.35rem 0.75rem', fontSize: '0.82rem' }}
+                  disabled={
+                    tinderRank.state.endedEarly ||
+                    tinderRank.naturallyComplete ||
+                    orderedRunIdsForTinder.length < 2
+                  }
+                  onClick={() => tinderRank.dispatch({ type: 'finish' })}
+                >
+                  Finish early
+                </button>
+                {tinderRank.state.endedEarly && tinderRank.ambiguousPairs > 0 && (
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '0.35rem 0.75rem', fontSize: '0.82rem' }}
+                    onClick={() => tinderRank.dispatch({ type: 'resume' })}
+                  >
+                    Keep comparing
+                  </button>
+                )}
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.45, maxWidth: 560 }}>
+                  Pairs you <strong style={{ color: '#cbd5e1' }}>don&apos;t</strong> have to see are skipped when the order already follows from
+                  your earlier picks (transitive). Use <strong style={{ color: '#cbd5e1' }}>Finish early</strong> anytime — the list below
+                  updates from whatever you&apos;ve compared so far. Notes stay in this browser only.
+                </span>
+              </div>
+
+              {tinderRankingOpen && (
+                <div className="glass-panel" style={{ padding: '1.25rem' }}>
+                  <h2 style={{ fontSize: '1.05rem', margin: '0 0 0.75rem', color: '#fff' }}>Ranking & comments</h2>
+                  <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5 }}>
+                    Best → worst from your direct picks, <strong style={{ color: '#94a3b8' }}>plus transitive inference</strong> (if A beats B and
+                    B beats C, we treat A above C without another click). When you stop early or some pairs never get compared, gaps are
+                    filled by win counts and clip order — see the status line. Comments stay in this session only.
+                  </p>
+                  <div
+                    style={{
+                      marginBottom: '1rem',
+                      padding: '0.65rem 0.9rem',
+                      borderRadius: 10,
+                      background: 'rgba(15, 23, 42, 0.55)',
+                      border: '1px solid var(--glass-border)',
+                      fontSize: '0.8rem',
+                      color: '#cbd5e1',
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    <strong style={{ color: '#94a3b8' }}>Status:</strong> {tinderRank.comparisonsDone} direct comparison
+                    {tinderRank.comparisonsDone === 1 ? '' : 's'}
+                    {tinderRank.state.endedEarly && (
+                      <span style={{ color: '#fcd34d' }}> · finished early</span>
+                    )}
+                    {tinderRank.naturallyComplete && !tinderRank.state.endedEarly && (
+                      <span style={{ color: '#a7f3d0' }}> · fully determined</span>
+                    )}
+                    {!tinderRank.state.endedEarly && !tinderRank.naturallyComplete && tinderRank.ambiguousPairs > 0 && (
+                      <span> · {tinderRank.ambiguousPairs} pair{tinderRank.ambiguousPairs === 1 ? '' : 's'} not yet ordered by your picks</span>
+                    )}
+                    {tinderRank.inferredRanking.approximated && (
+                      <span style={{ color: '#fca5a5' }}>
+                        {' '}
+                        · order partially guessed (conflicting or missing links — compare more or use Restart)
+                      </span>
+                    )}
+                  </div>
+                  {tinderRank.pairForSync && (
+                    <div
+                      style={{
+                        marginBottom: '1rem',
+                        padding: '0.75rem 1rem',
+                        borderRadius: 10,
+                        background: 'rgba(34, 211, 238, 0.08)',
+                        border: '1px solid rgba(34, 211, 238, 0.25)',
+                        fontSize: '0.84rem',
+                        color: '#e2e8f0',
+                        lineHeight: 1.55,
+                      }}
+                    >
+                      <div style={{ fontWeight: 700, color: '#67e8f9', marginBottom: '0.35rem' }}>Current pair</div>
+                      <div>
+                        <span style={{ color: '#94a3b8' }}>Left:</span>{' '}
+                        {slotByRunId.get(tinderRank.pairForSync[0])?.label ?? tinderRank.pairForSync[0].slice(0, 8)}
+                        {' · '}
+                        <span style={{ color: '#94a3b8' }}>Right:</span>{' '}
+                        {slotByRunId.get(tinderRank.pairForSync[1])?.label ?? tinderRank.pairForSync[1].slice(0, 8)}
+                      </div>
+                    </div>
+                  )}
+                  <div
+                    style={{
+                      fontSize: '0.72rem',
+                      fontWeight: 700,
+                      color: '#94a3b8',
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.05em',
+                      marginBottom: '0.5rem',
+                    }}
+                  >
+                    Estimated order (updates live)
+                  </div>
+                  <ol style={{ margin: 0, paddingLeft: '1.25rem', color: '#e2e8f0', fontSize: '0.88rem', lineHeight: 1.6 }}>
+                    {tinderRank.inferredRanking.order.map((id, i) => {
+                      const slot = slotByRunId.get(id)
+                      return (
+                        <li key={id} style={{ marginBottom: '0.85rem' }}>
+                          <div style={{ fontWeight: 600, color: '#f8fafc' }}>
+                            #{i + 1}{' '}
+                            <button
+                              type="button"
+                              onClick={() => slot && setConfigSlot(slot)}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                color: 'var(--halo-cyan)',
+                                cursor: slot ? 'pointer' : 'default',
+                                font: 'inherit',
+                                fontWeight: 600,
+                                textDecoration: 'underline',
+                                textUnderlineOffset: 3,
+                                padding: 0,
+                              }}
+                            >
+                              {slot?.label ?? id.slice(0, 8)}
+                            </button>
+                          </div>
+                          <div
+                            style={{
+                              fontSize: '0.72rem',
+                              fontFamily: 'ui-monospace, monospace',
+                              color: '#94a3b8',
+                              marginTop: '0.15rem',
+                              wordBreak: 'break-all',
+                            }}
+                          >
+                            {id}
+                          </div>
+                          {tinderComments[id]?.trim() ? (
+                            <div style={{ marginTop: '0.35rem', fontSize: '0.82rem', color: '#cbd5e1', whiteSpace: 'pre-wrap' }}>
+                              {tinderComments[id].trim()}
+                            </div>
+                          ) : (
+                            <div style={{ marginTop: '0.35rem', fontSize: '0.78rem', color: '#64748b', fontStyle: 'italic' }}>
+                              No comment
+                            </div>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ol>
+                </div>
+              )}
+
+              {tinderPairSlots.length === 2 && tinderRank.pairForSync && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
+                    gap: '1rem',
+                  }}
+                >
+                  {tinderPairSlots.map((s, colIdx) => {
+                    const side: 'left' | 'right' = colIdx === 0 ? 'left' : 'right'
+                    const role = colIdx === 0 ? 'Clip A (left)' : 'Clip B (right)'
+                    return (
+                      <div key={s.run_id} className="glass-panel" style={{ overflow: 'hidden', padding: 0, display: 'flex', flexDirection: 'column' }}>
+                        <div
+                          style={{
+                            padding: '0.65rem 1rem',
+                            borderBottom: '1px solid var(--glass-border)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '0.2rem',
+                          }}
+                        >
+                          <span style={{ fontSize: '0.68rem', fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                            {role}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setConfigSlot(s)}
+                            style={{
+                              textAlign: 'left',
+                              background: 'transparent',
+                              border: 'none',
+                              color: 'var(--halo-cyan)',
+                              fontWeight: 600,
+                              font: 'inherit',
+                              cursor: 'pointer',
+                              padding: 0,
+                              textDecoration: 'underline',
+                              textUnderlineOffset: 3,
+                            }}
+                          >
+                            {s.label}
+                          </button>
+                        </div>
+                        <div style={{ background: '#000', aspectRatio: '16/9', position: 'relative', flexShrink: 0 }}>
+                          {s.error && (
+                            <div style={{ color: '#f87171', padding: '1.5rem', fontSize: '0.9rem' }}>{s.error}</div>
+                          )}
+                          {s.src && (
+                            <video
+                              ref={(el) => setVideoRef(s.run_id, el)}
+                              src={s.src}
+                              preload="metadata"
+                              playsInline
+                              onLoadedMetadata={onMeta}
+                              onPlay={() => setPlaying(true)}
+                              onPause={() => {
+                                const anyPlaying = visibleOrderForSync.some((id) => {
+                                  const elv = videoRefs.current[id]
+                                  return elv && !elv.paused
+                                })
+                                if (!anyPlaying) setPlaying(false)
+                              }}
+                              muted
+                              onTimeUpdate={() => {
+                                if (masterRunId && s.run_id === masterRunId) onTimeUpdateMaster(masterRunId)
+                              }}
+                              style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', pointerEvents: 'none' }}
+                            />
+                          )}
+                        </div>
+                        <div style={{ padding: '0.75rem 1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
+                          <label style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>Comment on this clip</label>
+                          <textarea
+                            value={tinderComments[s.run_id] ?? ''}
+                            onChange={(e) => setTinderComments((prev) => ({ ...prev, [s.run_id]: e.target.value }))}
+                            rows={3}
+                            placeholder="Notes…"
+                            style={{
+                              width: '100%',
+                              boxSizing: 'border-box',
+                              resize: 'vertical',
+                              background: 'rgba(0,0,0,0.35)',
+                              border: '1px solid var(--glass-border)',
+                              borderRadius: 8,
+                              color: '#e2e8f0',
+                              fontSize: '0.82rem',
+                              padding: '0.5rem 0.65rem',
+                              fontFamily: 'inherit',
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="btn primary"
+                            style={{ width: '100%', padding: '0.55rem', fontSize: '0.88rem' }}
+                            onClick={() => tinderRank.dispatch({ type: 'pick', side })}
+                          >
+                            This clip is better
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {(tinderRank.naturallyComplete || tinderRank.state.endedEarly) && (
+                <div
+                  className="glass-panel"
+                  style={{
+                    padding: '1rem 1.25rem',
+                    fontSize: '0.88rem',
+                    color: tinderRank.naturallyComplete ? '#a7f3d0' : '#fde68a',
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {tinderRank.naturallyComplete && !tinderRank.state.endedEarly ? (
+                    <>
+                      Every pair is now ordered by your picks (including inferred links). Use <strong>Show ranking</strong> for the list and
+                      comments.
+                    </>
+                  ) : (
+                    <>
+                      Stopped early — the list above is a <strong>best-effort</strong> order from {tinderRank.comparisonsDone} comparison
+                      {tinderRank.comparisonsDone === 1 ? '' : 's'}. Use <strong>Keep comparing</strong> to add more, or <strong>Restart</strong>{' '}
+                      to clear.
+                    </>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {compareLayout === 'grid' && (
       <div
         style={{
           display: 'grid',
@@ -712,7 +1427,7 @@ export function ComparePage() {
                   onLoadedMetadata={onMeta}
                   onPlay={() => setPlaying(true)}
                   onPause={() => {
-                    const anyPlaying = visibleOrder.some((id) => {
+                    const anyPlaying = visibleOrderForSync.some((id) => {
                       const elv = videoRefs.current[id]
                       return elv && !elv.paused
                     })
@@ -729,6 +1444,7 @@ export function ComparePage() {
           </div>
         ))}
       </div>
+      )}
 
       {configSlot && (
         <CompareRunConfigModal
@@ -738,7 +1454,7 @@ export function ComparePage() {
         />
       )}
 
-      {slots.length > 0 && (
+      {slots.length > 0 && compareLayout === 'grid' && (
         <div style={{ marginTop: '2rem' }}>
           <h2 style={{ fontSize: '1.25rem', marginBottom: '0.35rem', color: '#fff' }}>Tracking & pipeline impact</h2>
           <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5, maxWidth: 720 }}>

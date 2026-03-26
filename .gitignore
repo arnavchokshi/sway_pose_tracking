@@ -7,6 +7,9 @@ input/*
 data/videos_inbox/*
 !data/videos_inbox/README.md
 
+# Phase-13 sweep: local sequence list (copy from data/ground_truth/sweep_sequences.example.yaml)
+data/ground_truth/sweep_sequences.yaml
+
 # DanceTrack HF cache / temp extract (large; local only)
 dancetrack_hf/
 .dancetrack_extract_tmp/

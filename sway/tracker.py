@@ -293,6 +293,9 @@ def _deepocsort_extra_from_env() -> Dict[str, Any]:
         asso = "giou"
     elif raw_asso in ("diou", "ciou"):
         asso = raw_asso
+    elif raw_asso in ("eiou",):
+        # BoxMOT has no EIoU; CIoU is the closest built-in (center distance + aspect ratio terms).
+        asso = "ciou"
     else:
         asso = "iou"
     return {
@@ -477,6 +480,7 @@ _SWAY_YOLO_WEIGHTS_ALIASES: Dict[str, str] = {
     "yolo26l": "yolo26l.pt",
     "yolo26x": "yolo26x.pt",
     "yolo26l_dancetrack": "yolo26l_dancetrack.pt",
+    "yolo26l_dancetrack_crowdhuman": "yolo26l_dancetrack_crowdhuman.pt",
     "yolo26x_dancetrack": "yolo26x_dancetrack.pt",
 }
 

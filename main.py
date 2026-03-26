@@ -56,7 +56,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import cv2
 import numpy as np
@@ -95,6 +95,7 @@ from sway.phase_debug_log import PhaseDebugLogger
 from sway.tracker import (
     _use_boxmot,
     apply_post_track_stitching,
+    boxmot_tracker_kind_from_env,
     iter_video_frames,
     run_boxmot_tracking_from_yolo_dets,
     run_phase1_yolo_only_boxmot,
@@ -116,7 +117,13 @@ from sway.track_pruning import (
     ULTRA_LOW_SKELETON_MEAN,
 )
 from sway.interp_utils import blend_pose_keypoints_scores
-from sway.pose_estimator import PoseEstimator, smart_expand_bbox_xyxy, vitpose_smart_pad_enabled
+from sway.pose_crop_temporal import apply_temporal_pose_crop
+from sway.pose_estimator import (
+    PoseEstimator,
+    smart_expand_bbox_xyxy,
+    vitpose_debug_enabled,
+    vitpose_smart_pad_enabled,
+)
 
 
 def _resolve_sapiens_torchscript_path() -> Optional[str]:
@@ -298,13 +305,32 @@ def _parse_stage_polygon_env() -> Optional[List[Tuple[float, float]]]:
 
 
 def get_device() -> torch.device:
-    """Select compute device: MPS (Apple Silicon) if available, else CPU."""
+    """Select compute device for ViTPose and shared sway inference.
+
+    Override with ``SWAY_TORCH_DEVICE``: ``cpu``, ``mps``, or ``cuda`` / ``cuda:0``.
+    Default: MPS on Apple Silicon when available, else CPU.
+    """
+    import os
+
+    raw = os.environ.get("SWAY_TORCH_DEVICE", "").strip().lower()
+    if raw == "cpu":
+        return torch.device("cpu")
+    if raw == "mps":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if raw.startswith("cuda"):
+        if torch.cuda.is_available():
+            return torch.device("cuda:0" if raw == "cuda" else raw)
+        return torch.device("cpu")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
 _LAB_CTX: Optional[Dict[str, Any]] = None
+# Serialize progress.jsonl appends (main thread + pose busy-heartbeat thread).
+_LAB_PROGRESS_IO_LOCK = threading.Lock()
 
 
 def _lab_track_summary_heuristic(raw_tracks: Dict[int, List[Any]], ystride: int) -> Dict[str, Any]:
@@ -372,7 +398,7 @@ def _build_pipeline_diagnostics(
 ) -> Dict[str, Any]:
     """Structured Lab / manifest payload: what ran and how optional features behaved."""
     from sway.global_track_link import _force_heuristic_global_link, resolve_aflink_weights
-    from sway.tracker import _use_boxmot, boxmot_tracker_kind_from_env, load_tracking_runtime
+    from sway.tracker import load_tracking_runtime
 
     tr = load_tracking_runtime()
     p = resolve_aflink_weights()
@@ -539,8 +565,82 @@ def _lab_progress(
         _LAB_CTX.setdefault("stage_log", []).append(payload)
     pj = _LAB_CTX.get("progress_jsonl")
     if pj:
-        with open(pj, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
+        line = json.dumps(payload) + "\n"
+        with _LAB_PROGRESS_IO_LOCK:
+            with open(pj, "a", encoding="utf-8") as f:
+                f.write(line)
+
+
+_T_pose = TypeVar("_T_pose")
+
+
+def _call_with_pose_busy_heartbeat(
+    *,
+    fn: Callable[[], _T_pose],
+    t0_phase5: float,
+    frame_idx: int,
+    total_frames: int,
+    phase5_pose_passes: int,
+    n_tracks: int,
+    pct: int,
+) -> _T_pose:
+    """
+    Run ViTPose in a worker thread while the main thread emits heartbeats every ~hb seconds.
+
+    The previous design ran ``fn`` on the main thread and used a second thread for heartbeats.
+    During CPU-bound HuggingFace processor work, the main thread holds the GIL, so the heartbeat
+    thread never ran — the Lab UI stayed at ~0% with no new lines for minutes (looks hung).
+
+    Inverting roles fixes that: the main thread ``join(timeout=hb)`` loops and prints between
+    waits; ViTPose runs on the worker thread.
+    """
+    import time as _time
+
+    hb = float(os.environ.get("SWAY_POSE_BUSY_HEARTBEAT_SEC", "5"))
+    if hb <= 0:
+        return fn()
+
+    slot: list[Any] = []
+    err: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            slot.append(fn())
+        except BaseException as e:
+            err.append(e)
+
+    th = threading.Thread(target=_worker, name="pose_forward", daemon=False)
+    th.start()
+    while True:
+        th.join(timeout=hb)
+        if not th.is_alive():
+            break
+        elapsed = _time.time() - t0_phase5
+        print(
+            f"  [phase5] ViTPose still running — frame {frame_idx + 1}/{total_frames} "
+            f"({pct}%), {elapsed:.0f}s in phase 5 (CPU preprocess or GPU; first batch can take minutes)…",
+            flush=True,
+        )
+        _lab_progress(
+            4,
+            "pose",
+            "Phase 5: Pose estimation",
+            status="running",
+            extra={
+                "frame": int(frame_idx + 1),
+                "total_frames": int(total_frames),
+                "pct": int(pct),
+                "pose_pass": int(phase5_pose_passes),
+                "tracks": int(n_tracks),
+                "wall_s_in_phase": round(elapsed, 1),
+                "vitpose_busy": True,
+            },
+        )
+    if err:
+        raise err[0]
+    if not slot:
+        raise RuntimeError("pose forward worker exited without result")
+    return slot[0]
 
 
 def _lab_register_preview(stage_key: str, rel_path: str) -> None:
@@ -926,6 +1026,9 @@ def main():
     _apply_params_to_env(params)
     apply_master_locked_detection_env()
     apply_master_locked_hybrid_sam_env()
+    # ByteTrack (Lab "Fast preview" / tracker_technology=bytetrack): skip SAM2 overlap refiner — much faster than Deep OC-SORT + hybrid SAM.
+    if boxmot_tracker_kind_from_env() == "bytetrack":
+        os.environ["SWAY_HYBRID_SAM_OVERLAP"] = "0"
     apply_master_locked_phase3_stitch_env()
     apply_master_locked_pose_env()
     apply_master_locked_smooth_env()
@@ -993,6 +1096,10 @@ def main():
     montage_start = 0
 
     vis_skip = float(params.get("POSE_VISIBILITY_THRESHOLD", 0.3))
+    pose_crop_smooth_alpha = float(params.get("POSE_CROP_SMOOTH_ALPHA", 0) or 0)
+    pose_crop_foot_bias_frac = float(params.get("POSE_CROP_FOOT_BIAS_FRAC", 0) or 0)
+    pose_crop_head_bias_frac = float(params.get("POSE_CROP_HEAD_BIAS_FRAC", 0) or 0)
+    pose_crop_anti_jitter_px = float(params.get("POSE_CROP_ANTI_JITTER_PX", 0) or 0)
 
     device = get_device()
     print(f"Using device: {device}")
@@ -1119,9 +1226,12 @@ def main():
                 flush=True,
             )
         print("\n[1/11] Phase 1 — (from checkpoint) skipped; running tracking + hybrid from YOLO dets…")
-        print(
-            "[2/11] Phase 2 — Tracking (BoxMOT + hybrid SAM from stored YOLO boxes)",
+        _p2_ck_msg = (
+            "[2/11] Phase 2 — Tracking (BoxMOT ByteTrack from stored YOLO dets; hybrid SAM off)"
+            if boxmot_tracker_kind_from_env() == "bytetrack"
+            else "[2/11] Phase 2 — Tracking (BoxMOT + hybrid SAM from stored YOLO boxes)"
         )
+        print(_p2_ck_msg)
         t0 = time.time()
         (
             raw_pre,
@@ -1253,9 +1363,12 @@ def main():
             return
 
         print("\n[1/11] Phase 1 — Detection (YOLO)")
-        print(
-            "[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT, optional track-time OSNet; hybrid SAM when enabled)",
+        _p2_track_msg = (
+            "[2/11] Phase 2 — Tracking (BoxMOT ByteTrack; hybrid SAM off — fast preview path)"
+            if boxmot_tracker_kind_from_env() == "bytetrack"
+            else "[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT, optional track-time OSNet; hybrid SAM when enabled)"
         )
+        print(_p2_track_msg)
         print("  (Single pass over the video: detection and association per frame.)")
         t0 = time.time()
         (
@@ -1718,6 +1831,12 @@ def main():
             f"  {backend} weights loaded in {time.time() - t0:.1f}s (first forward may add MPS/CUDA compile time)",
             flush=True,
         )
+        if vitpose_debug_enabled():
+            print(
+                "  ViTPose verbose debug: Phase 5 logs embeddings timing, hybrid SAM plain vs masked split, "
+                "and each ViTPose processor/model/post step.",
+                flush=True,
+            )
 
         raw_poses_by_frame = [{} for _ in range(total_frames)]
         embeddings_by_frame = [{} for _ in range(total_frames)]  # V3.8: Appearance for Re-ID
@@ -1728,7 +1847,7 @@ def main():
         # of frames could run ViTPose with zero logs (minutes on huge + MPS). See SWAY_POSE_LOG_* env.
         phase5_pose_passes = 0
         last_phase5_wall_log = time.time()
-        pose_log_every_sec = float(os.environ.get("SWAY_POSE_LOG_EVERY_SEC", "20"))
+        pose_log_every_sec = float(os.environ.get("SWAY_POSE_LOG_EVERY_SEC", "5"))
         pose_log_every_n = max(1, int(os.environ.get("SWAY_POSE_LOG_EVERY_N_PASSES", "8")))
         pose_slow_sec = float(os.environ.get("SWAY_POSE_SLOW_FORWARD_SEC", "4"))
         phase5_logged_first_forward = False
@@ -1749,6 +1868,7 @@ def main():
 
             prev_boxes = {}
             prev_poses = {}
+            pose_crop_state: Dict[int, Tuple[float, float, float, float]] = {}
 
             while True:
                 item = frame_q.get()
@@ -1777,9 +1897,22 @@ def main():
 
                 # V3.8: Extract appearance embeddings for Re-ID (red vs blue during occlusion)
                 if len(boxes) > 0:
+                    if vitpose_debug_enabled():
+                        t_emb = time.perf_counter()
+                        print(
+                            f"  [phase5_dbg] frame {frame_idx + 1}: extract_embeddings start "
+                            f"(n_boxes={len(boxes)})",
+                            flush=True,
+                        )
                     embeddings_by_frame[frame_idx] = extract_embeddings(
                         frame, boxes, track_ids, method="hsv_strip"
                     )
+                    if vitpose_debug_enabled():
+                        print(
+                            f"  [phase5_dbg] frame {frame_idx + 1}: extract_embeddings done "
+                            f"{(time.perf_counter() - t_emb) * 1000:.1f}ms",
+                            flush=True,
+                        )
 
                 run_pose = (frame_idx % args.pose_stride == 0) and len(boxes) > 0
                 if run_pose:
@@ -1817,6 +1950,12 @@ def main():
 
                     # V3.4: Compute visibility scores to skip occluded tracks
                     vis_scores = compute_visibility_scores(boxes, track_ids)
+                    if vitpose_debug_enabled():
+                        print(
+                            f"  [phase5_dbg] frame {frame_idx + 1}: visibility scores ready "
+                            f"(n_tracks={len(boxes)})",
+                            flush=True,
+                        )
 
                     boxes_to_estimate = []
                     ids_to_estimate = []
@@ -1831,12 +1970,29 @@ def main():
                             smart_expand_bbox_xyxy(
                                 box,
                                 prev_boxes.get(tid),
-                                w_fr,
-                                h_fr,
+                                frame_width,
+                                frame_height,
                             )
                             if _smart_pose_crop
                             else box
                         )
+                        if (
+                            pose_crop_smooth_alpha > 0
+                            or pose_crop_foot_bias_frac > 0
+                            or pose_crop_head_bias_frac > 0
+                            or pose_crop_anti_jitter_px > 0
+                        ):
+                            pose_box = apply_temporal_pose_crop(
+                                int(tid),
+                                pose_box,
+                                frame_w=frame_width,
+                                frame_h=frame_height,
+                                smooth_alpha=pose_crop_smooth_alpha,
+                                foot_bias_frac=pose_crop_foot_bias_frac,
+                                head_bias_frac=pose_crop_head_bias_frac,
+                                anti_jitter_px=pose_crop_anti_jitter_px,
+                                state=pose_crop_state,
+                            )
                         # V3.4: Skip pose estimation for heavily occluded tracks
                         vis = vis_scores.get(tid, 1.0)
                         if vis < vis_skip:
@@ -1897,8 +2053,15 @@ def main():
                         paddings.append(pad)
                         masks_to_estimate.append(m)
 
+                    if vitpose_debug_enabled():
+                        print(
+                            f"  [phase5_dbg] frame {frame_idx + 1}: boxes_to_estimate={len(boxes_to_estimate)}",
+                            flush=True,
+                        )
+
                     if boxes_to_estimate:
-                        frame_rgb = frame[:, :, ::-1]
+                        # Contiguous RGB avoids PIL/transformers edge cases with BGR ::-1 views.
+                        frame_rgb = np.ascontiguousarray(frame[:, :, ::-1])
                         seg_arg = masks_to_estimate if any(x is not None for x in masks_to_estimate) else None
                         n_mask = sum(1 for x in (seg_arg or []) if x is not None)
                         if not phase5_logged_first_forward:
@@ -1908,15 +2071,41 @@ def main():
                                 flush=True,
                             )
                             phase5_logged_first_forward = True
+                        if vitpose_debug_enabled():
+                            print(
+                                f"  [phase5_dbg] frame {frame_idx + 1}: BGR→RGB done "
+                                f"h×w={frame_rgb.shape[0]}×{frame_rgb.shape[1]} "
+                                f"boxes_to_estimate={len(boxes_to_estimate)} seg_arg="
+                                f"{'list' if seg_arg is not None else 'None'} n_sam_masks={n_mask}",
+                                flush=True,
+                            )
+                            print(
+                                f"  [phase5_dbg] frame {frame_idx + 1}: calling estimate_poses now…",
+                                flush=True,
+                            )
                         t_inf = time.perf_counter()
-                        estimated = pose_estimator.estimate_poses(
-                            frame_rgb,
-                            boxes_to_estimate,
-                            ids_to_estimate,
-                            paddings,
-                            segmentation_masks=seg_arg,
+                        estimated = _call_with_pose_busy_heartbeat(
+                            fn=lambda: pose_estimator.estimate_poses(
+                                frame_rgb,
+                                boxes_to_estimate,
+                                ids_to_estimate,
+                                paddings,
+                                segmentation_masks=seg_arg,
+                            ),
+                            t0_phase5=t0,
+                            frame_idx=frame_idx,
+                            total_frames=total_frames,
+                            phase5_pose_passes=phase5_pose_passes,
+                            n_tracks=len(boxes),
+                            pct=pct,
                         )
                         inf_dt = time.perf_counter() - t_inf
+                        if vitpose_debug_enabled():
+                            print(
+                                f"  [phase5_dbg] frame {frame_idx + 1}: estimate_poses returned "
+                                f"{(inf_dt * 1000):.1f}ms n_tracks_out={len(estimated)}",
+                                flush=True,
+                            )
                         if inf_dt >= pose_slow_sec:
                             print(
                                 f"  [phase5] slow forward {inf_dt:.1f}s @ frame {frame_idx + 1} "
@@ -2680,6 +2869,14 @@ def main():
                 print(
                     f"  [3D Lift] Camera from video metadata ({sk}): "
                     f"{feq:.1f}mm equiv → fx={video_camera['fx']:.1f}, fy={video_camera['fy']:.1f}",
+                    flush=True,
+                )
+            else:
+                fov_guess = os.environ.get("SWAY_PINHOLE_FOV_DEG", "70")
+                print(
+                    f"  [3D Lift] No ffprobe 35mm-equivalent tags — using default pinhole FOV "
+                    f"({fov_guess}°, SWAY_PINHOLE_FOV_DEG). Set SWAY_FX and SWAY_FY for accurate "
+                    f"world layout, or fix container metadata.",
                     flush=True,
                 )
 

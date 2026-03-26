@@ -5,6 +5,10 @@
 
 import type { DraftRun } from '../context/LabContext'
 
+function isFanOutNode(d: DraftRun) {
+  return d.parentRef.kind === 'all_roots' || d.parentRef.kind === 'all_at_level'
+}
+
 /** Boundaries written when a segment stops (matches main.py checkpoint dirs). */
 export function stopBoundaryForTreeLevel(level: number): string | undefined {
   const m = ['after_phase_1', 'after_phase_3', 'after_phase_4', 'after_phase_5']
@@ -29,16 +33,37 @@ export function treeSegmentLabel(level: number): string {
   return labels[Math.min(level, labels.length - 1)] ?? `Segment ${level + 1}`
 }
 
+/** Root plus every draft that chains from it via ``single`` parents only (for removing a branch in simple view). */
+export function descendantIdsIncludingRoot(rootId: string, all: DraftRun[]): Set<string> {
+  const acc = new Set<string>([rootId])
+  let growing = true
+  while (growing) {
+    growing = false
+    for (const d of all) {
+      if (acc.has(d.clientId)) continue
+      if (d.parentRef.kind === 'single' && acc.has(d.parentRef.parentClientId)) {
+        acc.add(d.clientId)
+        growing = true
+      }
+    }
+  }
+  return acc
+}
+
 export function dependencyClientIds(node: DraftRun, all: DraftRun[]): string[] {
-  if (node.parentRef.kind === 'none') return []
-  if (node.parentRef.kind === 'single') return [node.parentRef.parentClientId]
-  if (node.parentRef.kind === 'all_roots') {
-    return all.filter((n) => n.parentRef.kind === 'none').map((n) => n.clientId)
+  const pr = node.parentRef
+  switch (pr.kind) {
+    case 'none':
+      return []
+    case 'single':
+      return [pr.parentClientId]
+    case 'all_roots':
+      return all.filter((n) => n.parentRef.kind === 'none').map((n) => n.clientId)
+    case 'all_at_level':
+      return all.filter((n) => n.treeLevel === pr.level && !isFanOutNode(n)).map((n) => n.clientId)
+    default:
+      return []
   }
-  if (node.parentRef.kind === 'all_at_level') {
-    return all.filter((n) => n.treeLevel === node.parentRef.level).map((n) => n.clientId)
-  }
-  return []
 }
 
 export function topoSortDrafts(drafts: DraftRun[]): DraftRun[] {
@@ -105,7 +130,8 @@ function buildCheckpointForChild(parentLevel: number, childLevel: number, parent
 export type ExpandedBatchRunSpec = {
   recipe_name: string
   fields: Record<string, unknown>
-  checkpoint: Record<string, unknown>
+  /** Omitted or empty = full pipeline (no checkpoint stop / resume). */
+  checkpoint?: Record<string, unknown>
 }
 
 /**
@@ -123,6 +149,11 @@ export function expandDraftsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSp
 
   for (const node of sorted) {
     if (node.parentRef.kind === 'none') {
+      if (node.treeLevel !== 0) {
+        throw new Error(
+          `Run "${node.recipeName}" is a root but uses segment ${node.treeLevel + 1}. Roots must stay on Phase 1 — edit or remove this node.`,
+        )
+      }
       const stop = stopBoundaryForTreeLevel(node.treeLevel)
       if (!stop) {
         throw new Error('Root runs must be Phase-1 segments (stop after detect).')
@@ -145,6 +176,11 @@ export function expandDraftsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSp
           `Parent "${parent.recipeName}" cannot be used as a single parent — it fans out to multiple batch jobs. Add a Phase-2 node per parent instead.`,
         )
       }
+      if (node.treeLevel !== parent.treeLevel + 1) {
+        throw new Error(
+          `Run "${node.recipeName}" is segment ${node.treeLevel + 1} but its parent "${parent.recipeName}" is segment ${parent.treeLevel + 1}. Use Next segment from the parent card to keep the ladder aligned.`,
+        )
+      }
       const ck = buildCheckpointForChild(parent.treeLevel, node.treeLevel, pIdx)
       idToBatchIndex.set(node.clientId, specs.length)
       specs.push({
@@ -157,6 +193,11 @@ export function expandDraftsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSp
 
     if (node.parentRef.kind === 'all_roots') {
       if (roots.length === 0) throw new Error('“All Phase-1 parents” needs at least one Phase-1 root.')
+      if (node.treeLevel !== 1) {
+        throw new Error(
+          `“All Phase-1 roots” continuations must be segment 2 (track). "${node.recipeName}" is segment ${node.treeLevel + 1}.`,
+        )
+      }
       const parentLevel = 0
       for (const r of roots) {
         const pIdx = idToBatchIndex.get(r.clientId)
@@ -172,9 +213,15 @@ export function expandDraftsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSp
     }
 
     if (node.parentRef.kind === 'all_at_level') {
-      const parents = drafts.filter((d) => d.treeLevel === node.parentRef.level)
+      const lvl = node.parentRef.level
+      if (node.treeLevel !== lvl + 1) {
+        throw new Error(
+          `“All at segment ${lvl + 1}” node "${node.recipeName}" must be exactly one segment deeper (expected segment ${lvl + 2}, got ${node.treeLevel + 1}).`,
+        )
+      }
+      const parents = drafts.filter((d) => d.treeLevel === lvl && !isFanOutNode(d))
       if (parents.length === 0) {
-        throw new Error(`No nodes at level ${node.parentRef.level} for “all parents at level”.`)
+        throw new Error(`No nodes at level ${lvl} for “all parents at level”.`)
       }
       for (const p of parents) {
         const pIdx = idToBatchIndex.get(p.clientId)
@@ -196,16 +243,34 @@ export function expandDraftsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSp
   return specs
 }
 
+/** One batch job per Phase-1 root: full pipeline, same video (no checkpoint tree). */
+export function expandSimpleRootsToBatchSpecs(drafts: DraftRun[]): ExpandedBatchRunSpec[] {
+  return drafts
+    .filter((d) => d.parentRef.kind === 'none')
+    .map((d) => ({
+      recipe_name: d.recipeName,
+      fields: d.fields,
+    }))
+}
+
 export function parentRefSummary(node: DraftRun, drafts: DraftRun[]): string {
-  if (node.parentRef.kind === 'none') return 'Root — full video from frame 0'
-  if (node.parentRef.kind === 'single') {
-    const p = drafts.find((d) => d.clientId === node.parentRef.parentClientId)
-    return p ? `Continues from: ${p.recipeName}` : 'Continues from: (missing parent)'
+  const pr = node.parentRef
+  switch (pr.kind) {
+    case 'none':
+      return 'Root — full video from frame 0'
+    case 'single': {
+      const p = drafts.find((d) => d.clientId === pr.parentClientId)
+      return p ? `Continues from: ${p.recipeName}` : 'Continues from: (missing parent)'
+    }
+    case 'all_roots': {
+      const n = drafts.filter((d) => d.parentRef.kind === 'none').length
+      return `One run per Phase-1 root (${n} parent${n === 1 ? '' : 's'})`
+    }
+    case 'all_at_level': {
+      const n = drafts.filter((d) => d.treeLevel === pr.level && !isFanOutNode(d)).length
+      return `One run per node at segment level ${pr.level + 1} (${n} parents)`
+    }
+    default:
+      return ''
   }
-  if (node.parentRef.kind === 'all_roots') {
-    const n = drafts.filter((d) => d.parentRef.kind === 'none').length
-    return `One run per Phase-1 root (${n} parent${n === 1 ? '' : 's'})`
-  }
-  const n = drafts.filter((d) => d.treeLevel === node.parentRef.level).length
-  return `One run per node at segment level ${node.parentRef.level + 1} (${n} parents)`
 }
