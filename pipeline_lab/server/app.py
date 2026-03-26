@@ -21,6 +21,7 @@ import os
 import time
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -151,6 +152,55 @@ def _scp_pull_remote_file(
     tmp.replace(dest)
 
 
+def _rsync_optuna_dir_from_remote(
+    *,
+    host: str,
+    user: str,
+    pem: Optional[str],
+    remote_optuna_dir: str,
+    dest_root: Path,
+) -> None:
+    """
+    Pull ``trial_*`` dirs and sweep JSON/logs from Lambda (same tree as ``auto_sweep``).
+
+    Excludes ``sweep.db`` (SQLite is owned by the running sweep on the GPU box).
+    """
+    dest_root.mkdir(parents=True, exist_ok=True)
+    rd = remote_optuna_dir.strip().rstrip("/") + "/"
+    remote_spec = f"{user}@{host}:{rd}"
+    ssh_e = "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+    if pem:
+        ssh_e += f" -i {shlex.quote(pem)}"
+    cmd: List[str] = [
+        "rsync",
+        "-avz",
+        "--exclude=sweep.db",
+        "--exclude=sweep.db.bak_*",
+        "-e",
+        ssh_e,
+        remote_spec,
+        str(dest_root) + "/",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            cwd=str(REPO_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="rsync timed out (large trial dirs?)") from None
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="rsync not found — install rsync (macOS: built-in)",
+        ) from None
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or "rsync failed"
+        raise HTTPException(status_code=502, detail=msg) from None
+
+
 class OptunaLambdaPullBody(BaseModel):
     """Optional overrides for advanced use; defaults are the primary Lambda + pose-tracking key."""
 
@@ -158,6 +208,17 @@ class OptunaLambdaPullBody(BaseModel):
     user: Optional[str] = None
     pem: Optional[str] = None
     remote_path: Optional[str] = None
+    sync_trial_artifacts: bool = Field(
+        False,
+        description=(
+            "When True, rsync remote output/sweeps/optuna/ (excluding sweep.db) after scp — "
+            "needed for per-trial MP4 previews in the UI."
+        ),
+    )
+    remote_optuna_dir: Optional[str] = Field(
+        None,
+        description="Override remote optuna directory (default ~/sway_pose_tracking/output/sweeps/optuna/).",
+    )
 
 
 def _safe_optuna_sequence_segment(name: str) -> bool:
@@ -801,7 +862,9 @@ def optuna_pull_lambda(body: OptunaLambdaPullBody = Body(default_factory=OptunaL
     ``~/.ssh/pose-tracking.pem`` / ``~/.ssh/pose-tracking`` when present. Override with ``SWAY_LAMBDA_SWEEP_HOST``,
     ``SWAY_LAMBDA_SWEEP_USER``, ``SWAY_LAMBDA_SWEEP_PEM``, ``SWAY_LAMBDA_SWEEP_REMOTE_PATH``, or optional JSON body.
     Set ``SWAY_LAMBDA_SWEEP_HOST`` to an empty value to disable scp (local JSON only). Writes into the Optuna sweep
-    root (``SWAY_OPTUNA_SWEEP_DIR`` or ``output/sweeps/optuna/``). Does **not** run a local sweep.
+    root (``SWAY_OPTUNA_SWEEP_DIR`` or ``output/sweeps/optuna/``). With ``sync_trial_artifacts: true`` (JSON body),
+    also runs ``rsync`` of the remote optuna directory (excluding ``sweep.db``) so ``trial_*`` MP4s exist locally for
+    the UI. Does **not** run a local sweep.
     """
     env_host = os.environ.get("SWAY_LAMBDA_SWEEP_HOST")
     if env_host is not None and not env_host.strip():
@@ -844,7 +907,28 @@ def optuna_pull_lambda(body: OptunaLambdaPullBody = Body(default_factory=OptunaL
 
     dest = _optuna_sweep_root() / "sweep_status.json"
     _scp_pull_remote_file(host=host, user=user, pem=pem, remote_path=remote, dest=dest)
-    return {"ok": True, "pulled": True, "wrote": str(dest)}
+    out: Dict[str, Any] = {
+        "ok": True,
+        "pulled": True,
+        "wrote": str(dest),
+        "synced_trial_artifacts": False,
+    }
+    if body.sync_trial_artifacts:
+        ro = (body.remote_optuna_dir or os.environ.get("SWAY_LAMBDA_SWEEP_REMOTE_OPTUNA_DIR") or "").strip()
+        if not ro:
+            ro = "~/sway_pose_tracking/output/sweeps/optuna/"
+        _validate_lambda_remote_path(ro)
+        root = _optuna_sweep_root()
+        _rsync_optuna_dir_from_remote(
+            host=host,
+            user=user,
+            pem=pem,
+            remote_optuna_dir=ro,
+            dest_root=root,
+        )
+        out["synced_trial_artifacts"] = True
+        out["dest_root"] = str(root)
+    return out
 
 
 @app.get("/api/optuna-sweep/status")

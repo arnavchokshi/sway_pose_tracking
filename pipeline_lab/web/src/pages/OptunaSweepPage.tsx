@@ -128,10 +128,11 @@ export function OptunaSweepPage() {
   const [pickedClip, setPickedClip] = useState<string | null>(null)
 
   /**
-   * 1) POST pull-lambda (scp from the Lab API’s configured Lambda → local sweep_status.json).
+   * 1) POST pull-lambda (scp ``sweep_status.json``; optional rsync ``trial_*`` for MP4s).
    * 2) GET status. Does **not** run ``auto_sweep`` on this machine.
    */
-  const sync = useCallback(async () => {
+  const sync = useCallback(async (opts?: { syncTrialArtifacts?: boolean }) => {
+    const syncTrialArtifacts = opts?.syncTrialArtifacts ?? false
     setLoading(true)
     setErr(null)
     let reachedStatusFetch = false
@@ -139,7 +140,7 @@ export function OptunaSweepPage() {
       const pr = await fetch(pullLambdaUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ sync_trial_artifacts: syncTrialArtifacts }),
       })
       const pj = await pr.json().catch(() => null)
       if (!pr.ok) {
@@ -164,7 +165,7 @@ export function OptunaSweepPage() {
   }, [])
 
   useEffect(() => {
-    sync()
+    sync({ syncTrialArtifacts: false })
   }, [sync])
 
   useEffect(() => {
@@ -175,7 +176,7 @@ export function OptunaSweepPage() {
   }, [data, sequence])
 
   useEffect(() => {
-    const id = window.setInterval(() => sync(), 8000)
+    const id = window.setInterval(() => sync({ syncTrialArtifacts: false }), 8000)
     return () => window.clearInterval(id)
   }, [sync])
 
@@ -242,14 +243,32 @@ export function OptunaSweepPage() {
           <p className="optuna-sweep-sub">
             <strong>Refresh</strong> pulls <code>sweep_status.json</code> from your gpu_1x_a10 box (
             <code>150.136.111.175</code>, key <code>pose-tracking</code>) via <code>scp</code>, then reloads the table.
-            Sweep runs on Lambda only. Change the IP/key in <code>pipeline_lab/server/app.py</code> or use{' '}
-            <code>SWAY_LAMBDA_SWEEP_*</code> env vars; set <code>SWAY_LAMBDA_SWEEP_HOST=</code> to disable pulls.
+            <strong> Full sync</strong> also <code>rsync</code>s <code>trial_*</code> folders (phase MP4s). Sweep runs on
+            Lambda only. Override IP/key via <code>SWAY_LAMBDA_SWEEP_*</code>; set <code>SWAY_LAMBDA_SWEEP_HOST=</code>{' '}
+            to disable pulls. Point the API at local data with <code>SWAY_OPTUNA_SWEEP_DIR</code> if needed.
           </p>
         </div>
-        <button type="button" className="btn primary optuna-refresh" onClick={() => sync()} disabled={loading}>
-          {loading ? <Loader2 className="optuna-spin" size={18} /> : <RefreshCw size={18} />}
-          Refresh
-        </button>
+        <div className="optuna-sweep-actions">
+          <button
+            type="button"
+            className="btn primary optuna-refresh"
+            onClick={() => sync({ syncTrialArtifacts: false })}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="optuna-spin" size={18} /> : <RefreshCw size={18} />}
+            Refresh
+          </button>
+          <button
+            type="button"
+            className="btn optuna-refresh"
+            onClick={() => sync({ syncTrialArtifacts: true })}
+            disabled={loading}
+            title="scp status + rsync trial_* dirs (slower; required for preview MP4s)"
+          >
+            {loading ? <Loader2 className="optuna-spin" size={18} /> : <Film size={18} />}
+            Full sync (MP4s)
+          </button>
+        </div>
       </div>
 
       {err ? (
@@ -270,9 +289,9 @@ export function OptunaSweepPage() {
           <h2>No sweep data (yet)</h2>
           {data.meta?.hint ? <p>{data.meta.hint}</p> : null}
           <p className="optuna-muted">
-            Hit <strong>Refresh</strong> to copy the latest snapshot from Lambda, or place <code>sweep_status.json</code>{' '}
-            under <code>output/sweeps/optuna/</code> (or set <code>SWAY_OPTUNA_SWEEP_DIR</code>). Trial preview MP4s
-            only play if those files exist locally (sync <code>trial_*</code> dirs separately if needed).
+            Hit <strong>Refresh</strong> for <code>sweep_status.json</code>, or <strong>Full sync (MP4s)</strong> to also
+            rsync <code>trial_*</code> from Lambda. You can also place files under <code>output/sweeps/optuna/</code> or
+            set <code>SWAY_OPTUNA_SWEEP_DIR</code> on the API process.
           </p>
         </div>
       ) : null}
