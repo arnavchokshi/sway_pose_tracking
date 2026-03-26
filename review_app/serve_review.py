@@ -8,7 +8,7 @@ Use this instead (works offline; no network required).
   cd sway_pose_mvp
   python review_app/serve_review.py output/flight_batch
 
-Then open: http://127.0.0.1:8899/review/index.html
+Then open: http://localhost:8899/review/index.html
 
 HTTP byte-range (206) is required for video scrubbing/seeking. Python 3.11's
 SimpleHTTPRequestHandler does not implement Range — this server adds it.
@@ -382,7 +382,7 @@ def main() -> None:
         if port != args.port:
             print(f"Note: port {args.port} was in use; using {port} instead.")
         print(f"Serving: {root}")
-        print(f"Open:  http://127.0.0.1:{port}/review/index.html")
+        print(f"Open:  http://localhost:{port}/review/index.html")
         print("Ctrl+C to stop")
         try:
             httpd.serve_forever()

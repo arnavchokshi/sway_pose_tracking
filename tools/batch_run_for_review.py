@@ -16,7 +16,7 @@ Large batch queue (default inbox layout):
 
 Afterwards open the review UI — for reliable video scrubbing offline, prefer:
   python review_app/serve_review.py output/flight_batch
-  → http://127.0.0.1:8899/review/index.html
+  → http://localhost:8899/review/index.html
 (or open output/.../review/index.html directly if your browser allows local video).
 
 With --skip-existing, you can re-run the same command after sleep/crash/interrupt:

@@ -5,10 +5,10 @@ Queue the curated pipeline matrix against a server-side video via the Pipeline L
 Requires the Lab API (uvicorn) running; the video path must exist on that machine.
 
   cd sway_pose_mvp
-  uvicorn pipeline_lab.server.app:app --host 127.0.0.1 --port 8765
+  uvicorn pipeline_lab.server.app:app --host localhost --port 8765
 
   python -m tools.pipeline_matrix_runs --video /path/to/clip.mp4
-  python -m tools.pipeline_matrix_runs --video /path/to/clip.mp4 --lab-url http://127.0.0.1:8765
+  python -m tools.pipeline_matrix_runs --video /path/to/clip.mp4 --lab-url http://localhost:8765
   python -m tools.pipeline_matrix_runs --video clip.mp4 --only baseline,tracker_deep_ocsort_osnet,sam_off
   python -m tools.pipeline_matrix_runs --dry-run
 
@@ -78,7 +78,7 @@ def main() -> None:
     ap.add_argument(
         "--lab-url",
         type=str,
-        default="http://127.0.0.1:8765",
+        default="http://localhost:8765",
         help="Pipeline Lab base URL (no trailing slash)",
     )
     ap.add_argument(

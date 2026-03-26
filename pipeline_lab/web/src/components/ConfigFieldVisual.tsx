@@ -36,15 +36,15 @@ export function OverlapPairVisual({
         alignItems: 'center',
         justifyContent: 'center',
         gap,
-        height: 44,
-        marginBottom: 6,
+        height: 36,
+        marginBottom: 4,
       }}
       aria-hidden
     >
       <div
         style={{
-          width: 36,
-          height: 36,
+          width: 30,
+          height: 30,
           borderRadius: 6,
           border: '2px solid rgba(6, 182, 212, 0.85)',
           background: 'rgba(6, 182, 212, 0.12)',
@@ -53,8 +53,8 @@ export function OverlapPairVisual({
       />
       <div
         style={{
-          width: 36,
-          height: 36,
+          width: 30,
+          height: 30,
           borderRadius: 6,
           border: '2px solid rgba(236, 72, 153, 0.85)',
           background: 'rgba(236, 72, 153, 0.1)',

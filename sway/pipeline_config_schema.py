@@ -17,8 +17,11 @@ Phase 4 (pre-pose prune) has no Lab stage: YAML knobs are master-locked (see
 Tier C / Tier A span / selected Tier B thresholds and three pruning weights are
 master-locked for Phase 8 (``MASTER_LOCKED_POST_POSE_PRUNE_*``); sync, vote
 threshold, mirror, and low-conf weights stay tunable.
-Phase 9 locks ``SMOOTHER_MIN_CUTOFF`` and ``SWAY_TEMPORAL_POSE_RADIUS`` (neighbor-blend
-window); ``SMOOTHER_BETA`` and the neighbor-blend on/off toggle stay tunable.
+Phase 9 locks ``SMOOTHER_MIN_CUTOFF``, ``SWAY_TEMPORAL_POSE_RADIUS`` (neighbor-blend window
+when enabled), and **neighbor blend off** (``SWAY_TEMPORAL_POSE_REFINE``); ``SMOOTHER_BETA``
+stays tunable. Lab UI hides the neighbor-blend toggle; batch/matrix YAML may still set
+``temporal_pose_refine: true`` and the Lab worker honors it. Use ``SWAY_UNLOCK_SMOOTH_TUNING=1`` to override
+locked cutoff/radius from CLI or to tune without the fixed stack.
 """
 
 from __future__ import annotations
@@ -108,15 +111,17 @@ def freeze_lab_subprocess_phase3_stitch_env(env: Dict[str, str]) -> None:
 
 # Phase 5 pose stack (ViTPose path + 3D lift). ``pose_model`` / visibility stay in the Lab UI; pose stride is fixed
 # to every frame for Lab (see ``pose_stride`` + ``lab_hidden`` in ``PIPELINE_PARAM_FIELDS``).
-# Set ``SWAY_UNLOCK_POSE_TUNING=1`` for smoke (3D off, chunked ViTPose) or FP32 A/B.
+# Set ``SWAY_UNLOCK_POSE_TUNING=1`` for smoke (3D off, chunked ViTPose) or FP32 A/B. Smart pad is not
+# then forced to ``1``; ``vitpose_smart_pad_enabled()`` still defaults on unless ``SWAY_VITPOSE_SMART_PAD=0``.
 def apply_master_locked_pose_env() -> None:
-    """Unset chunked ViTPose cap; FP32 off; 3D lift on."""
+    """Unset chunked ViTPose cap; FP32 off; 3D lift on; ViTPose smart bbox pad on."""
     v = os.environ.get("SWAY_UNLOCK_POSE_TUNING", "").strip().lower()
     if v in ("1", "true", "yes"):
         return
     os.environ.pop("SWAY_VITPOSE_MAX_PER_FORWARD", None)
     os.environ["SWAY_VITPOSE_FP32"] = "0"
     os.environ["SWAY_3D_LIFT"] = "1"
+    os.environ["SWAY_VITPOSE_SMART_PAD"] = "1"
 
 
 def freeze_lab_subprocess_pose_env(env: Dict[str, str]) -> None:
@@ -124,6 +129,7 @@ def freeze_lab_subprocess_pose_env(env: Dict[str, str]) -> None:
     env.pop("SWAY_VITPOSE_MAX_PER_FORWARD", None)
     env["SWAY_VITPOSE_FP32"] = "0"
     env["SWAY_3D_LIFT"] = "1"
+    env["SWAY_VITPOSE_SMART_PAD"] = "1"
 
 
 # Phase 4 YAML keys that ``main.py`` reads from ``params`` for pre-pose pruning. Pipeline Lab does
@@ -169,8 +175,9 @@ def apply_master_locked_reid_dedup_params(params: Dict[str, Any]) -> None:
 
 
 # Phase 8 post-pose prune: Tier C, Tier A span, Tier B garbage thresholds, and three vote weights.
-# Set ``SWAY_UNLOCK_POST_POSE_PRUNE_TUNING=1`` for sweeps. Remaining Lab fields: ``SYNC_SCORE_MIN``,
-# ``PRUNE_THRESHOLD``, ``pruning_w_low_sync``, ``pruning_w_smart_mirror``, ``pruning_w_low_conf``.
+# Set ``SWAY_UNLOCK_POST_POSE_PRUNE_TUNING=1`` for sweeps. ``PRUNE_THRESHOLD`` is fixed in the Lab UI
+# (see ``LAB_UI_ENFORCED_DEFAULTS``). Remaining tunable YAML (advanced / unlock): ``SYNC_SCORE_MIN``,
+# ``pruning_w_low_sync``, ``pruning_w_smart_mirror``, ``pruning_w_low_conf``.
 MASTER_LOCKED_POST_POSE_PRUNE_SCALAR_PARAMS: Dict[str, Any] = {
     "CONFIRMED_HUMAN_MIN_SPAN_FRAC": 0.10,
     "TIER_C_SKELETON_MEAN": 0.15,
@@ -205,14 +212,15 @@ def apply_master_locked_post_pose_prune_params(params: Dict[str, Any]) -> None:
     params["PRUNING_WEIGHTS"] = merged
 
 
-# Phase 9: 1-Euro min cutoff (YAML) + temporal keypoint refine radius (env overrides CLI in ``temporal_pose_radius()``).
-# Set ``SWAY_UNLOCK_SMOOTH_TUNING=1`` for sweeps / wider neighbor windows.
+# Phase 9: 1-Euro min cutoff (YAML) + temporal keypoint refine radius + neighbor blend off (env).
+# Set ``SWAY_UNLOCK_SMOOTH_TUNING=1`` for sweeps, wider neighbor windows, or forcing neighbor blend on from CLI.
 MASTER_LOCKED_SMOOTH_PARAMS: Dict[str, Any] = {
     "SMOOTHER_MIN_CUTOFF": 1.0,
 }
 
 MASTER_LOCKED_SMOOTH_ENV: Dict[str, str] = {
     "SWAY_TEMPORAL_POSE_RADIUS": "2",
+    "SWAY_TEMPORAL_POSE_REFINE": "0",
 }
 
 
@@ -225,7 +233,7 @@ def apply_master_locked_smooth_params(params: Dict[str, Any]) -> None:
 
 
 def apply_master_locked_smooth_env() -> None:
-    """Force neighbor-blend radius on ``os.environ`` (see ``temporal_pose_radius()``)."""
+    """Force neighbor-blend radius and ``SWAY_TEMPORAL_POSE_REFINE=0`` on ``os.environ``."""
     v = os.environ.get("SWAY_UNLOCK_SMOOTH_TUNING", "").strip().lower()
     if v in ("1", "true", "yes"):
         return
@@ -233,77 +241,50 @@ def apply_master_locked_smooth_env() -> None:
         os.environ[key] = val
 
 
-def freeze_lab_subprocess_smooth_env(env: Dict[str, str]) -> None:
-    """Lab API: apply master Phase 9 env (temporal pose radius) to the child process."""
+def freeze_lab_subprocess_smooth_env(env: Dict[str, str], fields: Dict[str, Any] | None = None) -> None:
+    """Lab API: apply master Phase 9 env to the child process.
+
+    Neighbor blend defaults **off** (``SWAY_TEMPORAL_POSE_REFINE=0``). When ``fields`` is
+    provided and ``temporal_pose_refine`` is true (matrix / tree recipes), set ``...=1`` so
+    ``--temporal-pose-refine`` is not overridden.
+    """
     v = os.environ.get("SWAY_UNLOCK_SMOOTH_TUNING", "").strip().lower()
     if v in ("1", "true", "yes"):
         return
-    for key, val in MASTER_LOCKED_SMOOTH_ENV.items():
-        env[key] = val
+    env["SWAY_TEMPORAL_POSE_RADIUS"] = MASTER_LOCKED_SMOOTH_ENV["SWAY_TEMPORAL_POSE_RADIUS"]
+    if fields and fields.get("temporal_pose_refine") is True:
+        env["SWAY_TEMPORAL_POSE_REFINE"] = "1"
+    else:
+        env["SWAY_TEMPORAL_POSE_REFINE"] = MASTER_LOCKED_SMOOTH_ENV["SWAY_TEMPORAL_POSE_REFINE"]
 
 
-# Ordered stages: ``main_phases`` drives Lab flowchart captions (printed phase names + main.py
-# [n/11]) aligned with ``docs/MASTER_PIPELINE_GUIDELINE.md`` §5.
+# Intent-based Lab stages (end-user grouping). Technical ``main.py`` phases are documented in
+# ``docs/MASTER_PIPELINE_GUIDELINE.md``; field rows still carry legacy phase semantics in code comments.
 PIPELINE_STAGES: List[Dict[str, Any]] = [
     {
-        "id": "detection",
-        "label": "Spotting people in the video",
-        "short": "Spot people",
+        "id": "crowd_control",
+        "label": "Crowd control — how aggressively we find people",
+        "short": "Crowd",
+        # Printed phases in main.py progress [n/11] — see docs/MASTER_PIPELINE_GUIDELINE.md §5
         "main_phases": "1–2",
     },
     {
-        "id": "tracking",
-        "label": "Keeping the same label on each dancer",
-        "short": "Track IDs",
-        "main_phases": "1–2",
+        "id": "handshake",
+        "label": "The handshake — collisions, memory, and cross-clip identity",
+        "short": "Handshake",
+        "main_phases": "1–3, 6–7",
     },
     {
-        "id": "hybrid_sam",
-        "label": "Sharper boxes when dancers touch or overlap",
-        "short": "Overlap",
-        "main_phases": "1–2",
+        "id": "pose_polish",
+        "label": "Pose & polish — skeleton detail and motion feel",
+        "short": "Pose",
+        "main_phases": "5, 9",
     },
     {
-        "id": "phase3_stitch",
-        "label": "Merging broken IDs across the clip",
-        "short": "Merge IDs",
-        "main_phases": "3",
-    },
-    {
-        "id": "pose",
-        "label": "Estimating body pose (joints)",
-        "short": "Body pose",
-        "main_phases": "5",
-    },
-    {
-        "id": "reid_dedup",
-        "label": "Fixing wrong IDs and duplicate outlines",
-        "short": "Fix IDs",
-        "main_phases": "6–7",
-    },
-    {
-        "id": "post_pose_prune",
-        "label": "Dropping weak or fake skeletons",
-        "short": "Skeleton cleanup",
-        "main_phases": "8",
-    },
-    {
-        "id": "smooth",
-        "label": "Smoothing shaky joints over time",
-        "short": "Smoothing",
-        "main_phases": "9",
-    },
-    {
-        "id": "scoring",
-        "label": "Computing dance sync and shape scores",
-        "short": "Scoring",
-        "main_phases": "10",
-    },
-    {
-        "id": "export",
-        "label": "Saving your outputs",
+        "id": "cleanup_export",
+        "label": "Cleanup & export",
         "short": "Export",
-        "main_phases": "11",
+        "main_phases": "8, 10–11",
     },
 ]
 
@@ -428,7 +409,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         "detection",
         "How aggressively to merge overlapping boxes",
         "float",
-        0.50,
+        0.75,
         binding="env",
         key="SWAY_PRETRACK_NMS_IOU",
         min_=0.40,
@@ -490,8 +471,8 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         display="segmented",
         description=(
             "When YOLO runs every Nth frame, skipped frames get filled boxes before pose. "
-            "Linear is the long-standing default. GSI uses a light Gaussian (RBF) smoother between anchors "
-            "(also used when stitching track fragments). Off by default path = linear."
+            "**Linear** (default) is the choreography-grade choice per the Pose tab verdict; GSI is optional smoothing "
+            "between anchors (also used when stitching track fragments), not a substitute for dense detection cadence."
         ),
     ),
     # --- tracking (main.py phase 2) ---
@@ -506,7 +487,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         description=(
             "After each frame knows where people are, this step decides “this box is still dancer 3.” "
             "Deep OC-SORT is tuned for dance. You can add track-time OSNet appearance matching when outfits differ. "
-            "Overlap sharpening (next tab) runs on this path."
+            "Overlap sharpening (IoU trigger and optional weak-cue gate below) runs on this same path."
         ),
     ),
     _f(
@@ -524,6 +505,26 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "**Default:** Deep OC-SORT with motion/IoU association (no track-time Re-ID). "
             "**+ OSNet:** same tracker with OSNet embeddings during tracking — better through crosses/occlusions "
             "when outfits look different; prefetch ``models/osnet_x0_25_msmt17.pt`` (or set weights via advanced preset)."
+        ),
+    ),
+    _f(
+        "sway_phase13_mode",
+        "tracking",
+        "Phases 1–3 strategy (detection → track → stitch)",
+        "enum",
+        "standard",
+        binding="env",
+        key="SWAY_PHASE13_MODE",
+        choices=["standard", "dancer_registry", "sway_handshake"],
+        tier=1,
+        display="phase13_mode_cards",
+        description=(
+            "**Standard:** Baseline YOLO + Deep OC-SORT + hybrid SAM when overlap exceeds your IoU trigger + master-locked stitch. "
+            "**Dancer registry (experimental):** Same hybrid SAM / overlap machinery as standard unless you change env; adds "
+            "zonal HSV crossover verify and appearance-based dormant relink (full video scans — see ``docs/PHASE13_LAB_STRATEGIES.md``). "
+            "Recipe preset tightens pre-track NMS and pins DanceTrack weights + ViTPose-Base. "
+            "**Sway handshake (experimental):** Open-floor zonal registry + optional Hungarian reorder of SAM det rows; "
+            "Lab server forces hybrid IoU trigger **0.10** and weak cues **off** at enqueue."
         ),
     ),
     _f(
@@ -553,8 +554,9 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         advanced=True,
         tier=3,
         description=(
-            "Default off. When on, ``main.py`` runs an optional post-stitch hook (identity today — logs once). "
-            "Reserved for future graph-based ID association inside the pipeline."
+            "Default off. When on, ``main.py`` runs post-stitch **graph refinement**: edge-conditioned multi-head GAT "
+            "over trajectories + link logits (structural prior + optional ``SWAY_GNN_WEIGHTS``). "
+            "Tune ``SWAY_GNN_MERGE_THRESH``, ``SWAY_GNN_MAX_GAP``, etc. See ``sway/gnn_track_refine.py``."
         ),
     ),
     _f(
@@ -600,21 +602,20 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         "osnet_x0_25",
         binding="reid_model_preset",
         key="",
-        choices=["osnet_x0_25", "osnet_x1_0"],
+        choices=["osnet_x0_25"],
         visible_when_field="tracker_technology",
         visible_when_value="deep_ocsort_osnet",
         advanced=True,
         tier=2,
         description=(
-            "Used only when **+ OSNet** is selected. ``osnet_x0_25`` is the default download from "
-            "``python -m tools.prefetch_models``; ``osnet_x1_0`` is heavier if you place "
-            "``models/osnet_x1_0_msmt17.pt`` on disk."
+            "Used only when **+ OSNet** is selected. ``osnet_x0_25`` (lightweight) is the preset "
+            "from ``python -m tools.prefetch_models`` → ``models/osnet_x0_25_msmt17.pt``."
         ),
     ),
-    # --- hybrid_sam (runs inside the phase 1–2 pass; BoxMOT only) ---
+    # --- overlap / hybrid SAM (same Lab step as tracking; runs inside phases 1–2; BoxMOT only) ---
     _f(
         "info_hybrid_sam_master_locked",
-        "hybrid_sam",
+        "tracking",
         "Lock these down (set and forget)",
         "info",
         None,
@@ -634,25 +635,26 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     ),
     _f(
         "sway_hybrid_sam_iou_trigger",
-        "hybrid_sam",
+        "tracking",
         "How much overlap before the extra pass runs",
         "float",
         0.42,
         binding="env",
         key="SWAY_HYBRID_SAM_IOU_TRIGGER",
-        min_=0.25,
+        min_=0.10,
         max_=0.65,
         tier=1,
         display="slider",
         description=(
             "Higher = only very overlapped pairs get fixed (faster, less segmentation). "
             "Lower = fix sooner (slower, cleaner lifts and partner work). "
+            "Sway Handshake preset uses **0.10** (IoU custody trigger). "
             "With ROI crop on, lower values are cheaper than full-frame SAM."
         ),
     ),
     _f(
         "sway_hybrid_sam_weak_cues",
-        "hybrid_sam",
+        "tracking",
         "Skip SAM when overlap is high but boxes match the last frame",
         "bool",
         False,
@@ -667,7 +669,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     ),
     _f(
         "sway_hybrid_weak_conf_delta",
-        "hybrid_sam",
+        "tracking",
         "Weak cue: max |Δ confidence| vs matched previous box",
         "float",
         0.08,
@@ -683,7 +685,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     ),
     _f(
         "sway_hybrid_weak_height_frac",
-        "hybrid_sam",
+        "tracking",
         "Weak cue: max relative height change vs matched previous box",
         "float",
         0.12,
@@ -699,7 +701,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     ),
     _f(
         "sway_hybrid_weak_match_iou",
-        "hybrid_sam",
+        "tracking",
         "Weak cue: min IoU to match a box to the previous frame",
         "float",
         0.25,
@@ -785,6 +787,21 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
     ),
     # --- pose (main.py phase 5) ---
     _f(
+        "info_pose_choreography_verdict",
+        "pose",
+        "Master verdict: cadence & interpolation",
+        "info",
+        None,
+        binding="none",
+        key="",
+        description=(
+            "**The Verdict:** Kill the GSI Speed Cheat. Your choreography is too fast and complex to skip frames.\n\n"
+            "**The Lock:** Permanently lock in ``pose_stride`` = **1** (every single frame in the Lab) and keep "
+            "your interpolation on **linear** (the default)—box stride gaps, pose gap fill (CLI stride 2 only), "
+            "and export video tween."
+        ),
+    ),
+    _f(
         "info_pose_models",
         "pose",
         "What this step does",
@@ -818,7 +835,8 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         description=(
             "ViTPose+: larger = usually better on hard motion, slower. "
             "RTMPose-L needs MMPose (see requirements-rtmpose.txt). "
-            "**Sapiens** slot uses ViTPose-Base keypoints until a native Sapiens backend is added in code."
+            "**Sapiens** slot: set ``SWAY_SAPIENS_TORCHSCRIPT`` to a COCO-17 ``.pt2`` on the API host for native "
+            "TorchScript; otherwise ViTPose-Base keypoints."
         ),
     ),
     _f(
@@ -830,7 +848,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         binding="none",
         key="",
         description=(
-            "**Sapiens** is selectable as a pose card (runs ViTPose-Base until native Sapiens is wired). "
+            "**Sapiens** pose card: native when ``SWAY_SAPIENS_TORCHSCRIPT`` points to a ``.pt2`` file, else ViTPose-Base. "
             "**GNN** refine flag lives under Tracking. **HMR** mesh placeholder JSON is under Export. "
             "Regression tests: ``python -m tools.golden_bench`` from a terminal (not a Lab toggle)."
         ),
@@ -848,8 +866,8 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         display="segmented",
         lab_hidden=True,
         description=(
-            "Every frame = smoothest overlays, slowest. "
-            "Every other frame = about twice as fast; missing frames are filled in later so playback still looks continuous."
+            "The Lab **locks** skeleton estimation to **every frame** (``pose_stride`` **1**) per the Pose tab verdict. "
+            "CLI or batch matrices may still use stride 2; that path is for experiments, not choreography-grade truth."
         ),
     ),
     _f(
@@ -867,10 +885,10 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         visible_when_field="pose_stride",
         visible_when_value=2,
         description=(
-            "Only matters with “every other frame” pose. Linear is the long-standing default. "
-            "GSI uses the same RBF smoother as optional box paths; lengthscale is SWAY_GSI_LENGTHSCALE "
-            "(detection advanced when box mode is GSI), or set SWAY_POSE_GSI_LENGTHSCALE in params YAML "
-            "to override for pose gaps only."
+            "Only matters with “every other frame” pose (CLI / matrices—not the Lab). **Linear** (default) aligns "
+            "with the Pose tab verdict; GSI uses the same RBF smoother as optional box paths; lengthscale is "
+            "SWAY_GSI_LENGTHSCALE (detection advanced when box mode is GSI), or set SWAY_POSE_GSI_LENGTHSCALE "
+            "in params YAML to override for pose gaps only."
         ),
     ),
     _f(
@@ -885,12 +903,15 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
             "The master pipeline fixes these for every run — they are **not** configurable in the Lab UI. "
             "``main.py`` reapplies them after ``params`` YAML. For fast smoke (no 3D, chunked ViTPose) or "
             "deliberate FP32 tests, set ``SWAY_UNLOCK_POSE_TUNING=1``.\n\n"
-            "**Skeleton cadence:** **every frame** (``pose_stride`` **1**) — the Lab does not expose stride; "
-            "use ``--pose-stride 2`` from CLI or batch matrices if you need every-other-frame pose.\n\n"
+            "**Skeleton cadence:** **every frame** (``pose_stride`` **1**) — matches **The Lock** on the Pose tab; "
+            "the Lab does not expose stride. Use ``--pose-stride 2`` only from CLI or batch matrices for A/B tests, "
+            "not as a production shortcut for fast choreography.\n\n"
             "**Max people per ViTPose GPU forward:** **0** (cap **unset**) — one natural batch per frame; "
             "only raise the cap if 40+ people routinely OOM your GPU.\n\n"
             "**Force ViTPose float32 on GPU:** **Off** — FP16 when the device allows; FP32 is much slower/heavier "
             "for negligible joint gains.\n\n"
+            "**Smart bbox pad before ViTPose:** **On** — asymmetric / motion-aware crop expansion (``SWAY_VITPOSE_SMART_PAD``); "
+            "see §9.0.1 in ``docs/MASTER_PIPELINE_GUIDELINE.md``.\n\n"
             "**Add a simple depth view (3D):** **On** — runs Phase 10 lifting for depth-aware scoring and the 3D viewer; "
             "use ``SWAY_UNLOCK_POSE_TUNING=1`` and ``SWAY_3D_LIFT=0`` only if you truly want flat 2D-only export."
         ),
@@ -1107,7 +1128,7 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         description=(
             "Raw joints can wiggle frame to frame. "
             "This pass steadies them so overlays and scores look human without killing real sharp hits. "
-            "Optional neighbor blending further softens noise using a few frames on either side."
+            "Neighbor-frame blending before this step is **off** in the master stack (sharper hits); see the lock note below."
         ),
     ),
     _f(
@@ -1119,27 +1140,29 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         binding="none",
         key="",
         description=(
-            "The master pipeline fixes two numbers for every run — they are **not** in the Lab UI. "
+            "The master pipeline fixes these for every run — they are **not** in the Lab UI. "
             "``main.py`` reapplies them after ``params`` YAML / Lab build. For deliberate experiments "
-            "(e.g. wider neighbor blend), set ``SWAY_UNLOCK_SMOOTH_TUNING=1``.\n\n"
+            "(e.g. neighbor blend on, wider half-window), set ``SWAY_UNLOCK_SMOOTH_TUNING=1``.\n\n"
+            "**Neighbor blend (Phase 5):** **off** — ``SWAY_TEMPORAL_POSE_REFINE`` forced **0** on CLI runs; "
+            "batch recipes may still pass ``temporal_pose_refine: true`` from the Lab worker.\n\n"
             "**Baseline smoothness (**``SMOOTHER_MIN_CUTOFF``**):** **1.0** — tuned to kill micro-jitter when "
             "someone is nearly still without freezing joints.\n\n"
-            "**Neighbor blend half-window:** radius **2** (``SWAY_TEMPORAL_POSE_RADIUS``) — if neighbor blend "
-            "is on, raising this smears many frames together (“underwater” motion); keep the default."
+            "**Neighbor blend half-window (when enabled):** radius **2** (``SWAY_TEMPORAL_POSE_RADIUS``) — "
+            "raising it smears many frames together (“underwater” motion); keep the default."
         ),
     ),
     _f(
         "temporal_pose_refine",
         "smooth",
-        "Blend each joint with nearby frames",
+        "Smooth skeletons (fluid vs sharp)",
         "bool",
-        True,
+        False,
         binding="cli",
         key="temporal_pose_refine",
         tier=1,
         description=(
-            "Looks a few frames before/after and nudges shaky points toward a local average. "
-            "Turn off for fastest runs or when you want maximum raw responsiveness."
+            "**On (fluid):** light neighbor-frame blend — often nicer for ballet and contemporary. "
+            "**Off (sharp):** snappier hits for hip-hop and popping. One-Euro smoothing still runs after this step."
         ),
     ),
     _f(
@@ -1209,8 +1232,8 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         display="segmented",
         description=(
             "Final MP4s can run at native FPS while pose/boxes are stored at processed rate—this chooses how to blend "
-            "in between. Linear is default. GSI is optional; lengthscale uses SWAY_GSI_LENGTHSCALE or "
-            "SWAY_VIS_GSI_LENGTHSCALE in YAML."
+            "in between. **Linear** (default) matches the Pose tab verdict; GSI is optional video-only smoothing; "
+            "lengthscale uses SWAY_GSI_LENGTHSCALE or SWAY_VIS_GSI_LENGTHSCALE in YAML."
         ),
     ),
     _f(
@@ -1229,6 +1252,70 @@ PIPELINE_PARAM_FIELDS: List[Dict[str, Any]] = [
         ),
     ),
 ]
+
+# --- Lab UI: intent-based “Sway” panel (see PIPELINE_STAGES); everything else is master-hidden in the UI. ---
+_LEAN_VISIBLE_IDS = frozenset(
+    {
+        "sway_yolo_weights",
+        "sway_phase13_mode",
+        "sway_pretrack_nms_iou",
+        "sway_yolo_conf",
+        "sway_hybrid_sam_iou_trigger",
+        "sway_boxmot_max_age",
+        "sway_global_aflink_mode",
+        "pose_model",
+        "temporal_pose_refine",
+    }
+)
+
+_LEGACY_PHASE_TO_INTENT = {
+    "detection": "crowd_control",
+    "tracking": "handshake",
+    "phase3_stitch": "handshake",
+    "pose": "pose_polish",
+    "reid_dedup": "handshake",
+    "post_pose_prune": "cleanup_export",
+    "smooth": "pose_polish",
+    "scoring": "cleanup_export",
+    "export": "cleanup_export",
+}
+
+# ``sway_phase13_mode`` is omitted: Lab API ``_effective_ui_fields`` applies these after client fields;
+# locking it to standard would ignore Dancer registry / Sway handshake on every enqueue.
+_UI_LOCK_DEFAULTS: Dict[str, Any] = {
+    "tracker_technology": "deep_ocsort",
+    "sway_boxmot_reid_model": "osnet_x0_25",
+    "sway_yolo_detection_stride": 1,
+    "pose_stride": 1,
+    "sway_box_interp_mode": "linear",
+    "sway_vis_temporal_interp_mode": "linear",
+    "sway_gnn_track_refine": False,
+    "sway_hybrid_sam_weak_cues": False,
+    "sway_hybrid_weak_conf_delta": 0.08,
+    "sway_hybrid_weak_height_frac": 0.12,
+    "sway_hybrid_weak_match_iou": 0.25,
+    # Post-pose cleanup vote + export outputs (no Lab sliders/toggles).
+    "prune_threshold": 0.65,
+    "montage": False,
+    "save_phase_previews": True,
+}
+
+# Applied server-side to every Lab run / config merge so hidden master locks stay consistent.
+LAB_UI_ENFORCED_DEFAULTS: Dict[str, Any] = dict(_UI_LOCK_DEFAULTS)
+
+for _row in PIPELINE_PARAM_FIELDS:
+    _fid = _row["id"]
+    _row["phase"] = _LEGACY_PHASE_TO_INTENT.get(str(_row.get("phase") or ""), "crowd_control")
+    if _fid in _UI_LOCK_DEFAULTS:
+        _row["default"] = _UI_LOCK_DEFAULTS[_fid]
+    if _row.get("type") == "info":
+        _row["lab_hidden"] = True
+    elif _fid in _LEAN_VISIBLE_IDS:
+        _row["lab_hidden"] = False
+        _row["tier"] = 1
+        _row["advanced"] = False
+    else:
+        _row["lab_hidden"] = True
 
 
 def schema_payload() -> Dict[str, Any]:

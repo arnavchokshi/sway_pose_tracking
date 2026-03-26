@@ -8,7 +8,8 @@ Curated pipeline A/B recipes for comparing one stage at a time.
   - ViTPose batch cap, FP32, and 3D lift are **master-locked** (§9.0.1); model size and pose stride remain matrix-safe.
   - Phase 6–7 re-ID frame gap, OKS merge threshold, and the three collocated-dedup distance gates are **master-locked** (§11.0.1).
   - Phase 8 Tier C / Tier A span / garbage thresholds and three Tier B weights (completeness, head-only, jittery) are **master-locked** (§13.0.1).
-  - Phase 9 ``SMOOTHER_MIN_CUTOFF`` and neighbor-blend radius (``SWAY_TEMPORAL_POSE_RADIUS``) are **master-locked** (§14.0.1).
+  - Phase 9 ``SMOOTHER_MIN_CUTOFF``, neighbor-blend radius (``SWAY_TEMPORAL_POSE_RADIUS``), and **neighbor blend off**
+    (``SWAY_TEMPORAL_POSE_REFINE``) are **master-locked** on CLI (§14.0.1); Lab batch rows may still set ``temporal_pose_refine: true``.
 
 Everything else follows Lab defaults except the **single axis** each row documents
 (or a minimal pair when one knob only applies with another, e.g. stride-2 detection + box GSI vs. linear).
@@ -31,7 +32,7 @@ class MatrixRecipe(TypedDict, total=False):
     fields: Dict[str, Any]
 
 
-PIPELINE_MATRIX_VERSION = 10
+PIPELINE_MATRIX_VERSION = 11
 
 # Enforced on every row so matrix runs never swap detector weights.
 _PROVEN_DETECTION_SAM: Dict[str, Any] = {
@@ -43,7 +44,7 @@ PIPELINE_MATRIX_INTRO = (
     "long-range merge / AFLink thresholds are master-locked (§7.0.1); ViTPose cap, FP32, and 3D lift are "
     "master-locked (§9.0.1); Phase 6–7 re-ID gap / OKS / dedup distance triple-gate are master-locked (§11.0.1); "
     "Phase 8 Tier C + garbage baseline + three prune weights are master-locked (§13.0.1); "
-    "Phase 9 1-Euro min cutoff + temporal blend radius are master-locked (§14.0.1) — "
+    "Phase 9 1-Euro min cutoff + temporal blend radius + neighbor blend off are master-locked on CLI (§14.0.1) — "
     "compare ``pose_model``, ``pose_stride``, and gap interpolation instead. "
     "Each row changes only one other knob vs. the default dance stack (Deep OC-SORT without track-time OSNet, "
     "ViTPose-Base, pose stride 1). "
@@ -114,11 +115,11 @@ PIPELINE_MATRIX_RECIPES: List[MatrixRecipe] = [
         {"pose_stride": 2, "sway_pose_gap_interp_mode": "gsi"},
     ),
     _row(
-        "no_temporal_kp",
-        "M10_no_temporal_kp_refine",
+        "temporal_kp_on",
+        "M10_temporal_kp_refine_on",
         "pose",
-        "Disable neighbor-frame keypoint blend before 1-Euro.",
-        {"temporal_pose_refine": False},
+        "Enable neighbor-frame keypoint blend before 1-Euro vs. master default (off).",
+        {"temporal_pose_refine": True},
     ),
     _row(
         "boxmot_match_strict",
@@ -152,7 +153,7 @@ PIPELINE_MATRIX_RECIPES: List[MatrixRecipe] = [
     _row(
         "hybrid_sam_weak_cues",
         "M15_hybrid_SAM_weak_cues",
-        "hybrid_sam",
+        "tracking",
         "Hybrid-SORT-style skip gate when overlap is stable — faster SAM phase vs. default always-evaluate overlap.",
         {"sway_hybrid_sam_weak_cues": True},
     ),

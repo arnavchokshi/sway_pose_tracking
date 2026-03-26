@@ -1,12 +1,7 @@
 import { useEffect, useRef, useMemo } from 'react'
 
-const PALETTE = [
-  '#0ea5e9', // blue
-  '#06b6d4', // cyan
-  '#8b5cf6', // purple
-  '#ec4899', // pink
-  '#10b981'  // emerald
-]
+/** Muted slate / cool-gray only — keeps the viz readable, not rainbow */
+const PALETTE = ['#64748b', '#6b7280', '#788396', '#5c6b7a', '#7d8694']
 
 type Metrics = {
   numNodes: number
@@ -216,12 +211,12 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
       
       ctx.clearRect(0, 0, w, h)
       
-      // Draw background super subtle multi-color glow
+      // Subtle neutral vignette (intensity still tracks workload)
       const cx = w * 0.5
       const cy = h * 0.5
-      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.8)
-      grad.addColorStop(0, `rgba(14, 165, 233, ${m.glowAlpha * 0.15})`)
-      grad.addColorStop(0.5, `rgba(139, 92, 246, ${m.glowAlpha * 0.05})`)
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.85)
+      grad.addColorStop(0, `rgba(100, 116, 139, ${m.glowAlpha * 0.12})`)
+      grad.addColorStop(0.55, `rgba(71, 85, 105, ${m.glowAlpha * 0.04})`)
       grad.addColorStop(1, 'rgba(0,0,0,0)')
       
       ctx.fillStyle = grad
@@ -278,13 +273,12 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
         ctx.moveTo(node.x, node.y)
         ctx.lineTo(other.x, other.y)
         
-        // Dynamic gradient between the two connected nodes' colors
         const linkGrad = ctx.createLinearGradient(node.x, node.y, other.x, other.y)
         const [r1, g1, b1] = rgbCache[node.colorIndex]
         const [r2, g2, b2] = rgbCache[other.colorIndex]
-        
-        linkGrad.addColorStop(0, `rgba(${r1}, ${g1}, ${b1}, ${alpha * (0.2 + m.glowAlpha * 0.4)})`)
-        linkGrad.addColorStop(1, `rgba(${r2}, ${g2}, ${b2}, ${alpha * (0.2 + m.glowAlpha * 0.4)})`)
+        const baseA = alpha * (0.12 + m.glowAlpha * 0.22)
+        linkGrad.addColorStop(0, `rgba(${r1}, ${g1}, ${b1}, ${baseA})`)
+        linkGrad.addColorStop(1, `rgba(${r2}, ${g2}, ${b2}, ${baseA})`)
         
         ctx.strokeStyle = linkGrad
         ctx.lineWidth = 1 + alpha * 1.5
@@ -313,7 +307,7 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
         // Packet trails/glow
         ctx.beginPath()
         ctx.arc(px, py, 6, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha * 0.8})`
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha * 0.35})`
         ctx.fill()
       }
 
@@ -326,20 +320,18 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
         const pulseR = node.radius * 2.5 + Math.sin(timeRef.current * node.pulseSpeed + node.pulseOffset) * 2
         ctx.beginPath()
         ctx.arc(node.x, node.y, Math.max(0.1, pulseR), 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${0.15 + m.glowAlpha * 0.2})`
-        ctx.fill()
-        
-        // Inner bright solid core
-        const coreAlpha = 0.6 + m.glowAlpha * 0.4
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(255, 255, 255, ${coreAlpha})`
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${0.08 + m.glowAlpha * 0.12})`
         ctx.fill()
 
-        // Core secondary halo
+        const coreAlpha = 0.35 + m.glowAlpha * 0.25
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
+        ctx.fillStyle = `rgba(226, 232, 240, ${coreAlpha})`
+        ctx.fill()
+
         ctx.beginPath()
         ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${coreAlpha * 0.8})`
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${coreAlpha * 0.35})`
         ctx.fill()
       }
     }
@@ -352,19 +344,17 @@ export function ComplexityVisualizer({ fieldsState, className = '' }: { fieldsSt
   }, [])
 
   return (
-    <canvas 
-      ref={canvasRef} 
-      className={className} 
+    <canvas
+      ref={canvasRef}
+      className={className}
       style={{
         position: 'absolute',
-        top: 0,
-        left: 0,
+        inset: 0,
         pointerEvents: 'none',
-        opacity: 0.65,
-        mixBlendMode: 'screen',
+        opacity: 0.85,
         transition: 'opacity 0.8s ease',
-        zIndex: 0
-      }} 
+        zIndex: 0,
+      }}
     />
   )
 }

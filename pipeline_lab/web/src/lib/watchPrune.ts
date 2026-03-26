@@ -68,7 +68,7 @@ export const WATCH_PHASE_ROWS: {
     id: 'pose',
     title: 'Phase 5 · Pose estimation',
     blurb:
-      'ViTPose or RTMPose-L (if installed) on surviving tracks. Recipe: pose model, stride (1 vs 2), gap interpolation (linear/GSI), POSE_VISIBILITY_THRESHOLD, optional SWAY_3D_LIFT for data.json / 3D viewer.',
+      'ViTPose or RTMPose-L (if installed) on surviving tracks. Lab runs pose every frame (pose_stride=1) with linear interpolation defaults; matrices may still compare stride 2 / GSI. Recipe: pose model, POSE_VISIBILITY_THRESHOLD, optional SWAY_3D_LIFT for data.json / 3D viewer.',
   },
   {
     file: '04_phases_6_7.mp4',

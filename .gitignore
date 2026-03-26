@@ -35,6 +35,7 @@ output/
 
 # Pipeline Lab queued runs (local only)
 pipeline_lab/runs/
+pipeline_lab/tree_presets/last_tree_queue.log
 
 # MotionAGFormer (clone locally for 3D lift; see sway/pose_lift_3d.py)
 vendor/MotionAGFormer/

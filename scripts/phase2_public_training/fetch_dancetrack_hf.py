@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -73,16 +74,28 @@ def _download_one(local_dir: Path, name: str) -> Path:
 
     local_dir.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {name} …", flush=True)
-    hf_hub_download(
-        repo_id=HF_REPO,
-        repo_type="dataset",
-        filename=name,
-        local_dir=str(local_dir),
-    )
-    p = local_dir / name
-    if not p.is_file():
-        raise FileNotFoundError(f"Expected file after download: {p}")
-    return p
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            hf_hub_download(
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                filename=name,
+                local_dir=str(local_dir),
+            )
+            p = local_dir / name
+            if not p.is_file():
+                raise FileNotFoundError(f"Expected file after download: {p}")
+            return p
+        except Exception as e:
+            last_err = e
+            print(f"  HF download attempt {attempt}/3 failed: {e}", flush=True)
+            if attempt < 3:
+                wait = min(2**attempt, 60)
+                print(f"  Retrying in {wait}s …", flush=True)
+                time.sleep(wait)
+    assert last_err is not None
+    raise last_err
 
 
 def main() -> int:

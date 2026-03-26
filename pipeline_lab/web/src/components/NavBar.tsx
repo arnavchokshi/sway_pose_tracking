@@ -23,98 +23,43 @@ export function NavBar() {
     el.click()
   }
 
-  const navLinkStyle = ({ isActive }: { isActive: boolean }) => ({
-    padding: '0.5rem 1rem',
-    borderRadius: '999px',
-    fontSize: '0.85rem',
-    fontWeight: isActive ? 500 : 400,
-    color: isActive ? '#fff' : 'var(--text-muted)',
-    background: isActive ? 'rgba(255,255,255,0.08)' : 'transparent',
-    textDecoration: 'none',
-    transition: 'all 0.2s ease',
-  })
-
   return (
-    <div style={{ padding: '1rem 2rem', position: 'sticky', top: 0, zIndex: 50, marginBottom: '-1rem' }}>
-      <header
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0.4rem 0.4rem',
-          background: 'rgba(15, 23, 42, 0.4)',
-          backdropFilter: 'blur(24px)',
-          WebkitBackdropFilter: 'blur(24px)',
-          border: '1px solid var(--glass-border)',
-          borderRadius: '999px',
-          boxShadow: '0 4px 24px -1px rgba(0,0,0,0.3)'
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-          <div 
-            style={{ 
-              fontWeight: 600, 
-              fontSize: '0.9rem', 
-              color: 'var(--halo-cyan)', 
-              padding: '0.5rem 1.2rem',
-              background: 'rgba(6, 182, 212, 0.1)',
-              border: '1px solid rgba(6, 182, 212, 0.3)',
-              borderRadius: '999px',
-              marginLeft: '0.2rem'
-            }}
-          >
-            Sway Studio
-          </div>
-          
-          <div style={{ display: 'flex', gap: '0.25rem' }}>
-            <NavLink to="/" end style={navLinkStyle}>
+    <div className="app-nav-outer">
+      <header className="nav-shell">
+        <div className="nav-shell__left">
+          <div className="nav-brand">Sway Studio</div>
+
+          <nav className="nav-links" aria-label="Primary">
+            <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Lab
             </NavLink>
-            <NavLink to="/config" style={navLinkStyle}>
+            <NavLink to="/config" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Config Builder
             </NavLink>
-            <NavLink to="/compare" style={navLinkStyle}>
+            <NavLink to="/compare" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Compare
             </NavLink>
-          </div>
+          </nav>
         </div>
 
-        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '0.5rem', marginRight: '0.25rem' }}>
+        <div className="nav-shell__right">
           {videoFile ? (
             <>
-              <div style={{ 
-                display: 'flex', 
-                alignItems: 'center', 
-                gap: '0.75rem',
-                padding: '0.35rem 1rem 0.35rem 0.5rem',
-                background: 'rgba(0,0,0,0.3)',
-                border: '1px solid var(--glass-border)',
-                borderRadius: '999px'
-              }}>
-                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981', boxShadow: '0 0 8px #10b981' }} />
-                <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.1 }}>
-                  <span style={{ fontSize: '0.55rem', fontWeight: 700, letterSpacing: '0.06em', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Shared Video</span>
-                  <span style={{ fontSize: '0.85rem', fontWeight: 500, color: '#fff', maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <div className="nav-video-chip">
+                <span className="nav-video-chip__dot" aria-hidden />
+                <div className="nav-video-chip__text">
+                  <span className="nav-video-chip__label">Shared video</span>
+                  <span className="nav-video-chip__name" title={videoLabel}>
                     {videoLabel}
                   </span>
                 </div>
               </div>
-              <button 
-                type="button" 
-                className="btn" 
-                style={{ padding: '0.5rem 1rem', borderRadius: '999px', fontSize: '0.8rem' }} 
-                onClick={openFilePicker}
-              >
+              <button type="button" className="btn btn--compact" onClick={openFilePicker}>
                 Replace file
               </button>
             </>
           ) : (
-            <button 
-              type="button" 
-              className="btn primary" 
-              style={{ padding: '0.5rem 1.25rem', borderRadius: '999px', fontSize: '0.85rem' }} 
-              onClick={openFilePicker}
-            >
+            <button type="button" className="btn primary btn--compact" onClick={openFilePicker}>
               Upload video
             </button>
           )}

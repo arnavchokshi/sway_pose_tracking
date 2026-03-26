@@ -1,8 +1,8 @@
 """
 Default-off experimental hooks called from ``main.py`` (in-pipeline, not Lab post-subprocess).
 
-GNN / HMR here are **stubs or sidecars** until full models are integrated; flags still change
-run behavior (logs, manifest diagnostics, optional JSON files).
+GNN refine is a full graph pass (see ``sway.gnn_track_refine``); HMR remains a sidecar
+placeholder. Flags still change run behavior (logs, manifest diagnostics, optional JSON).
 """
 
 from __future__ import annotations
@@ -23,17 +23,14 @@ def maybe_gnn_refine_raw_tracks(
     ystride: int,
 ) -> Dict[int, List[Any]]:
     """
-    Optional post-stitch pass (Phase 3+) reserved for graph-based association.
-    Today: identity (no merge) — prints once so the run differs when the flag is on.
+    Optional post-stitch graph refine: edge-conditioned multi-head GAT + link logits
+    (see ``sway.gnn_track_refine``). Mutates ``raw_tracks`` in place when enabled.
     """
     if not gnn_track_refine_enabled():
         return raw_tracks
-    print(
-        "  GNN track refine: SWAY_GNN_TRACK_REFINE=1 (identity pass — graph merge not implemented yet; "
-        f"{len(raw_tracks)} tracks, {total_frames} frames, ystride={ystride}).",
-        flush=True,
-    )
-    return raw_tracks
+    from sway.gnn_track_refine import gnn_refine_raw_tracks
+
+    return gnn_refine_raw_tracks(raw_tracks, int(total_frames), int(ystride))
 
 
 def hmr_mesh_sidecar_enabled() -> bool:

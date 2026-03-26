@@ -9,7 +9,7 @@ What to capture when reviewing pipeline outputs, **how to run offline (e.g. on a
    ```bash
    python review_app/serve_review.py output/flight_batch
    ```
-   then open `http://127.0.0.1:8899/review/index.html` (works fully offline after the first load if assets are local).
+   then open `http://localhost:8899/review/index.html` (works fully offline after the first load if assets are local).
 3. **Review in the page** — overlays explain what happened:
    - **Green** (in the MP4) = final kept dancers  
    - **Red** (canvas) = track **pruning** (`prune_log` / table)  

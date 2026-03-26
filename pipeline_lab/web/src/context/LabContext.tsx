@@ -19,10 +19,21 @@ import {
   saveLabVideoFile,
 } from '../lib/labPersistence'
 
+export type DraftParentRef =
+  | { kind: 'none' }
+  | { kind: 'single'; parentClientId: string }
+  /** Queue one continuation run per Phase-1 root (same recipe/fields). */
+  | { kind: 'all_roots' }
+  /** Queue one run per draft node at the given tree level (0 = same as all_roots for typical trees). */
+  | { kind: 'all_at_level'; level: number }
+
 export type DraftRun = {
   clientId: string
   recipeName: string
   fields: Record<string, unknown>
+  /** Checkpoint segment: 0 = stop after phase 1, then 1, 2, … for later boundaries. */
+  treeLevel: number
+  parentRef: DraftParentRef
 }
 
 type LabContextValue = {
@@ -31,7 +42,10 @@ type LabContextValue = {
   setVideo: (file: File | null) => void
   drafts: DraftRun[]
   setDrafts: React.Dispatch<React.SetStateAction<DraftRun[]>>
-  updateDraft: (clientId: string, patch: Partial<Pick<DraftRun, 'recipeName' | 'fields'>>) => void
+  updateDraft: (
+    clientId: string,
+    patch: Partial<Pick<DraftRun, 'recipeName' | 'fields' | 'treeLevel' | 'parentRef'>>,
+  ) => void
   addDraft: (initial?: Partial<DraftRun>) => void
   removeDraft: (clientId: string) => void
   duplicateDraft: (clientId: string) => void
@@ -71,7 +85,17 @@ export function LabProvider({ children }: { children: ReactNode }) {
           setVideoLabel(vf.name)
         }
         if (ids.length > 0) setSessionRunIds(ids)
-        if (d.length > 0) setDrafts(d as DraftRun[])
+        if (d.length > 0) {
+          setDrafts(
+            d.map((row) => ({
+              clientId: row.clientId,
+              recipeName: row.recipeName,
+              fields: row.fields,
+              treeLevel: row.treeLevel ?? 0,
+              parentRef: row.parentRef ?? { kind: 'none' },
+            })),
+          )
+        }
       })
       .catch(() => {
         /* private mode / IDB blocked */
@@ -121,19 +145,25 @@ export function LabProvider({ children }: { children: ReactNode }) {
     setSessionRunIds([])
   }, [])
 
-  const updateDraft = useCallback((clientId: string, patch: Partial<Pick<DraftRun, 'recipeName' | 'fields'>>) => {
-    setDrafts((prev) =>
-      prev.map((d) => (d.clientId === clientId ? { ...d, ...patch } : d)),
-    )
-  }, [])
+  const updateDraft = useCallback(
+    (
+      clientId: string,
+      patch: Partial<Pick<DraftRun, 'recipeName' | 'fields' | 'treeLevel' | 'parentRef'>>,
+    ) => {
+      setDrafts((prev) => prev.map((d) => (d.clientId === clientId ? { ...d, ...patch } : d)))
+    },
+    [],
+  )
 
   const addDraft = useCallback((initial?: Partial<DraftRun>) => {
     setDrafts((prev) => {
-      const n = prev.length + 1
+      const n = prev.filter((x) => x.parentRef.kind === 'none').length + 1
       const d: DraftRun = {
         clientId: newClientId(),
-        recipeName: initial?.recipeName ?? `Run ${n}`,
+        recipeName: initial?.recipeName ?? `Phase 1 — ${n}`,
         fields: { ...(initial?.fields ?? {}) },
+        treeLevel: initial?.treeLevel ?? 0,
+        parentRef: initial?.parentRef ?? { kind: 'none' },
       }
       return [...prev, d]
     })
@@ -154,6 +184,8 @@ export function LabProvider({ children }: { children: ReactNode }) {
         clientId: newClientId(),
         recipeName: `${src.recipeName} (copy)`,
         fields: { ...src.fields },
+        treeLevel: src.treeLevel,
+        parentRef: src.parentRef,
       }
       const idx = prev.findIndex((d) => d.clientId === clientId)
       const next = [...prev]

@@ -182,8 +182,8 @@ export function PipelineImpactReport({ diagnostics }: { diagnostics?: Diag | nul
       title: 'Interpolation (GSI / linear)',
       body:
         parts.length > 0
-          ? `${parts.join(' · ')}. JSON keyframes stay on discrete processed frames; GSI mainly smooths boxes, pose fill, or video export.`
-          : 'All linear (default): box gaps, pose stride gaps (if any), and export-time video blend.',
+          ? `${parts.join(' · ')}. JSON keyframes stay on discrete processed frames; GSI mainly smooths boxes, pose fill, or video export. Master choreography stance: pose every frame + linear defaults (Pose tab verdict).`
+          : 'All linear (default): box gaps, pose stride gaps (if any), and export-time video blend — matches the master lock (pose_stride=1 in Lab, linear interpolation).',
       tone: parts.length > 0 ? 'accent' : 'ok',
     })
   }
@@ -249,8 +249,14 @@ export function PipelineImpactReport({ diagnostics }: { diagnostics?: Diag | nul
   const exp = diagnostics.experimental as Diag | undefined
   if (exp && typeof exp === 'object') {
     const bits: string[] = []
-    if (exp.gnn_track_refine === true) bits.push('GNN refine hook (identity stub)')
-    if (exp.sapiens_pose_cli === true) bits.push('Sapiens pose slot → ViTPose-Base fallback')
+    if (exp.gnn_track_refine === true) bits.push('GNN track refine (post-stitch graph merge)')
+    if (exp.sapiens_pose_cli === true) {
+      if (exp.sapiens_native_torchscript === true) {
+        bits.push('Sapiens pose slot → native TorchScript')
+      } else {
+        bits.push('Sapiens pose slot → ViTPose-Base fallback')
+      }
+    }
     if (exp.hmr_mesh_sidecar === true) bits.push('HMR mesh sidecar JSON written')
     if (bits.length > 0) {
       rows.push({
@@ -449,7 +455,7 @@ export function FriendlyRunConfig({
               <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#cbd5e1', marginBottom: '0.4rem' }}>
                 {stageTitle(phaseId)}
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '0.45rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))', gap: '0.45rem' }}>
                 {withValues.map((f) => (
                   <div
                     key={f.id}
@@ -502,7 +508,7 @@ function RunConfigRawFallback({ fields }: { fields: Record<string, unknown> }) {
       <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: '0.45rem' }}>
         Schema not loaded — raw keys:
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.4rem', fontSize: '0.75rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))', gap: '0.4rem', fontSize: '0.75rem' }}>
         {Object.entries(fields)
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([k, v]) => (

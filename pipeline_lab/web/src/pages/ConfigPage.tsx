@@ -1,22 +1,32 @@
 import { useEffect, useState, useMemo } from 'react'
+import { PIPELINE_LAB_LOCAL } from '../siteUrls'
 import { API } from '../types'
 import type { Schema, SchemaField } from '../types'
 import {
-  applyConfigPreset,
-  CONFIG_PRESET_LABELS,
-  CONFIG_PRESET_ORDER,
+  applyLabRecipe,
   defaultsFromSchema,
+  phase13StrategyFromFields,
+  PHASE13_STRATEGY_BLURBS,
+  PHASE13_STRATEGY_LABELS,
+  PHASE13_STRATEGY_ORDER,
+  QUALITY_TIER_BLURBS,
+  QUALITY_TIER_LABELS,
+  QUALITY_TIER_ORDER,
+  type QualityTierId,
 } from '../configPresets'
 import { InlineFieldInput } from '../components/InlineFieldInput'
-import { ConfigFieldWrap, ConfigInfoFold } from '../components/ConfigFieldWrap'
-import { HYBRID_SAM_PHASE_ID, hideHybridSamPhase } from '../lib/labFieldVisibility'
+import { ConfigFieldWrap } from '../components/ConfigFieldWrap'
+import { Phase13EffectivePanel } from '../components/Phase13EffectivePanel'
+import { hideFieldForPhase13Strategy, PHASE13_MODE_FIELD_ID } from '../lib/labPhase13Ui'
+import { hideHybridSamPhase, isHybridSamOverlapField } from '../lib/labFieldVisibility'
 import { isSchemaFieldVisible } from '../lib/labFieldMeta'
-import { mainPyPhaseCaption } from '../lib/schemaStageCaption'
 import {
-  buildPipelineFlowchartRows,
-  flowchartRowIsActive,
-  flowchartRowIsDone,
-} from '../lib/flowchartRows'
+  CONFIG_PAGE_LEDE,
+  CONFIG_STAGE_INTRO,
+  fieldBelongsToConfigStage,
+  groupFieldsForStage,
+} from '../lib/configPageUi'
+import { masterGuidePhaseLabel } from '../lib/schemaStageCaption'
 import { ComplexityVisualizer } from '../components/ComplexityVisualizer'
 
 export function ConfigPage() {
@@ -25,7 +35,9 @@ export function ConfigPage() {
   const [activePhaseIndex, setActivePhaseIndex] = useState(0)
   const [configName, setConfigName] = useState('My Config')
   const [fieldsState, setFieldsState] = useState<Record<string, unknown>>({})
-  const [activePreset, setActivePreset] = useState<string | null>('standard')
+  const [qualityTier, setQualityTier] = useState<QualityTierId>('standard')
+  /** When true, preset buttons are not highlighted (user diverged from last preset apply). */
+  const [recipeCustom, setRecipeCustom] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -36,7 +48,7 @@ export function ConfigPage() {
         if (!r.ok) {
           if (r.status === 502 || r.status === 503) {
             throw new Error(
-              'Pipeline API is not reachable (bad gateway). The Vite dev server proxies /api to http://127.0.0.1:8765 — start uvicorn there in another terminal.',
+              `Pipeline API is not reachable (bad gateway). The dev UI proxies /api to ${PIPELINE_LAB_LOCAL.apiOrigin} — start uvicorn there in another terminal.`,
             )
           }
           throw new Error(`Schema request failed (HTTP ${r.status}).`)
@@ -66,18 +78,7 @@ export function ConfigPage() {
     }
   }, [])
 
-  const fieldsByPhase = useMemo(() => {
-    if (!schema) return new Map<string, SchemaField[]>()
-    const m = new Map<string, SchemaField[]>()
-    for (const f of schema.fields) {
-      const arr = m.get(f.phase) || []
-      arr.push(f)
-      m.set(f.phase, arr)
-    }
-    return m
-  }, [schema])
-
-  const flowchartRows = useMemo(() => (schema ? buildPipelineFlowchartRows(schema.stages) : []), [schema])
+  const activePhase13 = useMemo(() => phase13StrategyFromFields(fieldsState), [fieldsState])
 
   if (schemaError) {
     return (
@@ -101,7 +102,7 @@ export function ConfigPage() {
           }}
         >
           {`cd sway_pose_mvp
-uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
+uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
         </pre>
         <p style={{ color: 'var(--text-muted)', margin: '1rem 0 0', fontSize: '0.9rem' }}>
           Keep that running while <code style={{ color: 'var(--halo-cyan)' }}>npm run dev</code> is active.
@@ -116,237 +117,282 @@ uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765`}
 
   const stages = schema.stages
   const activeStage = stages[activePhaseIndex]
-  const activeFieldsRaw = fieldsByPhase.get(activeStage?.id) || []
-  const hybridSamHidden =
-    activeStage?.id === HYBRID_SAM_PHASE_ID && hideHybridSamPhase(fieldsState.tracker_technology)
-  const activeFields = hybridSamHidden
-    ? activeFieldsRaw
-    : activeFieldsRaw.filter((f) => f.type === 'info' || isSchemaFieldVisible(f, fieldsState))
+  const activeFieldsRaw = schema.fields.filter((f) => fieldBelongsToConfigStage(f, activeStage.id))
+  const hideOverlapBecauseTracker = hideHybridSamPhase(
+    fieldsState.tracker_technology,
+    fieldsState.sway_phase13_mode,
+  )
+  const activeFields = activeFieldsRaw.filter((f) => {
+    if (f.type === 'info') return false
+    if (f.id === PHASE13_MODE_FIELD_ID) return false
+    if (hideOverlapBecauseTracker && activeStage?.id === 'handshake' && isHybridSamOverlapField(f.id)) {
+      return false
+    }
+    if (hideFieldForPhase13Strategy(f.id, activePhase13)) return false
+    return isSchemaFieldVisible(f, fieldsState)
+  })
+  const showOverlapHiddenBanner = activeStage?.id === 'handshake' && hideOverlapBecauseTracker
+
+  const controlFields = activeFields.filter((f) => f.type !== 'info')
+  const intro = activeStage ? CONFIG_STAGE_INTRO[activeStage.id] : undefined
+  const { sections, orphans } = groupFieldsForStage(controlFields, activeStage?.id ?? '')
+
+  const renderField = (f: SchemaField, idx: number) => (
+    <div key={f.id} className="animate-slide-up" style={{ animationDelay: `${idx * 0.03}s` }}>
+      <ConfigFieldWrap field={f} value={fieldsState[f.id]}>
+        <InlineFieldInput
+          f={f}
+          value={fieldsState[f.id]}
+          onChange={(v) => {
+            setFieldsState((prev) => ({ ...prev, [f.id]: v }))
+            setRecipeCustom(true)
+          }}
+          allFields={fieldsState}
+        />
+      </ConfigFieldWrap>
+    </div>
+  )
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', height: '100%' }}>
-      {/* Header */}
-      <div className="glass-panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 2rem' }}>
-        <input 
-          value={configName} 
-          onChange={e => setConfigName(e.target.value)}
-          style={{ background: 'transparent', border: 'none', borderBottom: '1px solid var(--halo-cyan)', color: '#fff', fontSize: '1.5rem', fontWeight: 600, outline: 'none', padding: '0.2rem 0' }}
-        />
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          {CONFIG_PRESET_ORDER.map((id) => (
-            <button
-              key={id}
-              type="button"
-              className="btn"
-              style={{ 
-                whiteSpace: 'nowrap',
-                borderColor: activePreset === id ? '#fff' : undefined,
-                background: activePreset === id ? 'rgba(255,255,255,0.15)' : undefined
-              }}
-              onClick={() => {
-                setFieldsState(applyConfigPreset(schema, id))
-                setActivePreset(id)
-              }}
-            >
-              {CONFIG_PRESET_LABELS[id]}
-            </button>
-          ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem', height: '100%' }}>
+      <div className="glass-panel config-page-settings-panel">
+        <header className="config-page-settings-header">
+          <div className="config-page-settings-header__row">
+            <h1 className="config-page-settings-title">Pipeline settings</h1>
+            <div className="config-page-identity">
+              <label className="config-page-preset-label" htmlFor="config-name-input">
+                Config name
+              </label>
+              <input
+                id="config-name-input"
+                value={configName}
+                onChange={(e) => setConfigName(e.target.value)}
+                placeholder="e.g. Finals — tight stage"
+                className="config-page-name-input"
+              />
+            </div>
+          </div>
+          <p className="config-page-settings-lede">{CONFIG_PAGE_LEDE}</p>
+        </header>
+
+        <div className="config-page-preset-card">
+          <div className="config-page-preset-label">Recipe baseline</div>
+          <p className="config-page-preset-blurb">
+            Two independent choices: <strong style={{ color: '#cbd5e1' }}>speed &amp; quality</strong> (weights, pose, scoring)
+            vs <strong style={{ color: '#cbd5e1' }}>Phases 1–3 strategy</strong> (early detection → track → stitch). Combine
+            them — e.g. Maximum accuracy + Sway handshake. Manual edits hide the highlights until you press a preset again.
+            Phases 1–3 strategy is only changed here (the handshake step no longer duplicates that enum).
+          </p>
+          <div className="config-page-preset-rows">
+            <div>
+              <div
+                style={{
+                  fontSize: '0.68rem',
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.06em',
+                  color: 'var(--text-muted)',
+                  marginBottom: '0.3rem',
+                }}
+              >
+                Speed &amp; quality
+              </div>
+              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                {QUALITY_TIER_ORDER.map((id) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className="btn"
+                    title={QUALITY_TIER_BLURBS[id]}
+                    style={{
+                      whiteSpace: 'nowrap',
+                      borderColor: !recipeCustom && qualityTier === id ? '#fff' : undefined,
+                      background: !recipeCustom && qualityTier === id ? 'rgba(255,255,255,0.15)' : undefined,
+                    }}
+                    onClick={() => {
+                      setFieldsState(applyLabRecipe(schema, id, phase13StrategyFromFields(fieldsState)))
+                      setQualityTier(id)
+                      setRecipeCustom(false)
+                    }}
+                  >
+                    {QUALITY_TIER_LABELS[id]}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div
+                style={{
+                  fontSize: '0.68rem',
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.06em',
+                  color: 'var(--text-muted)',
+                  marginBottom: '0.3rem',
+                }}
+              >
+                Phases 1–3 strategy
+              </div>
+              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                {PHASE13_STRATEGY_ORDER.map((id) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className="btn"
+                    title={PHASE13_STRATEGY_BLURBS[id]}
+                    style={{
+                      whiteSpace: 'nowrap',
+                      borderColor: activePhase13 === id ? '#fff' : undefined,
+                      background: activePhase13 === id ? 'rgba(255,255,255,0.15)' : undefined,
+                    }}
+                    onClick={() => {
+                      setFieldsState(applyLabRecipe(schema, qualityTier, id))
+                      setRecipeCustom(false)
+                    }}
+                  >
+                    {PHASE13_STRATEGY_LABELS[id]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{ marginTop: '0.85rem' }}>
+            <Phase13EffectivePanel strategy={activePhase13} fieldsState={fieldsState} />
+          </div>
         </div>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', flex: 1 }}>
-        {/* Top: Flowchart */}
-        <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
-          <div style={{ marginBottom: '1rem' }}>
-            <h2 style={{ margin: 0, fontSize: '1.2rem', color: '#fff' }}>Pipeline Flow</h2>
-            <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.45, maxWidth: 820 }}>
-              Left to right is execution order. Captions line up with <code style={{ fontSize: '0.75rem' }}>main.py</code> phase
-              prints. This page is a reusable template — the Lab attaches a video per run. Use the Lab recipe&apos;s{' '}
-              <strong style={{ color: '#cbd5e1' }}>Export</strong> step for phase preview MP4s, final view variants, and optional
-              mesh sidecar flags.
-            </p>
+      <div
+        className="glass-panel config-page-steps-panel"
+        style={{ padding: '0.85rem 1rem' }}
+        aria-label="Pipeline steps; workload estimate shown as background motion"
+      >
+        <div className="config-page-workload-bg" aria-hidden>
+          <ComplexityVisualizer fieldsState={fieldsState} />
+        </div>
+        <div className="config-page-steps-inner">
+          <div className="config-page-steps-heading">
+            <h2>Steps</h2>
+            <span className="config-page-steps-pill" title="main.py prints [1/11] through [11/11]; the UI groups knobs into four intents">
+              4 setup steps · 11 engine phases
+            </span>
           </div>
-          
-          <div className="flowchart-board" style={{ position: 'relative', overflowX: 'auto', padding: '1rem 0.5rem', display: 'flex', alignItems: 'center', gap: '1rem', minHeight: 'auto', background: 'transparent' }}>
-            <ComplexityVisualizer fieldsState={fieldsState} />
-            {flowchartRows.map((row, rowIdx) => {
-              const isRowActive = flowchartRowIsActive(row, activePhaseIndex)
-              const isRowDone = flowchartRowIsDone(row, activePhaseIndex)
+          <p className="config-page-steps-lede">
+            Pick a step to see only the controls for that part of the pipeline. The CLI still prints{' '}
+            <strong>eleven phases</strong> — each card shows which printed phase numbers your knobs target. Pre-pose prune (
+            <strong>phase 4</strong>) is master-locked in code (no tab here). 3D lift runs between smoothing and scoring when
+            enabled but is not a separate printed phase.
+          </p>
 
-              const connector = rowIdx < flowchartRows.length - 1 && (
-                <svg width="40" height="24" viewBox="0 0 40 24" style={{ overflow: 'visible', flexShrink: 0 }}>
-                  <path
-                    d="M 0 12 C 15 12, 25 12, 34 12"
-                    className={`flow-path ${isRowDone ? 'done' : ''} ${isRowActive ? 'active' : ''}`}
-                  />
-                  <polygon
-                    points="32,7 40,12 32,17"
-                    fill={isRowDone || isRowActive ? 'var(--halo-cyan)' : 'var(--glass-border)'}
-                    style={{ transition: 'fill 0.5s' }}
-                  />
-                </svg>
-              )
-
-              if (row.kind === 'single') {
-                const stage = stages[row.index]
-                const idx = row.index
-                const isActive = idx === activePhaseIndex
-                const isDone = idx < activePhaseIndex
-                return (
-                  <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-                    <div
-                      onClick={() => setActivePhaseIndex(idx)}
-                      className={`node-box ${isActive ? 'selected' : ''} ${isDone ? 'status-done' : ''}`}
-                      style={{
-                        padding: '1rem 1.2rem',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        gap: '0.35rem',
-                        minWidth: '180px',
-                      }}
-                    >
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>
-                        {mainPyPhaseCaption(stage, idx)}
-                      </div>
-                      <div style={{ fontWeight: 600, color: isActive ? '#fff' : 'var(--text-main)', fontSize: '1rem' }}>
-                        {stage.label}
-                      </div>
-                    </div>
-                    {connector}
-                  </div>
-                )
-              }
-
-              const track = stages[row.trackingIndex]
-              const overlap = stages[row.overlapIndex]
-              const lineActive = (i: number) => i === activePhaseIndex
+          <div className="config-page-flow" role="tablist" aria-label="Pipeline steps">
+            {stages.map((stage, idx) => {
+              const isActive = idx === activePhaseIndex
+              const isDone = idx < activePhaseIndex
+              const copy = CONFIG_STAGE_INTRO[stage.id]
               return (
-                <div key="merged-tracking-overlap" style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-                  <div
-                    className={`node-box ${isRowActive ? 'selected' : ''} ${isRowDone ? 'status-done' : ''}`}
-                    style={{
-                      padding: '1rem 1.2rem',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'stretch',
-                      gap: '0.35rem',
-                      minWidth: '220px',
-                    }}
-                  >
-                    <div
-                      style={{
-                        fontSize: '0.72rem',
-                        color: 'var(--text-muted)',
-                        letterSpacing: '0.04em',
-                        textAlign: 'center',
-                      }}
-                    >
-                      {mainPyPhaseCaption(track, row.trackingIndex)}
+                <button
+                  key={stage.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  className={`config-page-flow-node ${isActive ? 'config-page-flow-node--active' : ''} ${isDone ? 'config-page-flow-node--done' : ''}`}
+                  onClick={() => setActivePhaseIndex(idx)}
+                >
+                  <div className="config-page-flow-node-top">
+                    <span className="config-page-flow-badge" aria-hidden>
+                      {idx + 1}
+                    </span>
+                    <div className="config-page-flow-step">
+                      {stage.short}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setActivePhaseIndex(row.trackingIndex)}
-                      style={{
-                        fontWeight: lineActive(row.trackingIndex) ? 600 : 500,
-                        color: lineActive(row.trackingIndex) ? '#fff' : 'var(--text-main)',
-                        fontSize: '1rem',
-                        background: 'transparent',
-                        border: 'none',
-                        cursor: 'pointer',
-                        padding: '0.15rem 0',
-                        textAlign: 'center',
-                        fontFamily: 'inherit',
-                      }}
-                    >
-                      {track.label}
-                    </button>
-                    <div
-                      style={{
-                        height: 1,
-                        margin: '0.1rem 0',
-                        background: 'rgba(148, 163, 184, 0.35)',
-                        alignSelf: 'stretch',
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setActivePhaseIndex(row.overlapIndex)}
-                      style={{
-                        fontWeight: lineActive(row.overlapIndex) ? 600 : 500,
-                        color: lineActive(row.overlapIndex) ? '#fff' : 'var(--text-main)',
-                        fontSize: '1rem',
-                        background: 'transparent',
-                        border: 'none',
-                        cursor: 'pointer',
-                        padding: '0.15rem 0',
-                        textAlign: 'center',
-                        fontFamily: 'inherit',
-                      }}
-                    >
-                      {overlap.label}
-                    </button>
                   </div>
-                  {connector}
-                </div>
+                  <div className="config-page-flow-name">{copy?.headline ?? stage.label}</div>
+                  {stage.main_phases ? (
+                    <div className="config-page-flow-mainpy">{masterGuidePhaseLabel(stage.main_phases)}</div>
+                  ) : null}
+                </button>
               )
             })}
           </div>
         </div>
+      </div>
 
-        {/* Bottom Active Params */}
-        <div className="glass-panel" style={{ padding: '1.5rem 1.75rem 2rem', flex: 1 }}>
-          <h2 style={{ marginTop: 0, marginBottom: '1.5rem', color: '#fff', fontSize: '1.35rem', fontWeight: 600 }}>{activeStage?.label} — Parameters</h2>
-          <div 
-            key={activeStage?.id}
-            style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '1.25rem' }}
-          >
-            {hybridSamHidden ? (
-              <div
-                style={{
-                  gridColumn: '1 / -1',
-                  padding: '1.15rem 1.35rem',
-                  borderRadius: 12,
-                  border: '1px solid rgba(148, 163, 184, 0.35)',
-                  background: 'rgba(30, 41, 59, 0.45)',
-                  color: 'var(--text-muted)',
-                  fontSize: '0.92rem',
-                  lineHeight: 1.55,
-                }}
-              >
-                Overlap sharpening only runs with the <strong style={{ color: '#e2e8f0' }}>built-in tracker</strong>.{' '}
-                With the <strong style={{ color: '#e2e8f0' }}>alternate tracker</strong> selected, these options are hidden
-                because they would not apply. Switch back to tune overlap behavior.
+      <div className="glass-panel" style={{ padding: '1rem 1.25rem 1.25rem', flex: 1 }}>
+        <h2 className="config-page-panel-title">
+          {intro?.headline ?? activeStage?.label}
+          {activeStage ? (
+            <span style={{ fontWeight: 500, color: '#64748b', fontSize: '0.85rem', marginLeft: '0.5rem' }}>
+              ({activeStage.short}
+              {activeStage.main_phases ? (
+                <>
+                  {' '}
+                  ·{' '}
+                  <span style={{ color: 'var(--halo-cyan)' }}>{masterGuidePhaseLabel(activeStage.main_phases)}</span>
+                </>
+              ) : null}
+              )
+            </span>
+          ) : null}
+        </h2>
+        <p className="config-page-panel-lede">{intro?.lede ?? 'Adjust parameters for this part of the run.'}</p>
+
+        <div key={activeStage?.id}>
+          {showOverlapHiddenBanner && (
+            <div
+              style={{
+                marginBottom: '1.25rem',
+                padding: '1rem 1.15rem',
+                borderRadius: 12,
+                border: '1px solid rgba(148, 163, 184, 0.35)',
+                background: 'rgba(30, 41, 59, 0.45)',
+                color: 'var(--text-muted)',
+                fontSize: '0.88rem',
+                lineHeight: 1.55,
+              }}
+            >
+              Overlap refinement only applies on the default tracker path. These controls are hidden when an alternate engine
+              is selected.
+            </div>
+          )}
+          {activeStage?.id === 'handshake' && activePhase13 === 'sway_handshake' && !hideOverlapBecauseTracker && (
+            <div
+              style={{
+                marginBottom: '1.25rem',
+                padding: '1rem 1.15rem',
+                borderRadius: 12,
+                border: '1px solid rgba(45, 212, 191, 0.35)',
+                background: 'rgba(6, 95, 70, 0.2)',
+                color: 'var(--text-muted)',
+                fontSize: '0.88rem',
+                lineHeight: 1.55,
+              }}
+            >
+              <strong style={{ color: '#e2e8f0' }}>Sway handshake</strong> forces hybrid SAM IoU to{' '}
+              <strong style={{ color: '#e2e8f0' }}>0.10</strong> and weak cues off at enqueue — overlap sliders are hidden.
+              See <strong style={{ color: '#e2e8f0' }}>Effective Phases 1–3 configuration</strong> above.
+            </div>
+          )}
+
+          {sections.map((sec, sIdx) => (
+            <div key={sec.def.title} className="config-page-section">
+              <h3 className="config-page-section-title">{sec.def.title}</h3>
+              <p className="config-page-section-blurb">{sec.def.blurb}</p>
+              <div className="config-page-section-grid">
+                {sec.fields.map((f, i) => renderField(f, sIdx * 10 + i))}
               </div>
-            ) : (
-              <>
-                {activeFields.map((f, idx) =>
-                  f.type === 'info' ? (
-                    <div key={f.id} className="animate-slide-up" style={{ gridColumn: '1 / -1', animationDelay: `${idx * 0.04}s` }}>
-                      <ConfigInfoFold title={`ℹ ${f.label}`} body={f.description ?? ''} />
-                    </div>
-                  ) : (
-                    <div key={f.id} className="animate-slide-up" style={{ animationDelay: `${idx * 0.04}s` }}>
-                      <ConfigFieldWrap field={f} value={fieldsState[f.id]}>
-                        <InlineFieldInput
-                          f={f}
-                          value={fieldsState[f.id]}
-                          onChange={(v) => {
-                            setFieldsState((prev) => ({ ...prev, [f.id]: v }))
-                            setActivePreset(null)
-                          }}
-                          allFields={fieldsState}
-                        />
-                      </ConfigFieldWrap>
-                    </div>
-                  ),
-                )}
-                {activeFields.length === 0 && (
-                  <div style={{ color: 'var(--text-muted)' }}>Nothing to change on this step.</div>
-                )}
-              </>
-            )}
-          </div>
+            </div>
+          ))}
+
+          {orphans.length > 0 && (
+            <div className="config-page-section">
+              <h3 className="config-page-section-title">Other</h3>
+              <div className="config-page-section-grid">{orphans.map((f, i) => renderField(f, 80 + i))}</div>
+            </div>
+          )}
+
+          {controlFields.length === 0 && (
+            <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Nothing to change on this step.</div>
+          )}
         </div>
       </div>
     </div>

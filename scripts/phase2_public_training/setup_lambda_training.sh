@@ -24,7 +24,14 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 ARCH="$(uname -m)"
 echo "==> CPU architecture: $ARCH"
 
+# Minimal cloud images sometimes ship without ensurepip / venv.
 if [ ! -x "$PY" ]; then
+  if ! python3 -m venv /tmp/.sway_check_venv 2>/dev/null; then
+    echo "==> Installing python3-venv (required for python3 -m venv on this image)"
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
+  fi
+  rm -rf /tmp/.sway_check_venv
   echo "==> Creating virtualenv at $VENV"
   python3 -m venv "$VENV"
 fi
@@ -57,4 +64,8 @@ assert cuda, 'CUDA not available — wrong wheels or driver'"
 "$PY" -c "from ultralytics import YOLO; import huggingface_hub; print('OK: ultralytics + huggingface_hub')"
 
 echo "==> Done. Training uses: $PY"
-echo "==> Next: bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh"
+echo "==> Next (pick one):"
+echo "    bash scripts/phase2_public_training/run_lambda_crowdhuman_skip_dancetrack.sh   # CrowdHuman only (upload DanceTrack .pt first)"
+echo "    bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh"
+echo "    bash scripts/phase2_public_training/run_lambda_train_dancetrack_crowdhuman.sh   # train DT then CH on box"
+echo "    # or: YOLO_LAMBDA_PIPELINE=crowdhuman bash .../run_lambda_yolo_train.sh"

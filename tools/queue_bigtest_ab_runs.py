@@ -5,7 +5,7 @@ Queue the Tier 1–3 A/B run set described in product docs via Pipeline Lab API 
   cd sway_pose_mvp
   python3 -m tools.queue_bigtest_ab_runs --video /path/to/BigTest.mov --verify-start
 
-Requires uvicorn on PIPELINE_LAB_URL (default http://127.0.0.1:8765). Uses POST /api/runs/batch_path.
+Requires uvicorn on PIPELINE_LAB_URL (default http://localhost:8765). Uses POST /api/runs/batch_path.
 """
 
 from __future__ import annotations
@@ -57,10 +57,10 @@ def _build_runs() -> List[Dict[str, Any]]:
         {"recipe_name": "T03_pose_ViTPose_Base", "fields": {"pose_model": "ViTPose-Base"}},
         {"recipe_name": "T04_tracker_deep_ocsort_motion", "fields": {"tracker_technology": "deep_ocsort"}},
         {
-            "recipe_name": "T04_tracker_deep_ocsort_osnet_x1",
+            "recipe_name": "T04_tracker_deep_ocsort_osnet_x0_25",
             "fields": {
                 "tracker_technology": "deep_ocsort_osnet",
-                "sway_boxmot_reid_model": "osnet_x1_0",
+                "sway_boxmot_reid_model": "osnet_x0_25",
             },
         },
         # Tier 2
@@ -135,7 +135,7 @@ def _verify_batch(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Queue BigTest A/B batch on Pipeline Lab (CLI)")
     ap.add_argument("--video", type=str, required=True, help="Absolute path to video on the Lab server machine")
-    ap.add_argument("--lab-url", type=str, default="http://127.0.0.1:8765", help="Lab base URL (no trailing slash)")
+    ap.add_argument("--lab-url", type=str, default="http://localhost:8765", help="Lab base URL (no trailing slash)")
     ap.add_argument("--dry-run", action="store_true", help="Print JSON payload only")
     ap.add_argument(
         "--verify-start",

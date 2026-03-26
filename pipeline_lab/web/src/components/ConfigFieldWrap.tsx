@@ -14,7 +14,7 @@ export function ConfigFieldWrap({
   children: ReactNode
   variant?: 'default' | 'dense'
 }) {
-  const pad = variant === 'dense' ? '0.85rem' : '1rem'
+  const pad = variant === 'dense' ? '0.65rem' : '0.75rem'
   return (
     <div
       className="config-field-card"
@@ -32,7 +32,7 @@ export function ConfigFieldWrap({
             alignItems: 'flex-start',
             justifyContent: 'space-between',
             gap: '0.5rem',
-            marginBottom: '0.55rem',
+            marginBottom: '0.4rem',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap', minWidth: 0 }}>
@@ -84,34 +84,5 @@ export function ConfigFieldWrap({
       <SchemaFieldVisual fieldId={field.id} value={value} />
       {children}
     </div>
-  )
-}
-
-/** Collapsible info strip — keeps phase intros one line until expanded. */
-export function ConfigInfoFold({ title, body }: { title: string; body: string }) {
-  return (
-    <details
-      className="config-info-fold"
-      style={{
-        borderRadius: 10,
-        border: '1px solid rgba(148, 163, 184, 0.22)',
-        background: 'rgba(0,0,0,0.18)',
-        padding: '0.5rem 0.75rem',
-        marginBottom: '0.75rem',
-      }}
-    >
-      <summary
-        style={{
-          cursor: 'pointer',
-          fontSize: '0.78rem',
-          fontWeight: 600,
-          color: '#94a3b8',
-          listStyle: 'none',
-        }}
-      >
-        {title}
-      </summary>
-      <p style={{ margin: '0.5rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{body}</p>
-    </details>
   )
 }

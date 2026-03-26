@@ -152,15 +152,39 @@ def apply_post_track_stitching(
     total_frames: int,
     *,
     ystride: Optional[int] = None,
+    video_path: Optional[str] = None,
+    native_fps: float = 30.0,
 ) -> Dict[int, List[Any]]:
     """
     Doc Phase 3 — dormant registry, fragment stitch, coalescence, complementary merge,
     coexisting merge, stride gap fill. Runs after per-frame detection + tracking (Phases 1–2).
+
+    When ``SWAY_PHASE13_MODE=dancer_registry`` and ``video_path`` is set, runs appearance-based
+    dormant relinking after motion dormant (see ``sway.dancer_registry_pipeline``).
     """
     tr = load_tracking_runtime()
     if ystride is None:
         ystride = int(tr["yolo_stride"])
     raw_tracks = _apply_dormant_and_global(raw_tracks, total_frames)
+    try:
+        from sway.dancer_registry_pipeline import (
+            apply_dancer_registry_appearance_dormant,
+            phase13_dancer_registry_enabled,
+        )
+
+        if (
+            phase13_dancer_registry_enabled()
+            and video_path
+            and str(video_path).strip()
+        ):
+            raw_tracks = apply_dancer_registry_appearance_dormant(
+                raw_tracks,
+                str(video_path),
+                int(total_frames),
+                float(native_fps),
+            )
+    except Exception as ex:  # noqa: BLE001
+        print(f"  [dancer_registry] Appearance dormant skipped: {ex}", flush=True)
     raw_tracks = stitch_fragmented_tracks(
         raw_tracks,
         total_frames,
@@ -1178,6 +1202,7 @@ def _run_tracking_boxmot_diou(
     int,
     Dict[str, Any],
     Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
     """Phases 1–2: YOLO predict + pre-track NMS + BoxMOT Deep OC-SORT (no post-track stitch)."""
     from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
@@ -1230,9 +1255,25 @@ def _run_tracking_boxmot_diou(
     else:
         print("  Hybrid SAM overlap refiner OFF.", flush=True)
 
+    handshake_state = None
+    try:
+        from sway.handshake_tracking import SwayHandshakeState, phase13_handshake_enabled
+
+        if phase13_handshake_enabled():
+            handshake_state = SwayHandshakeState()
+            print(
+                "  Sway Handshake: dancer registry + SAM mask↔ID verify "
+                f"(IoU≥{float(hybrid_cfg.get('iou_trigger', 0.42)):.2f}).",
+                flush=True,
+            )
+    except Exception:
+        handshake_state = None
+
     raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
     # frame_idx -> list of (xyxy high-res, detector confidence); pre–track-association dets.
     phase1_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
+    # After DIoU (if any), before classical IoU-NMS — for live IoU tuning in Lab.
+    phase1_pre_classical_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
     total_frames = 0
     native_fps = 30.0
     frame_width = 1920
@@ -1310,6 +1351,7 @@ def _run_tracking_boxmot_diou(
 
                 if r0.boxes is None or len(r0.boxes) == 0:
                     dets = np.empty((0, 6), dtype=np.float32)
+                    phase1_pre_classical_by_frame[frame_idx] = []
                 else:
                     xyxy = r0.boxes.xyxy.cpu().numpy()
                     conf = r0.boxes.conf.cpu().numpy()
@@ -1321,24 +1363,38 @@ def _run_tracking_boxmot_diou(
                         diou_keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
                         xyxy = xyxy[diou_keep]
                         conf = conf[diou_keep]
+                    pre_pairs: List[Tuple[Tuple[float, float, float, float], float]] = []
+                    for i in range(len(xyxy)):
+                        r = xyxy[i]
+                        pre_pairs.append(((float(r[0]), float(r[1]), float(r[2]), float(r[3])), float(conf[i])))
+                    phase1_pre_classical_by_frame[frame_idx] = pre_pairs
                     keep2 = classical_nms_indices(xyxy, conf, iou_thresh=_pretrack_classical_nms_iou())
                     xyxy = xyxy[keep2]
                     conf = conf[keep2]
                     cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
                     dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
 
+                # Phase-1 preview / checkpoint: YOLO + NMS only (before hybrid SAM and tracker).
+                yolo_only_pairs: List[Tuple[Tuple[float, float, float, float], float]] = []
+                if dets is not None and len(dets) > 0:
+                    for row in dets:
+                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                        cf = float(row[4])
+                        yolo_only_pairs.append(((x1, y1, x2, y2), cf))
+                phase1_dets_by_frame[frame_idx] = yolo_only_pairs
+
                 if hybrid_refiner is not None:
                     dets, hmeta = hybrid_refiner.refine_person_dets(frame, dets)
                 else:
                     hmeta = {}
 
-                det_pairs: List[Tuple[Tuple[float, float, float, float], float]] = []
-                if dets is not None and len(dets) > 0:
-                    for row in dets:
-                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-                        cf = float(row[4])
-                        det_pairs.append(((x1, y1, x2, y2), cf))
-                phase1_dets_by_frame[frame_idx] = det_pairs
+                _hcfg = hybrid_cfg if hybrid_refiner is not None else load_hybrid_sam_config()
+                if handshake_state is not None:
+                    from sway.handshake_tracking import handshake_process_frame
+
+                    dets, hmeta = handshake_process_frame(
+                        handshake_state, frame, dets, hmeta, _hcfg
+                    )
 
                 sam2_roi_tuple: Optional[tuple] = None
                 if hybrid_refiner is not None and hmeta.get("used_sam"):
@@ -1355,6 +1411,8 @@ def _run_tracking_boxmot_diou(
 
                 out = tracker.update(dets, frame)
                 valid_dancers_this_frame = 0
+                if handshake_state is not None and out is not None and len(out) > 0:
+                    handshake_state.set_prev_tracker_out(np.atleast_2d(out))
                 if out is not None and len(out) > 0:
                     out_arr = np.atleast_2d(out)
                     mask_assign = assign_sam_masks_to_tracker_output(dets, out_arr, per_det_masks)
@@ -1435,6 +1493,365 @@ def _run_tracking_boxmot_diou(
         int(ystride),
         hybrid_stats,
         phase1_dets_by_frame,
+        phase1_pre_classical_by_frame,
+    )
+
+
+def run_phase1_yolo_only_boxmot(
+    video_path: str,
+    lab_on_infer: Optional[Callable[[int, int, int], None]] = None,
+) -> Tuple[
+    int,
+    float,
+    float,
+    int,
+    int,
+    int,
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+]:
+    """
+    YOLO person detection only (BoxMOT path): NMS-scaled boxes + confidences per frame, no hybrid SAM,
+    no tracker. Used for ``after_phase_1`` checkpoints.
+    """
+    from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
+
+    apply_boxmot_kf_unfreeze_guard()
+
+    tr = load_tracking_runtime()
+    yconf = float(tr["yolo_conf"])
+    ystride = int(tr["yolo_stride"])
+    yolo_bs = int(tr["yolo_infer_batch"])
+    base_detect = int(tr["detect_size"])
+
+    model_path = resolve_yolo_inference_weights()
+    bmk = boxmot_tracker_kind_from_env()
+    print(f"[phase1-only] Loading detection model: {model_path} (BoxMOT path, tracker={bmk})")
+    y_half = yolo_predict_use_half()
+    model = YOLO(model_path)
+
+    phase1_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
+    phase1_pre_classical_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
+    total_frames = 0
+    native_fps = 30.0
+    frame_width = 1920
+    frame_height = 1080
+    max_dancers_last_chunk = 0
+    current_detect_size = base_detect
+    yolo_infer_count = 0
+
+    chunk_idx = -1
+    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
+        chunk_idx += 1
+        if chunk_idx == 0:
+            print(
+                f"  [phase1-only] chunk_size={tr['chunk_size']}, YOLO stride={ystride}, base detect {base_detect}px.",
+                flush=True,
+            )
+        native_fps = nfps
+        frame_width = w_f
+        frame_height = h_f
+        if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
+            current_detect_size = max(base_detect, 960)
+        elif max_dancers_last_chunk > 4:
+            current_detect_size = max(base_detect, 960)
+        else:
+            current_detect_size = base_detect
+        max_dancers_this_chunk = 0
+        det_batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]] = []
+
+        def _flush_yolo_only_batch(
+            batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]],
+        ) -> None:
+            nonlocal yolo_infer_count, max_dancers_this_chunk
+            if not batch:
+                return
+            imgs = [b[4] for b in batch]
+            res_list = model.predict(
+                imgs,
+                classes=[0],
+                conf=yconf,
+                verbose=False,
+                half=y_half,
+            )
+            if not isinstance(res_list, (list, tuple)):
+                res_list = [res_list]
+            if len(res_list) != len(batch):
+                raise RuntimeError(
+                    f"YOLO infer batch: got {len(res_list)} result(s) for {len(batch)} image(s)"
+                )
+            for (frame_idx, frame, scale_x, scale_y, _rgb), r0 in zip(batch, res_list):
+                yolo_infer_count += 1
+                if r0.boxes is None or len(r0.boxes) == 0:
+                    dets = np.empty((0, 6), dtype=np.float32)
+                    phase1_pre_classical_by_frame[frame_idx] = []
+                else:
+                    xyxy = r0.boxes.xyxy.cpu().numpy()
+                    conf = r0.boxes.conf.cpu().numpy()
+                    xyxy[:, 0] *= scale_x
+                    xyxy[:, 1] *= scale_y
+                    xyxy[:, 2] *= scale_x
+                    xyxy[:, 3] *= scale_y
+                    if not _yolo26_series_weights(model_path):
+                        diou_keep = diou_nms_indices(xyxy, conf, iou_threshold=0.7)
+                        xyxy = xyxy[diou_keep]
+                        conf = conf[diou_keep]
+                    pre_pairs_ph1: List[Tuple[Tuple[float, float, float, float], float]] = []
+                    for i in range(len(xyxy)):
+                        r = xyxy[i]
+                        pre_pairs_ph1.append(
+                            ((float(r[0]), float(r[1]), float(r[2]), float(r[3])), float(conf[i]))
+                        )
+                    phase1_pre_classical_by_frame[frame_idx] = pre_pairs_ph1
+                    keep2 = classical_nms_indices(xyxy, conf, iou_thresh=_pretrack_classical_nms_iou())
+                    xyxy = xyxy[keep2]
+                    conf = conf[keep2]
+                    cls0 = np.zeros((len(xyxy), 1), dtype=np.float32)
+                    dets = np.hstack([xyxy, conf.reshape(-1, 1), cls0]).astype(np.float32)
+
+                yolo_pairs: List[Tuple[Tuple[float, float, float, float], float]] = []
+                if dets is not None and len(dets) > 0:
+                    for row in dets:
+                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                        cf = float(row[4])
+                        yolo_pairs.append(((x1, y1, x2, y2), cf))
+                phase1_dets_by_frame[frame_idx] = yolo_pairs
+                nd = len(yolo_pairs)
+                max_dancers_this_chunk = max(max_dancers_this_chunk, nd)
+                if lab_on_infer is not None and (yolo_infer_count == 1 or yolo_infer_count % 25 == 0):
+                    lab_on_infer(frame_idx, yolo_infer_count, nd)
+
+        for frame_idx, frame in chunk_frames:
+            if frame_idx % ystride != 0:
+                continue
+            h_fr, w_fr = frame.shape[:2]
+            frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
+            frame_low_rgb = frame_low[:, :, ::-1]
+            scale_x = w_fr / current_detect_size
+            scale_y = h_fr / current_detect_size
+            det_batch.append((frame_idx, frame, scale_x, scale_y, frame_low_rgb))
+            if len(det_batch) >= yolo_bs:
+                _flush_yolo_only_batch(det_batch)
+                det_batch.clear()
+
+        _flush_yolo_only_batch(det_batch)
+
+        max_dancers_last_chunk = max_dancers_this_chunk
+        total_frames += len(chunk_frames)
+        del chunk_frames
+
+    output_fps = native_fps
+    return (
+        total_frames,
+        float(output_fps),
+        float(native_fps),
+        frame_width,
+        frame_height,
+        int(ystride),
+        phase1_dets_by_frame,
+        phase1_pre_classical_by_frame,
+    )
+
+
+def run_boxmot_tracking_from_yolo_dets(
+    video_path: str,
+    yolo_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+    lab_on_infer: Optional[Callable[[int, int, int], None]] = None,
+) -> Tuple[
+    Dict[int, List[Any]],
+    int,
+    float,
+    Optional[List[Tuple[int, np.ndarray]]],
+    float,
+    int,
+    int,
+    int,
+    Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
+]:
+    """
+    Phases 2 (tracker + optional hybrid SAM) from a phase-1 YOLO checkpoint (BoxMOT path only).
+    Replays the video with the same chunking; for each detection frame, uses stored YOLO boxes+conf,
+    then hybrid SAM + ``tracker.update`` as in the normal pipeline.
+    """
+    from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
+
+    apply_boxmot_kf_unfreeze_guard()
+
+    tr = load_tracking_runtime()
+    yconf = float(tr["yolo_conf"])
+    ystride = int(tr["yolo_stride"])
+    yolo_bs = int(tr["yolo_infer_batch"])
+    base_detect = int(tr["detect_size"])
+
+    model_path = resolve_yolo_inference_weights()
+    bmk = boxmot_tracker_kind_from_env()
+    print(f"[resume phase1→track] {model_path} BoxMOT {bmk}; hybrid SAM + tracker from checkpoint dets.")
+    reid_w = _resolve_boxmot_reid_weights()
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _doc_kw = _deepocsort_extra_from_env()
+    src_fps = probe_video_fps(video_path)
+    tr_fps = max(1, int(round(src_fps)))
+    tracker = _create_boxmot_tracker(
+        bmk, yconf, dev, reid_w, _doc_kw, tracker_frame_rate=tr_fps
+    )
+    hybrid_cfg = load_hybrid_sam_config()
+    hybrid_refiner: Optional[HybridSamRefiner] = None
+    if hybrid_cfg["enabled"]:
+        hybrid_refiner = HybridSamRefiner(hybrid_cfg)
+
+    handshake_state = None
+    try:
+        from sway.handshake_tracking import SwayHandshakeState, phase13_handshake_enabled
+
+        if phase13_handshake_enabled():
+            handshake_state = SwayHandshakeState()
+    except Exception:
+        handshake_state = None
+
+    raw_tracks: Dict[int, List[Tuple[int, Tuple, float]]] = {}
+    phase1_dets_by_frame: Dict[int, List[Tuple[Tuple[float, float, float, float], float]]] = {}
+    total_frames = 0
+    native_fps = 30.0
+    frame_width = 1920
+    frame_height = 1080
+    max_dancers_last_chunk = 0
+    current_detect_size = base_detect
+    yolo_infer_count = 0
+
+    chunk_idx = -1
+    for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
+        chunk_idx += 1
+        native_fps = nfps
+        frame_width = w_f
+        frame_height = h_f
+        if os.environ.get("SWAY_GROUP_VIDEO", "").lower() in ("1", "true", "yes"):
+            current_detect_size = max(base_detect, 960)
+        elif max_dancers_last_chunk > 4:
+            current_detect_size = max(base_detect, 960)
+        else:
+            current_detect_size = base_detect
+        max_dancers_this_chunk = 0
+        det_batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]] = []
+
+        def _flush_track_from_checkpoint_batch(
+            batch: List[Tuple[int, np.ndarray, float, float, np.ndarray]],
+        ) -> None:
+            nonlocal yolo_infer_count, max_dancers_this_chunk
+            if not batch:
+                return
+            for (frame_idx, frame, scale_x, scale_y, _rgb) in batch:
+                yolo_infer_count += 1
+                pairs = yolo_dets_by_frame.get(frame_idx, [])
+                if not pairs:
+                    dets = np.empty((0, 6), dtype=np.float32)
+                else:
+                    rows = []
+                    for (x1, y1, x2, y2), cf in pairs:
+                        rows.append([x1, y1, x2, y2, cf, 0.0])
+                    dets = np.array(rows, dtype=np.float32)
+
+                yolo_pairs = list(pairs)
+                phase1_dets_by_frame[frame_idx] = yolo_pairs
+
+                hmeta: Dict[str, Any] = {}
+                if hybrid_refiner is not None:
+                    dets, hmeta = hybrid_refiner.refine_person_dets(frame, dets)
+                else:
+                    hmeta = {}
+
+                _hcfg = hybrid_cfg if hybrid_refiner is not None else load_hybrid_sam_config()
+                if handshake_state is not None:
+                    from sway.handshake_tracking import handshake_process_frame
+
+                    dets, hmeta = handshake_process_frame(
+                        handshake_state, frame, dets, hmeta, _hcfg
+                    )
+
+                sam2_roi_tuple: Optional[tuple] = None
+                if hybrid_refiner is not None and hmeta.get("used_sam"):
+                    fh, fw = frame.shape[:2]
+                    rb = hmeta.get("roi_box")
+                    if rb is not None and len(rb) >= 4:
+                        sam2_roi_tuple = tuple(float(x) for x in rb[:4])
+                    else:
+                        sam2_roi_tuple = (0.0, 0.0, float(fw), float(fh))
+
+                per_det_masks = hmeta.get("per_det_masks")
+                if per_det_masks is None:
+                    per_det_masks = [None] * int(len(dets))
+
+                out = tracker.update(dets, frame)
+                valid_dancers_this_frame = 0
+                if handshake_state is not None and out is not None and len(out) > 0:
+                    handshake_state.set_prev_tracker_out(np.atleast_2d(out))
+                if out is not None and len(out) > 0:
+                    out_arr = np.atleast_2d(out)
+                    mask_assign = assign_sam_masks_to_tracker_output(dets, out_arr, per_det_masks)
+                    for row_idx, row in enumerate(out_arr):
+                        x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                        tid = int(row[4])
+                        cf = float(row[5]) if len(row) > 5 else float(yconf)
+                        if tid < 0:
+                            continue
+                        valid_dancers_this_frame += 1
+                        box_hr = (x1, y1, x2, y2)
+                        is_sam, msk = mask_assign[row_idx] if row_idx < len(mask_assign) else (False, None)
+                        msk_fit = resize_mask_to_bbox(msk, box_hr) if msk is not None else None
+                        has_mask = msk_fit is not None and bool(np.any(msk_fit))
+                        if tid not in raw_tracks:
+                            raw_tracks[tid] = []
+                        raw_tracks[tid].append(
+                            TrackObservation(
+                                frame_idx,
+                                box_hr,
+                                cf,
+                                is_sam_refined=bool(is_sam and has_mask),
+                                segmentation_mask=msk_fit if has_mask else None,
+                                sam2_input_roi_xyxy=sam2_roi_tuple,
+                            )
+                        )
+                max_dancers_this_chunk = max(max_dancers_this_chunk, valid_dancers_this_frame)
+                if lab_on_infer is not None and (yolo_infer_count == 1 or yolo_infer_count % 25 == 0):
+                    lab_on_infer(frame_idx, yolo_infer_count, valid_dancers_this_frame)
+
+        for frame_idx, frame in chunk_frames:
+            if frame_idx % ystride != 0:
+                continue
+            h_fr, w_fr = frame.shape[:2]
+            frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
+            frame_low_rgb = frame_low[:, :, ::-1]
+            scale_x = w_fr / current_detect_size
+            scale_y = h_fr / current_detect_size
+            det_batch.append((frame_idx, frame, scale_x, scale_y, frame_low_rgb))
+            if len(det_batch) >= yolo_bs:
+                _flush_track_from_checkpoint_batch(det_batch)
+                det_batch.clear()
+
+        _flush_track_from_checkpoint_batch(det_batch)
+
+        max_dancers_last_chunk = max_dancers_this_chunk
+        total_frames += len(chunk_frames)
+        del chunk_frames
+
+    hybrid_stats: Dict[str, Any] = {}
+    if hybrid_refiner is not None:
+        hybrid_stats = hybrid_refiner.summary()
+
+    output_fps = native_fps
+    return (
+        raw_tracks,
+        total_frames,
+        float(output_fps),
+        None,
+        float(native_fps),
+        frame_width,
+        frame_height,
+        int(ystride),
+        hybrid_stats,
+        phase1_dets_by_frame,
+        {},
     )
 
 
@@ -1451,6 +1868,7 @@ def _run_tracking_botsort_pre_stitch(
     int,
     int,
     Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
     Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
     """Phases 1–2: YOLO track() + BoT-SORT (no post-track stitch)."""
@@ -1577,6 +1995,7 @@ def _run_tracking_botsort_pre_stitch(
         int(ystride),
         {},
         phase1_dets_by_frame,
+        phase1_dets_by_frame,
     )
 
 
@@ -1593,6 +2012,7 @@ def run_tracking_before_post_stitch(
     int,
     int,
     Dict[str, Any],
+    Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
     Dict[int, List[Tuple[Tuple[float, float, float, float], float]]],
 ]:
     """Phases 1–2 only: streaming YOLO + tracker; caller runs apply_post_track_stitching for Phase 3.
@@ -1618,7 +2038,7 @@ def run_tracking(
     Returns:
         raw_tracks, total_frames, output_fps, frames_list (None), native_fps, frame_width, frame_height
     """
-    raw, tf, ofps, fl, nf, fw, fh, ys, _hy, _p1 = run_tracking_before_post_stitch(video_path)
+    raw, tf, ofps, fl, nf, fw, fh, ys, _hy, _p1, _p1pre = run_tracking_before_post_stitch(video_path)
     raw = apply_post_track_stitching(raw, tf, ystride=ys)
     return raw, tf, ofps, fl, nf, fw, fh
 

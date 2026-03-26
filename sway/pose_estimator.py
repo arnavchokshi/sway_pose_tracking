@@ -49,6 +49,83 @@ COCO_SKELETON_EDGES = [
 BBOX_PADDING = 0.15
 
 
+def vitpose_smart_pad_enabled() -> bool:
+    """
+    Asymmetric crop expansion + aspect hint for ViTPose (``smart_expand_bbox_xyxy`` in ``main.py``).
+
+    **Default on** when unset. Production and Lab subprocesses set ``SWAY_VITPOSE_SMART_PAD=1`` via
+    ``apply_master_locked_pose_env`` / ``freeze_lab_subprocess_pose_env`` unless
+    ``SWAY_UNLOCK_POSE_TUNING=1``. Opt out explicitly with ``SWAY_VITPOSE_SMART_PAD=0`` / ``false`` /
+    ``no`` / ``off``.
+    """
+    v = os.environ.get("SWAY_VITPOSE_SMART_PAD", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return True
+
+
+def smart_expand_bbox_xyxy(
+    box: Tuple[float, float, float, float],
+    prev_box: Optional[Tuple[float, float, float, float]],
+    img_w: int,
+    img_h: int,
+    *,
+    base_pad_frac: float = 0.12,
+    target_wh_ratio: float = 0.5,
+    lead_frac: float = 0.20,
+    lift_top_frac: float = 0.40,
+) -> Tuple[float, float, float, float]:
+    """
+    Expand tracker box for ViTPose: optional velocity-leading side, lift-aware top pad,
+    then nudge aspect ratio toward ``target_wh_ratio`` (width / height) before a light symmetric pad.
+    """
+    x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+    if prev_box is not None:
+        px1, py1, px2, py2 = prev_box
+        pcx, pcy = (px1 + px2) * 0.5, (py1 + py2) * 0.5
+        dx, dy = cx - pcx, cy - pcy
+        if dx > 6.0:
+            x2 += lead_frac * w
+        elif dx < -6.0:
+            x1 -= lead_frac * w
+        if dy < -5.0 and abs(dx) < 5.0:
+            y1 -= lift_top_frac * h
+
+    # Aspect: ViTPose likes a tall-ish person crop; widen canvas (pad top/bottom) when box is too squat.
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    wh = w / h
+    if wh > target_wh_ratio + 1e-3:
+        need_h = w / target_wh_ratio
+        extra = max(0.0, need_h - h)
+        y1 -= 0.5 * extra
+        y2 += 0.5 * extra
+    elif wh < target_wh_ratio - 1e-3 and wh > 1e-6:
+        need_w = h * target_wh_ratio
+        extra = max(0.0, need_w - w)
+        x1 -= 0.5 * extra
+        x2 += 0.5 * extra
+
+    pw = base_pad_frac * max(1.0, x2 - x1)
+    ph = base_pad_frac * max(1.0, y2 - y1)
+    x1 -= pw
+    x2 += pw
+    y1 -= ph
+    y2 += ph
+
+    x1 = max(0.0, min(float(img_w - 1), x1))
+    y1 = max(0.0, min(float(img_h - 1), y1))
+    x2 = max(x1 + 1.0, min(float(img_w), x2))
+    y2 = max(y1 + 1.0, min(float(img_h), y2))
+    return (x1, y1, x2, y2)
+
+
 def vitpose_force_fp32() -> bool:
     """
     When True, keep ViTPose in float32 on MPS/CUDA (slower, sometimes numerically safer).

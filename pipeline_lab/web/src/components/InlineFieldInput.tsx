@@ -1,4 +1,5 @@
 import type { SchemaField } from '../types'
+import { labChoiceDisplayLabel } from '../lib/labChoiceLabels'
 import { renderConfigVisual } from './ConfigFieldVisual'
 
 const YOLO_CARD_META: Record<string, { accent: string; badge: string; hint: string }> = {
@@ -12,6 +13,25 @@ const YOLO_CARD_META: Record<string, { accent: string; badge: string; hint: stri
   yolo26x: { accent: '#f97316', badge: 'Slowest, sharpest', hint: 'Hard lighting & small bodies' },
 }
 
+/** Phases 1–3 bundled strategy (detection → track → stitch); each option replaces the whole early stack behavior. */
+const PHASE13_MODE_META: Record<string, { accent: string; badge: string; hint: string }> = {
+  standard: {
+    accent: '#94a3b8',
+    badge: 'Default',
+    hint: 'Hybrid SAM on heavy overlap, usual dormant + fragment stitch — the baseline path.',
+  },
+  dancer_registry: {
+    accent: '#a78bfa',
+    badge: 'Experimental',
+    hint: 'High-NMS anchors, hybrid SAM off while tracking, then a zonal verify pass after crossovers.',
+  },
+  sway_handshake: {
+    accent: '#22d3ee',
+    badge: 'Experimental',
+    hint: 'Builds a floor color registry; at IoU trigger, SAM checks masks vs registry to fix ID slips before BoxMOT.',
+  },
+}
+
 const POSE_CARD_META: Record<string, { accent: string; badge: string; hint: string }> = {
   'ViTPose-Base': { accent: '#34d399', badge: 'Light', hint: 'Default speed' },
   'ViTPose-Large': { accent: '#fbbf24', badge: 'Heavy', hint: 'Sharper poses' },
@@ -20,70 +40,16 @@ const POSE_CARD_META: Record<string, { accent: string; badge: string; hint: stri
   'Sapiens (ViTPose-Base fallback)': {
     accent: '#c084fc',
     badge: 'Sapiens slot',
-    hint: 'ViTPose-Base until native Sapiens is wired',
+    hint: 'Set SWAY_SAPIENS_TORCHSCRIPT on the API host for native .pt2; else ViTPose-Base',
   },
 }
 
 const BOOL_STATUS: Record<string, { on: string; off: string }> = {
   sway_hybrid_sam_weak_cues: { on: 'Stable-overlap gate on', off: 'IoU only' },
   sway_bidirectional_track_pass: { on: 'Forward + reverse pass', off: 'Forward only' },
-  sway_gnn_track_refine: { on: 'GNN hook on (stub)', off: 'Off' },
+  sway_gnn_track_refine: { on: 'GNN track refine (edge GAT + merge)', off: 'Off' },
   sway_hmr_mesh_sidecar: { on: 'hmr_mesh_sidecar.json', off: 'Off' },
-  montage: { on: 'Montage clip', off: 'No montage' },
-  save_phase_previews: { on: 'Phase clips saved', off: 'Skip previews' },
   temporal_pose_refine: { on: 'Neighbor blend on', off: 'Raw only' },
-}
-
-function choiceDisplayLabel(fieldId: string, raw: string): string {
-  switch (fieldId) {
-    case 'pose_stride':
-      if (raw === '1') return 'Every frame'
-      if (raw === '2') return 'Every other frame'
-      break
-    case 'tracker_technology':
-      if (raw === 'deep_ocsort') return 'Default (motion only)'
-      if (raw === 'deep_ocsort_osnet') return 'Deep OC-SORT + OSNet'
-      if (raw === 'BoxMOT') return 'Default (motion only)'
-      if (raw === 'StrongSORT') return 'Deep OC-SORT + OSNet'
-      if (raw === 'BoT-SORT' || raw === 'ByteTrack' || raw === 'OC-SORT') return 'Default (motion only)'
-      break
-    case 'sway_global_aflink_mode':
-      if (raw === 'neural_if_available') return 'Smart linker'
-      if (raw === 'force_heuristic') return 'Simple rules'
-      break
-    case 'sway_box_interp_mode':
-      if (raw === 'linear') return 'Linear'
-      if (raw === 'gsi') return 'GSI (smooth)'
-      break
-    case 'sway_pose_gap_interp_mode':
-      if (raw === 'linear') return 'Linear'
-      if (raw === 'gsi') return 'GSI (smooth)'
-      break
-    case 'sway_vis_temporal_interp_mode':
-      if (raw === 'linear') return 'Linear'
-      if (raw === 'gsi') return 'GSI (smooth)'
-      break
-    case 'pose_model':
-      if (raw === 'ViTPose-Base') return 'Base — fastest'
-      if (raw === 'ViTPose-Large') return 'Large — sharper'
-      if (raw === 'ViTPose-Huge') return 'Huge — heaviest'
-      if (raw === 'RTMPose-L') return 'RTMPose — speed test'
-      if (raw === 'Sapiens (ViTPose-Base fallback)') return 'Sapiens slot — ViT base'
-      break
-    case 'sway_boxmot_reid_model':
-      if (raw === 'osnet_x0_25') return 'Lighter'
-      if (raw === 'osnet_x1_0') return 'Heavier, finer'
-      break
-    case 'sway_yolo_weights':
-      if (raw === 'yolo26s') return 'YOLO26s'
-      if (raw === 'yolo26l') return 'YOLO26l'
-      if (raw === 'yolo26l_dancetrack') return 'YOLO26l · DanceTrack'
-      if (raw === 'yolo26x') return 'YOLO26x'
-      break
-    default:
-      break
-  }
-  return raw
 }
 
 function sliderStep(f: SchemaField): number {
@@ -212,7 +178,7 @@ export function InlineFieldInput({
                   transition: 'background 0.12s ease',
                 }}
               >
-                {choiceDisplayLabel(f.id, s)}
+                {labChoiceDisplayLabel(f.id, s)}
               </button>
             )
           })}
@@ -250,7 +216,7 @@ export function InlineFieldInput({
                   transition: 'border 0.12s ease, background 0.12s ease',
                 }}
               >
-                {choiceDisplayLabel(f.id, s)}
+                {labChoiceDisplayLabel(f.id, s)}
                 {isDis && (
                   <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)', marginTop: 2 }}>soon</div>
                 )}
@@ -261,11 +227,83 @@ export function InlineFieldInput({
       )
     }
 
+    if (f.display === 'phase13_mode_cards' && f.id === 'sway_phase13_mode') {
+      return (
+        <div
+          className="options-grid"
+          style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 148px), 1fr))', gap: '0.45rem' }}
+        >
+          {f.choices.map((c) => {
+            const s = String(c)
+            const isSelected = String(v ?? '') === s
+            const meta = PHASE13_MODE_META[s] ?? { accent: '#94a3b8', badge: '', hint: '' }
+            return (
+              <div
+                key={s}
+                className={`option-card ${isSelected ? 'selected' : ''}`}
+                onClick={() => onChange(s)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    onChange(s)
+                  }
+                }}
+                style={{
+                  padding: '0.55rem 0.5rem',
+                  minHeight: 92,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.3rem',
+                  cursor: 'pointer',
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: '0.62rem',
+                    fontWeight: 800,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.06em',
+                    color: '#7dd3fc',
+                  }}
+                >
+                  Phases 1–3
+                </div>
+                <div style={{ fontWeight: 700, fontSize: '0.8rem', lineHeight: 1.25, color: '#f8fafc' }}>
+                  {labChoiceDisplayLabel(f.id, s)}
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem', alignItems: 'center' }}>
+                  <span
+                    style={{
+                      fontSize: '0.62rem',
+                      fontWeight: 700,
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.04em',
+                      padding: '0.12rem 0.35rem',
+                      borderRadius: 6,
+                      background: 'rgba(0,0,0,0.35)',
+                      color: meta.accent,
+                    }}
+                  >
+                    {meta.badge}
+                  </span>
+                </div>
+                {meta.hint && (
+                  <span style={{ fontSize: '0.62rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>{meta.hint}</span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )
+    }
+
     if (f.display === 'model_cards' && f.id === 'sway_yolo_weights') {
       return (
         <div
           className="options-grid"
-          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '0.55rem' }}
+          style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 120px), 1fr))', gap: '0.45rem' }}
         >
           {f.choices.map((c) => {
             const s = String(c)
@@ -274,7 +312,7 @@ export function InlineFieldInput({
             const fileKey = `${s}.pt`
             const missing = modelsStatus && modelsStatus[fileKey] === false
             const recommended = s === 'yolo26l' && modelsStatus && modelsStatus['yolo26l.pt'] === true
-            const title = choiceDisplayLabel('sway_yolo_weights', s)
+            const title = labChoiceDisplayLabel('sway_yolo_weights', s)
             return (
               <div
                 key={s}
@@ -283,12 +321,12 @@ export function InlineFieldInput({
                 style={{
                   opacity: missing ? 0.55 : 1,
                   position: 'relative',
-                  padding: '0.65rem 0.55rem',
-                  minHeight: 88,
+                  padding: '0.5rem 0.45rem',
+                  minHeight: 72,
                   display: 'flex',
                   flexDirection: 'column',
                   justifyContent: 'space-between',
-                  gap: '0.35rem',
+                  gap: '0.28rem',
                 }}
               >
                 <div style={{ fontWeight: 700, fontSize: '0.78rem', lineHeight: 1.25, color: '#f8fafc' }}>{title}</div>
@@ -351,7 +389,7 @@ export function InlineFieldInput({
       return (
         <div
           className="options-grid"
-          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: '0.55rem' }}
+          style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 118px), 1fr))', gap: '0.45rem' }}
         >
           {f.choices.map((c) => {
             const s = String(c)
@@ -363,16 +401,16 @@ export function InlineFieldInput({
                 className={`option-card ${isSelected ? 'selected' : ''}`}
                 onClick={() => onChange(s)}
                 style={{
-                  padding: '0.65rem 0.5rem',
-                  minHeight: 80,
+                  padding: '0.5rem 0.45rem',
+                  minHeight: 66,
                   display: 'flex',
                   flexDirection: 'column',
                   justifyContent: 'space-between',
-                  gap: '0.3rem',
+                  gap: '0.25rem',
                 }}
               >
                 <div style={{ fontWeight: 700, fontSize: '0.75rem', color: '#f8fafc' }}>
-                  {choiceDisplayLabel(f.id, s)}
+                  {labChoiceDisplayLabel(f.id, s)}
                 </div>
                 <span
                   style={{
@@ -413,7 +451,7 @@ export function InlineFieldInput({
               }}
               title={isDis ? 'Not available in this version yet' : undefined}
             >
-              {choiceDisplayLabel(f.id, s)}
+              {labChoiceDisplayLabel(f.id, s)}
               {isDis && (
                 <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>coming soon</div>
               )}
@@ -436,7 +474,7 @@ export function InlineFieldInput({
         : null
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.32rem' }}>
         {viz}
         <input
           type="range"

@@ -42,6 +42,39 @@ git add -A && git commit -m "Your message"   # if you have changes
 git push origin main
 ```
 
+### CrowdHuman only — single command on Lambda (fresh box)
+
+You do **not** need CrowdHuman on your Mac. On the GPU instance, after `git clone` / `git pull` of this repo:
+
+1. **Upload your DanceTrack `best.pt`** (you already trained this) so the CrowdHuman stage can fine-tune from it:
+
+   ```bash
+   mkdir -p ~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights
+   # From your Mac (replace IP and local path):
+   scp /path/to/your_dancetrack_best.pt ubuntu@<LAMBDA_IP>:~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt
+   ```
+
+   Or put the file anywhere on Lambda and set `YOLO_CROWDHUMAN_PARENT_WEIGHTS=/absolute/path/to/best.pt` in the shell before the one-shot.
+
+2. **Disk:** use a volume with enough free space (CrowdHuman fetch recommends **≥ ~22 GiB** free before download).
+
+3. **One command** from `~/sway_pose_tracking` (installs venv + PyTorch, downloads CrowdHuman from Hugging Face, converts to YOLO, trains):
+
+   ```bash
+   cd ~/sway_pose_tracking && bash scripts/phase2_public_training/run_lambda_crowdhuman_one_shot.sh
+   ```
+
+   Output weights: `~/sway_pose_tracking/runs/detect/yolo26l_crowdhuman_ft/weights/best.pt` — copy to your Mac as `models/yolo26l_dancetrack.pt` (see “Weights when done” below).
+
+**Logs & recovery**
+
+- **One-shot session log:** `~/sway_pose_tracking/training_one_shot_latest.log` (and a dated `training_one_shot_*.log`).
+- **Pipeline log (fetch + train):** `~/sway_pose_tracking/training_full_latest.log` plus per-run `training_full_*.log`.
+- **Per-run manifest:** `runs/detect/<run_name>/training_manifest.json` (hyperparameters, git hash).
+- **Resume training** if the job died but `runs/detect/<run_name>/weights/last.pt` exists:  
+  `YOLO_TRAIN_RESUME=1 .venv/bin/python -u scripts/phase2_public_training/train_yolo26l.py --phase crowdhuman --resume`  
+  (use the same `--phase` as before; `--resume-from` optional if `last.pt` is elsewhere).
+
 ---
 
 ## On each run (do in order)
@@ -69,17 +102,29 @@ git clone https://github.com/arnavchokshi/sway_pose_tracking.git
 cd ~/sway_pose_tracking
 tmux new -s train
 chmod +x scripts/phase2_public_training/setup_lambda_training.sh \
-         scripts/phase2_public_training/run_lambda_train_dancetrack.sh
+         scripts/phase2_public_training/run_lambda_yolo_train.sh \
+         scripts/phase2_public_training/run_lambda_train_dancetrack.sh \
+         scripts/phase2_public_training/run_lambda_train_dancetrack_crowdhuman.sh \
+         scripts/phase2_public_training/run_lambda_train_crowdhuman.sh
 bash scripts/phase2_public_training/setup_lambda_training.sh
 bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh
 ```
+
+- **DanceTrack + CrowdHuman in one go** (recommended if you want the same `yolo26l_dancetrack.pt` slot in the app, but weights include CrowdHuman fine-tune): after `setup_lambda_training.sh`, run  
+  `bash scripts/phase2_public_training/run_lambda_train_dancetrack_crowdhuman.sh`  
+  This runs DanceTrack fetch/convert/train, then CrowdHuman (HF) fetch/convert/train. **Disk:** CrowdHuman adds several tens of GB — use a large volume; `fetch_crowdhuman_hf.py` aborts if free space is too low.
+- **CrowdHuman only** (same instance, DanceTrack already finished and `yolo26l_dancetrack_only/weights/best.pt` exists):  
+  `bash scripts/phase2_public_training/run_lambda_train_crowdhuman.sh`  
+  Or: `YOLO_LAMBDA_PIPELINE=crowdhuman bash scripts/phase2_public_training/run_lambda_yolo_train.sh`
+- **CrowdHuman only, DanceTrack weights from your machine:** `scp` your DanceTrack `best.pt` to the instance (e.g. under `~/sway_pose_tracking/`), then either move it to `runs/detect/yolo26l_dancetrack_only/weights/best.pt`, or set **`YOLO_CROWDHUMAN_PARENT_WEIGHTS=/absolute/path/to/your_best.pt`** when running the CrowdHuman pipeline above.
 
 - Detach tmux (session keeps running): **Ctrl+B**, then **D**.  
 - Reattach: `tmux attach -t train`
 
 Weights when done:
 
-`~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt`
+- DanceTrack-only run: `~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt`
+- After CrowdHuman stage: **`~/sway_pose_tracking/runs/detect/yolo26l_crowdhuman_ft/weights/best.pt`** — copy this to your Mac as `models/yolo26l_dancetrack.pt` (same env var / Lab token as before).
 
 **Quick status from your Mac** (one-shot, safe in Cursor — replace IP if the dashboard changed):
 
@@ -116,12 +161,22 @@ cd ~/sway_pose_tracking
 
 ### 4. Mac — download weights
 
-New Terminal tab on your Mac:
+New Terminal tab on your Mac.
+
+**DanceTrack-only** (`run_lambda_train_dancetrack.sh`):
 
 ```bash
 scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
   ubuntu@132.145.211.165:~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt \
   ~/Desktop/yolo26l_dancetrack_only_best.pt
+```
+
+**After CrowdHuman fine-tune** (`run_lambda_train_dancetrack_crowdhuman.sh` or `run_lambda_train_crowdhuman.sh`):
+
+```bash
+scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
+  ubuntu@132.145.211.165:~/sway_pose_tracking/runs/detect/yolo26l_crowdhuman_ft/weights/best.pt \
+  ~/Desktop/yolo26l_crowdhuman_ft_best.pt
 ```
 
 ### 5. Mac — install weights for the app
@@ -130,8 +185,9 @@ scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
 # Set SWAY_REPO to your local sway_pose_mvp directory (the folder that contains main.py).
 export SWAY_REPO="$HOME/path/to/sway_pose_mvp"
 mkdir -p "$SWAY_REPO/models"
-mv ~/Desktop/yolo26l_dancetrack_only_best.pt \
-  "$SWAY_REPO/models/yolo26l_dancetrack.pt"
+# Use the Desktop filename from step 4 (DanceTrack-only or CrowdHuman-stage — same destination name):
+mv ~/Desktop/yolo26l_dancetrack_only_best.pt "$SWAY_REPO/models/yolo26l_dancetrack.pt"
+# If you scp'd CrowdHuman weights instead: mv ~/Desktop/yolo26l_crowdhuman_ft_best.pt "$SWAY_REPO/models/yolo26l_dancetrack.pt"
 export SWAY_YOLO_WEIGHTS="$SWAY_REPO/models/yolo26l_dancetrack.pt"
 ```
 

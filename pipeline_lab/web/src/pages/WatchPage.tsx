@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { API } from '../types'
 import type { ProgressLine } from '../types'
 import {
@@ -25,8 +25,11 @@ import {
 } from '../lib/watchPrune'
 import { WATCH_PHASE_TUNING_FIELD_IDS } from '../lib/watchPhaseTuning'
 import { formatConfigValue } from '../lib/formatConfigValue'
+import { videoContainContentRect } from '../lib/videoContentRect'
+import { sam2RoiLayerStyles } from '../lib/sam2RoiOverlay'
 import { ArrowLeft, Box, Clapperboard, Film, RotateCw, Search, Gauge } from 'lucide-react'
 import { TrackQualitySummary, PipelineImpactReport, FriendlyRunConfig, RunOverviewStrip } from '../components/RunMetrics'
+import { CauseConfigBlock, TierBBlock } from '../components/PruneInspectBlocks'
 import type { Schema } from '../types'
 
 type RunDetail = {
@@ -170,162 +173,6 @@ function WatchPhaseTuningBlock({
           <code style={{ fontSize: '0.6rem' }}>/api/schema</code>.
         </div>
       )}
-    </div>
-  )
-}
-
-/** Map bbox from video pixel space onto the letterboxed `object-fit: contain` video element. */
-function videoContainContentRect(video: HTMLVideoElement): {
-  left: number
-  top: number
-  w: number
-  h: number
-  scale: number
-} | null {
-  const vw = video.videoWidth
-  const vh = video.videoHeight
-  const cw = video.clientWidth
-  const ch = video.clientHeight
-  if (!vw || !vh || !cw || !ch) return null
-  const scale = Math.min(cw / vw, ch / vh)
-  const dw = vw * scale
-  const dh = vh * scale
-  return {
-    left: (cw - dw) / 2,
-    top: (ch - dh) / 2,
-    w: dw,
-    h: dh,
-    scale,
-  }
-}
-
-/** Live overlay: dashed box + label in letterboxed video coordinates (matches burned-in preview). */
-function sam2RoiLayerStyles(
-  roi: [number, number, number, number],
-  video: HTMLVideoElement,
-): { box: CSSProperties; label: CSSProperties } | null {
-  const c = videoContainContentRect(video)
-  if (!c) return null
-  const [x1, y1, x2, y2] = roi
-  const left = c.left + x1 * c.scale
-  const top = c.top + y1 * c.scale
-  const width = Math.max(0, (x2 - x1) * c.scale)
-  const height = Math.max(0, (y2 - y1) * c.scale)
-  const labelTop = Math.max(c.top + 4, top - 22)
-  return {
-    box: {
-      position: 'absolute',
-      left,
-      top,
-      width,
-      height,
-      pointerEvents: 'none',
-      boxSizing: 'border-box',
-      border: '2px dashed rgba(255, 140, 0, 0.92)',
-      borderRadius: 6,
-      boxShadow: '0 0 0 1px rgba(0,0,0,0.45)',
-      zIndex: 3,
-    },
-    label: {
-      position: 'absolute',
-      left,
-      top: labelTop,
-      pointerEvents: 'none',
-      fontSize: '0.68rem',
-      fontWeight: 700,
-      letterSpacing: '0.06em',
-      textTransform: 'uppercase',
-      color: '#ffb020',
-      textShadow: '0 0 8px rgba(0,0,0,0.95)',
-      whiteSpace: 'nowrap',
-      zIndex: 4,
-    },
-  }
-}
-
-function formatCauseParamValue(v: unknown): string {
-  if (v === null || v === undefined) return '—'
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
-  if (typeof v === 'string') return v
-  if (Array.isArray(v)) return JSON.stringify(v)
-  if (typeof v === 'object') return JSON.stringify(v)
-  return String(v)
-}
-
-function CauseConfigBlock({ e }: { e: PruneEntry }) {
-  const cc = e.cause_config as
-    | { filter?: string; summary?: string; params?: Record<string, unknown> }
-    | undefined
-  if (!cc || typeof cc !== 'object') return null
-  const paramEntries =
-    cc.params && typeof cc.params === 'object' ? Object.entries(cc.params) : []
-  if (!cc.summary && !cc.filter && paramEntries.length === 0) return null
-  return (
-    <div
-      style={{
-        marginTop: '0.35rem',
-        padding: '0.45rem 0.55rem',
-        borderRadius: 8,
-        background: 'rgba(30, 41, 59, 0.55)',
-        border: '1px solid rgba(148, 163, 184, 0.2)',
-        fontSize: '0.7rem',
-        lineHeight: 1.45,
-        color: '#cbd5e1',
-      }}
-      onClick={(ev) => ev.stopPropagation()}
-    >
-      <div style={{ fontWeight: 600, color: '#93c5fd', marginBottom: '0.2rem' }}>Filter / configuration</div>
-      {cc.filter != null && cc.filter !== '' && (
-        <div>
-          <span style={{ color: 'var(--text-muted)' }}>id </span>
-          {cc.filter}
-        </div>
-      )}
-      {cc.summary != null && cc.summary !== '' && (
-        <div style={{ marginTop: '0.15rem' }}>{cc.summary}</div>
-      )}
-      {paramEntries.length > 0 && (
-        <div
-          style={{
-            marginTop: '0.25rem',
-            fontFamily: 'ui-monospace, monospace',
-            fontSize: '0.65rem',
-            color: '#e2e8f0',
-            wordBreak: 'break-word',
-          }}
-        >
-          {paramEntries.map(([k, v]) => (
-            <div key={k}>
-              {k}: {formatCauseParamValue(v)}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function TierBBlock({ e }: { e: PruneEntry }) {
-  const raw = e.tier_b_vote as
-    | { weighted_sum?: number; prune_threshold?: number; rule_hits?: Record<string, number> }
-    | undefined
-  if (!raw) return null
-  const hits = raw.rule_hits ?? {}
-  const lines = Object.entries(hits)
-    .filter(([, v]) => Number(v) > 0)
-    .map(([k]) => k.replace(/^prune_/, '').replace(/_tracks$/, ''))
-  return (
-    <div style={{ marginTop: '0.45rem', fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
-      <div>
-        Weighted sum <span style={{ color: '#e2e8f0' }}>{raw.weighted_sum}</span>
-        {raw.prune_threshold != null && (
-          <>
-            {' '}
-            vs threshold <span style={{ color: '#e2e8f0' }}>{raw.prune_threshold}</span>
-          </>
-        )}
-      </div>
-      {lines.length > 0 && <div>Rules firing: {lines.join(', ')}</div>}
     </div>
   )
 }
@@ -913,6 +760,11 @@ export function WatchPage() {
           <button type="button" className="btn" onClick={() => nav(-1)}>
             <ArrowLeft size={18} /> Back
           </button>
+          {isDone && id ? (
+            <Link to={`/watch/${id}/live`} className="btn">
+              Live sandbox
+            </Link>
+          ) : null}
           <div>
             <h1 style={{ fontSize: '1.2rem', margin: 0, fontWeight: 600 }}>{title || 'Output'}</h1>
             <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
@@ -1338,9 +1190,11 @@ export function WatchPage() {
 
             {currentPhaseId === 'pose' && (
               <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5, margin: '0 0 0.5rem' }}>
-                No track-level prune rows are logged during pose itself. Check the recipe snapshot above for model (ViTPose vs
-                RTMPose-L), stride, gap interpolation, visibility threshold, and 3D lift — then adjust in the Lab Config page if
-                overlays look soft or sparse.
+                No track-level prune rows are logged during pose itself. The Lab locks{' '}
+                <strong style={{ color: '#e2e8f0' }}>pose_stride=1</strong> (every frame) and{' '}
+                <strong style={{ color: '#e2e8f0' }}>linear</strong> interpolation by default — skip-frame + GSI shortcuts are
+                not the choreography path. Check the recipe snapshot for model (ViTPose vs RTMPose-L), visibility threshold, and
+                3D lift; adjust on the Lab Config page if overlays look soft or sparse.
               </p>
             )}
 

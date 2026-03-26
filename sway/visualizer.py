@@ -179,12 +179,26 @@ def draw_tracks_post_stitch_preview(
     boxes: List[tuple],
     track_ids: List[int],
     sam2_input_roi_xyxy: Optional[Sequence[float]] = None,
+    *,
+    is_sam_refined: Optional[List[bool]] = None,
+    segmentation_masks: Optional[List[Optional[np.ndarray]]] = None,
 ) -> np.ndarray:
     """
-    Phase 1–3 preview: boxes/IDs plus optional dashed rectangle for the image region fed to SAM2
-    when hybrid overlap refinement ran (ROI crop or full frame).
+    Phase 1–3 preview: boxes/IDs, optional hybrid-SAM colored pixels (same rules as export
+    segmentation_style), plus optional dashed rectangle for the image region fed to SAM2.
     """
-    out = draw_boxes_only(frame, boxes, track_ids)
+    flags = is_sam_refined if isinstance(is_sam_refined, list) else []
+    use_seg = bool(flags) and any(flags)
+    if use_seg:
+        out = draw_segmentation_style(
+            frame,
+            boxes,
+            track_ids,
+            is_sam_refined=is_sam_refined,
+            segmentation_masks=segmentation_masks,
+        )
+    else:
+        out = draw_boxes_only(frame, boxes, track_ids)
     if sam2_input_roi_xyxy is None or len(sam2_input_roi_xyxy) < 4:
         return out
     h, w = out.shape[:2]
@@ -1015,6 +1029,17 @@ def _interpolate_frame_data(
 
     p1b, p1c = _pick_phase1_dets_for_interp(fd_lo, fd_hi, t)
 
+    def _pick_sam2_roi_xyxy() -> Optional[List[float]]:
+        r_lo = fd_lo.get("sam2_input_roi_xyxy")
+        r_hi = fd_hi.get("sam2_input_roi_xyxy")
+        if t < 0.5:
+            chosen = r_lo if r_lo is not None else r_hi
+        else:
+            chosen = r_hi if r_hi is not None else r_lo
+        if chosen is None or len(chosen) < 4:
+            return None
+        return [float(chosen[i]) for i in range(4)]
+
     return {
         "boxes": boxes_out,
         "track_ids": track_ids_out,
@@ -1024,6 +1049,7 @@ def _interpolate_frame_data(
         "timing_errors": timing_out,
         "is_sam_refined": is_sam_out,
         "segmentation_masks": seg_masks_out,
+        "sam2_input_roi_xyxy": _pick_sam2_roi_xyxy(),
         "phase1_boxes": p1b,
         "phase1_confs": p1c,
     }

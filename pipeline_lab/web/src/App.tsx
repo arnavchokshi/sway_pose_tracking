@@ -5,18 +5,20 @@ import { LabPage } from './pages/LabPage'
 import { ConfigPage } from './pages/ConfigPage'
 import { ComparePage } from './pages/ComparePage'
 import { WatchPage } from './pages/WatchPage'
+import { LiveSandboxPage } from './pages/LiveSandboxPage'
 
 export default function App() {
   return (
     <BrowserRouter>
       <LabProvider>
-        <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: '100vh' }}>
+        <div className="app-root">
           <NavBar />
           <main className="main-content">
             <Routes>
               <Route path="/" element={<LabPage />} />
               <Route path="/config" element={<ConfigPage />} />
               <Route path="/compare" element={<ComparePage />} />
+              <Route path="/watch/:id/live" element={<LiveSandboxPage />} />
               <Route path="/watch/:id" element={<WatchPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

@@ -2,13 +2,22 @@
  * Restore lab UI after refresh: session run IDs + drafts (localStorage), video blob (IndexedDB).
  */
 
+type PersistedParentRef =
+  | { kind: 'none' }
+  | { kind: 'single'; parentClientId: string }
+  | { kind: 'all_roots' }
+  | { kind: 'all_at_level'; level: number }
+
 export type PersistedDraftRun = {
   clientId: string
   recipeName: string
   fields: Record<string, unknown>
+  treeLevel?: number
+  parentRef?: PersistedParentRef
 }
 
 const LS_RUN_IDS = 'sway_lab_session_run_ids'
+const LS_BATCH_FILTER = 'sway_lab_session_batch_filter_id'
 const LS_DRAFTS = 'sway_lab_drafts'
 
 const IDB_NAME = 'sway-pipeline-lab-v1'
@@ -111,7 +120,21 @@ function safeParseDrafts(raw: string | null): PersistedDraftRun[] {
       const recipeName = typeof o.recipeName === 'string' ? o.recipeName : 'Run'
       const fields = o.fields && typeof o.fields === 'object' && o.fields !== null ? (o.fields as Record<string, unknown>) : {}
       if (!clientId) continue
-      out.push({ clientId, recipeName, fields })
+      const treeLevel = typeof o.treeLevel === 'number' && Number.isFinite(o.treeLevel) ? Math.max(0, Math.floor(o.treeLevel)) : 0
+      let parentRef: PersistedParentRef = { kind: 'none' }
+      const pr = o.parentRef
+      if (pr && typeof pr === 'object' && pr !== null) {
+        const p = pr as Record<string, unknown>
+        const k = p.kind
+        if (k === 'single' && typeof p.parentClientId === 'string') {
+          parentRef = { kind: 'single', parentClientId: p.parentClientId }
+        } else if (k === 'all_roots') {
+          parentRef = { kind: 'all_roots' }
+        } else if (k === 'all_at_level' && typeof p.level === 'number' && Number.isFinite(p.level)) {
+          parentRef = { kind: 'all_at_level', level: Math.max(0, Math.floor(p.level)) }
+        }
+      }
+      out.push({ clientId, recipeName, fields, treeLevel, parentRef })
     }
     return out
   } catch {
@@ -144,6 +167,27 @@ export function persistSessionRunIds(ids: string[]): void {
   }
 }
 
+/** Persisted so a refresh on `/` still expands the same Lab batch (CLI adds runs with the same batch_id). */
+export function loadSessionBatchFilterId(): string | null {
+  try {
+    const raw = localStorage.getItem(LS_BATCH_FILTER)
+    const t = raw?.trim()
+    return t && t.length > 0 ? t : null
+  } catch {
+    return null
+  }
+}
+
+export function persistSessionBatchFilterId(id: string | null): void {
+  try {
+    const t = id?.trim()
+    if (!t) localStorage.removeItem(LS_BATCH_FILTER)
+    else localStorage.setItem(LS_BATCH_FILTER, t)
+  } catch {
+    /* quota / private mode */
+  }
+}
+
 export function persistDrafts(drafts: PersistedDraftRun[]): void {
   try {
     if (drafts.length === 0) localStorage.removeItem(LS_DRAFTS)
@@ -156,6 +200,7 @@ export function persistDrafts(drafts: PersistedDraftRun[]): void {
 export function clearLabLocalStorage(): void {
   try {
     localStorage.removeItem(LS_RUN_IDS)
+    localStorage.removeItem(LS_BATCH_FILTER)
     localStorage.removeItem(LS_DRAFTS)
   } catch {
     /* ignore */

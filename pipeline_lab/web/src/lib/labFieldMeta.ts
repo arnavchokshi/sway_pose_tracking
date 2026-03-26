@@ -16,11 +16,11 @@ export function isSchemaFieldVisible(f: SchemaField, state: Record<string, unkno
 }
 
 const TIER1_SORT: string[] = [
+  'sway_phase13_mode',
   'sway_yolo_weights',
-  'tracker_technology',
   'sway_hybrid_sam_iou_trigger',
+  'sway_boxmot_max_age',
   'sway_global_aflink_mode',
-  'sway_boxmot_reid_model',
   'pose_model',
   'temporal_pose_refine',
 ]

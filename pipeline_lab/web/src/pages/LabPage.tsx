@@ -1,17 +1,20 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ComponentType,
-  type CSSProperties,
-} from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { PIPELINE_LAB_LOCAL } from '../siteUrls'
 import { API } from '../types'
-import type { Schema, RunInfo, ProgressLine } from '../types'
+import type { BatchSummary, Schema, RunInfo, ProgressLine } from '../types'
 import { safeJsonPreview } from '../lib/jsonPreview'
 import { isProbableVideoFile, VIDEO_ACCEPT_ATTR } from '../lib/videoFile'
+import { loadSessionBatchFilterId, persistSessionBatchFilterId } from '../lib/labPersistence'
+import { statusPresentationForRun } from '../lib/runStatusPresentation'
+import {
+  computePhaseDepths,
+  flattenTreeVisualOrder,
+  sessionHasCheckpointTree,
+  subtreeRunIdsInSession,
+} from '../lib/batchTreeLayout'
+import { compareViewModeForTreeColumn } from '../lib/treeColumnCompareView'
+import { BatchTreeView } from '../components/BatchTreeView'
 import { useLab } from '../context/LabContext'
 import { RunEditorModal } from '../components/RunEditorModal'
 import { RunConfigModal } from '../components/RunConfigModal'
@@ -24,24 +27,18 @@ import {
   Trash2,
   Clapperboard,
   Columns2,
-  Loader2,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  CircleDashed,
   Terminal,
   Settings2,
   StopCircle,
-  Unplug,
   RotateCw,
   Upload,
-  ListChecks,
+  LayoutGrid,
+  GitBranch,
 } from 'lucide-react'
+
 function formatShortId(runId: string) {
   return runId.length > 12 ? `${runId.slice(0, 8)}…` : runId
 }
-
-const MATRIX_HIDDEN_STORAGE_KEY = 'sway_lab_matrix_hidden_recipes'
 
 function formatCreated(iso?: string) {
   if (!iso) return null
@@ -52,71 +49,6 @@ function formatCreated(iso?: string) {
   } catch {
     return null
   }
-}
-
-function statusPresentation(status: string): {
-  title: string
-  subtitle: string
-  color: string
-  Icon: ComponentType<{ size?: number; className?: string; style?: CSSProperties }>
-} {
-  switch (status) {
-    case 'done':
-      return {
-        title: 'Complete',
-        subtitle: 'Outputs are ready — open Watch for phase clips and render styles.',
-        color: '#10b981',
-        Icon: CheckCircle2,
-      }
-    case 'running':
-      return {
-        title: 'Running',
-        subtitle: 'Pipeline is executing (detection → pose → export). This can take a while.',
-        color: '#0ea5e9',
-        Icon: Loader2,
-      }
-    case 'queued':
-      return {
-        title: 'Queued',
-        subtitle: 'Waiting to start — runs start one after another when workers are free.',
-        color: '#a78bfa',
-        Icon: Clock,
-      }
-    case 'error':
-      return {
-        title: 'Failed',
-        subtitle: 'This run stopped with an error. Check the message below or server logs.',
-        color: '#ef4444',
-        Icon: XCircle,
-      }
-    case 'cancelled':
-      return {
-        title: 'Stopped',
-        subtitle: 'You stopped this run from the Lab. Partial outputs may exist under the run folder.',
-        color: '#fbbf24',
-        Icon: StopCircle,
-      }
-    default:
-      return {
-        title: status || 'Unknown',
-        subtitle: 'Status not reported yet — try refreshing in a few seconds.',
-        color: '#94a3b8',
-        Icon: CircleDashed,
-      }
-  }
-}
-
-function statusPresentationForRun(run: Pick<RunInfo, 'status' | 'subprocess_alive'>): ReturnType<typeof statusPresentation> {
-  if (run.status === 'running' && run.subprocess_alive === false) {
-    return {
-      title: 'Stale (not attached)',
-      subtitle:
-        'The run folder still looks in-progress, but this API process is not running main.py for it (common after restarting uvicorn). Delete the run or start a new batch — Stop is unavailable.',
-      color: '#f59e0b',
-      Icon: Unplug,
-    }
-  }
-  return statusPresentation(run.status)
 }
 
 function isCompletedProgressRow(p: ProgressLine) {
@@ -422,6 +354,7 @@ function RunPipelineDetail({
 export function LabPage() {
   const nav = useNavigate()
   const location = useLocation()
+  const [searchParams, setSearchParams] = useSearchParams()
   const {
     videoFile,
     videoLabel,
@@ -442,6 +375,12 @@ export function LabPage() {
   const [editingId, setEditingId] = useState<string | null>(null)
 
   const [batchError, setBatchError] = useState<string | null>(null)
+  const [treePresets, setTreePresets] = useState<Array<{ id: string; filename: string }>>([])
+  const [treePresetId, setTreePresetId] = useState('')
+  const [treeVideoA, setTreeVideoA] = useState<File | null>(null)
+  const [treeVideoB, setTreeVideoB] = useState<File | null>(null)
+  const [treeQueueBusy, setTreeQueueBusy] = useState(false)
+  const [treeQueueError, setTreeQueueError] = useState<string | null>(null)
   const [starting, setStarting] = useState(false)
   const [configRunId, setConfigRunId] = useState<string | null>(null)
 
@@ -451,26 +390,160 @@ export function LabPage() {
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null)
   const [rerunningRunId, setRerunningRunId] = useState<string | null>(null)
-  const dropDepthRef = useRef(0)
-  const [dropActive, setDropActive] = useState(false)
+  const [fileDropOverlay, setFileDropOverlay] = useState(false)
 
-  type MatrixRecipeRow = {
-    id: string
-    recipe_name: string
-    description?: string
-    varies?: string
-    fields: Record<string, unknown>
-  }
-  type MatrixPayload = { version: number; intro: string; recipes: MatrixRecipeRow[] }
-  const [matrixPayload, setMatrixPayload] = useState<MatrixPayload | null>(null)
-  const [matrixLoadError, setMatrixLoadError] = useState<string | null>(null)
-  const [matrixHiddenRecipeIds, setMatrixHiddenRecipeIds] = useState<string[]>([])
-  const [matrixSelectedIds, setMatrixSelectedIds] = useState<string[]>([])
-  const [matrixPathInput, setMatrixPathInput] = useState('')
-  const [matrixQueueing, setMatrixQueueing] = useState(false)
-  const [matrixBannerError, setMatrixBannerError] = useState<string | null>(null)
-  const lastMatrixVersionRef = useRef<number | null>(null)
   const [deletingAllRuns, setDeletingAllRuns] = useState(false)
+  const [batchViewMode, setBatchViewMode] = useState<'list' | 'tree'>('list')
+  /** Batches on the API when this browser has no session yet (resume without ``?batch=``). */
+  const [serverBatchesHint, setServerBatchesHint] = useState<BatchSummary[]>([])
+  const [treeCompareSelected, setTreeCompareSelected] = useState<Set<string>>(() => new Set())
+  /** Anchor run for shift-click range select on tree Compare (last plain click on a finished run). */
+  const treeCompareAnchorRef = useRef<string | null>(null)
+  const urlSessionFromQueryDone = useRef(false)
+  /** When set (from `?batch=`), session run list is re-synced from GET /api/runs so CLI fan-out adds new runs with the same batch_id. */
+  const [sessionBatchFilterId, setSessionBatchFilterId] = useState<string | null>(null)
+  const prevSessionRunCountRef = useRef(0)
+
+  useEffect(() => {
+    if (!labHydrated || urlSessionFromQueryDone.current) return
+    const batch = searchParams.get('batch')?.trim()
+    const runsParam = searchParams.get('runs')?.trim()
+    if (!batch && !runsParam) return
+    urlSessionFromQueryDone.current = true
+
+    const stripBatchRunsParams = () => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete('batch')
+          next.delete('runs')
+          return next
+        },
+        { replace: true },
+      )
+    }
+
+    if (runsParam) {
+      setSessionBatchFilterId(null)
+      const ids = runsParam.split(',').map((s) => s.trim()).filter(Boolean)
+      if (ids.length > 0) setSessionRunIds(ids)
+      stripBatchRunsParams()
+      return
+    }
+
+    if (batch) {
+      setSessionBatchFilterId(batch)
+      stripBatchRunsParams()
+    }
+  }, [labHydrated, searchParams, setSearchParams, setSessionRunIds])
+
+  useEffect(() => {
+    if (!sessionBatchFilterId) return
+    const syncFromBatch = () => {
+      void fetch(`${API}/api/runs`)
+        .then((r) => r.json())
+        .then((rows: unknown) => {
+          if (!Array.isArray(rows)) return
+          const matched = rows.filter(
+            (x): x is RunInfo =>
+              typeof x === 'object' && x !== null && (x as RunInfo).batch_id === sessionBatchFilterId,
+          )
+          matched.sort((a, b) => {
+            const ca = a.created ?? ''
+            const cb = b.created ?? ''
+            if (ca !== cb) return ca.localeCompare(cb)
+            return a.run_id.localeCompare(b.run_id)
+          })
+          const nextIds = matched.map((x) => x.run_id)
+          setSessionRunIds((prev) => {
+            if (prev.length === nextIds.length && prev.every((id, i) => id === nextIds[i])) return prev
+            return nextIds
+          })
+        })
+        .catch(() => {
+          /* offline / CORS */
+        })
+    }
+    syncFromBatch()
+    const t = setInterval(syncFromBatch, 2000)
+    return () => clearInterval(t)
+  }, [sessionBatchFilterId, setSessionRunIds])
+
+  useEffect(() => {
+    if (prevSessionRunCountRef.current > 0 && sessionRunIds.length === 0) {
+      setSessionBatchFilterId(null)
+    }
+    prevSessionRunCountRef.current = sessionRunIds.length
+  }, [sessionRunIds.length])
+
+  const prevBatchFilterRef = useRef<string | null | undefined>(undefined)
+  useEffect(() => {
+    if (sessionBatchFilterId !== null) {
+      persistSessionBatchFilterId(sessionBatchFilterId)
+    } else if (prevBatchFilterRef.current !== undefined && prevBatchFilterRef.current !== null) {
+      persistSessionBatchFilterId(null)
+    }
+    prevBatchFilterRef.current = sessionBatchFilterId
+  }, [sessionBatchFilterId])
+
+  /** After refresh on `/`, `?batch=` is gone — restore filter from localStorage unless a new `?batch=` is in the URL. */
+  useEffect(() => {
+    if (!labHydrated) return
+    if (searchParams.get('batch')?.trim()) return
+    const fromLs = loadSessionBatchFilterId()
+    if (!fromLs) return
+    setSessionBatchFilterId((cur) => (cur ? cur : fromLs))
+  }, [labHydrated, searchParams])
+
+  function parseBatchSummaries(rows: unknown): BatchSummary[] {
+    if (!Array.isArray(rows)) return []
+    const out: BatchSummary[] = []
+    for (const x of rows) {
+      if (!x || typeof x !== 'object') continue
+      const o = x as Record<string, unknown>
+      if (typeof o.batch_id !== 'string' || !o.batch_id.trim()) continue
+      out.push({
+        batch_id: o.batch_id.trim(),
+        run_count: typeof o.run_count === 'number' ? o.run_count : 0,
+        n_queued: typeof o.n_queued === 'number' ? o.n_queued : 0,
+        n_running_live: typeof o.n_running_live === 'number' ? o.n_running_live : 0,
+        n_running_stale: typeof o.n_running_stale === 'number' ? o.n_running_stale : 0,
+        n_done: typeof o.n_done === 'number' ? o.n_done : 0,
+        n_error: typeof o.n_error === 'number' ? o.n_error : 0,
+        n_cancelled: typeof o.n_cancelled === 'number' ? o.n_cancelled : 0,
+        has_checkpoint_tree: o.has_checkpoint_tree === true,
+        latest_created: typeof o.latest_created === 'string' ? o.latest_created : '',
+      })
+    }
+    return out
+  }
+
+  useEffect(() => {
+    if (!labHydrated) return
+    if (sessionBatchFilterId) return
+    if (sessionRunIds.length > 0) return
+    let cancelled = false
+    void fetch(`${API}/api/batches`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: unknown) => {
+        if (cancelled) return
+        const parsed = parseBatchSummaries(rows)
+        const active = parsed.filter((b) => b.n_queued + b.n_running_live > 0)
+        if (active.length === 1) {
+          setServerBatchesHint([])
+          setSessionBatchFilterId(active[0].batch_id)
+          return
+        }
+        const show = active.length > 1 ? active : parsed.slice(0, 10)
+        setServerBatchesHint(show)
+      })
+      .catch(() => {
+        if (!cancelled) setServerBatchesHint([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [labHydrated, sessionBatchFilterId, sessionRunIds.length, setSessionBatchFilterId])
 
   const applyVideoFile = useCallback(
     (file?: File) => {
@@ -483,6 +556,63 @@ export function LabPage() {
     },
     [setVideo],
   )
+
+  const isFileDragEvent = useCallback((e: DragEvent) => {
+    const t = e.dataTransfer?.types
+    if (!t) return false
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] === 'Files') return true
+    }
+    return false
+  }, [])
+
+  useEffect(() => {
+    if (!schema || schemaError || !labHydrated) return
+
+    const onEnter = (e: DragEvent) => {
+      if (!isFileDragEvent(e)) return
+      e.preventDefault()
+      setFileDropOverlay(true)
+    }
+
+    const onOver = (e: DragEvent) => {
+      if (!isFileDragEvent(e)) return
+      e.preventDefault()
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+    }
+
+    const onLeave = (e: DragEvent) => {
+      if (!isFileDragEvent(e)) return
+      const rel = e.relatedTarget as Node | null
+      if (rel && document.documentElement.contains(rel)) return
+      setFileDropOverlay(false)
+    }
+
+    const onDrop = (e: DragEvent) => {
+      if (!isFileDragEvent(e)) return
+      e.preventDefault()
+      setFileDropOverlay(false)
+      applyVideoFile(e.dataTransfer?.files?.[0])
+    }
+
+    const clearOverlay = () => setFileDropOverlay(false)
+
+    document.addEventListener('dragenter', onEnter, true)
+    document.addEventListener('dragover', onOver, true)
+    document.addEventListener('dragleave', onLeave, true)
+    document.addEventListener('drop', onDrop, false)
+    document.addEventListener('dragend', clearOverlay, true)
+    window.addEventListener('blur', clearOverlay)
+
+    return () => {
+      document.removeEventListener('dragenter', onEnter, true)
+      document.removeEventListener('dragover', onOver, true)
+      document.removeEventListener('dragleave', onLeave, true)
+      document.removeEventListener('drop', onDrop, false)
+      document.removeEventListener('dragend', clearOverlay, true)
+      window.removeEventListener('blur', clearOverlay)
+    }
+  }, [applyVideoFile, isFileDragEvent, labHydrated, schema, schemaError])
 
   const editingDraft = useMemo(
     () => drafts.find((d) => d.clientId === editingId) ?? null,
@@ -510,149 +640,39 @@ export function LabPage() {
   }, [])
 
   useEffect(() => {
+    if (!schema) return
     let cancelled = false
-    setMatrixLoadError(null)
-    fetch(`${API}/api/pipeline_matrix`)
+    fetch(`${API}/api/tree_presets`)
       .then(async (r) => {
         const text = await r.text()
-        if (!r.ok) throw new Error(`pipeline_matrix HTTP ${r.status}`)
-        return JSON.parse(text) as MatrixPayload
+        if (!r.ok) throw new Error(`tree presets HTTP ${r.status}`)
+        return JSON.parse(text) as unknown
       })
-      .then((p) => {
-        if (!cancelled) setMatrixPayload(p)
+      .then((rows) => {
+        if (cancelled || !Array.isArray(rows)) return
+        const ok = rows.filter(
+          (x): x is { id: string; filename: string } =>
+            typeof x === 'object' &&
+            x !== null &&
+            typeof (x as { id?: unknown }).id === 'string' &&
+            typeof (x as { filename?: unknown }).filename === 'string',
+        )
+        setTreePresets(ok)
+        setTreePresetId((cur) => (cur && ok.some((p) => p.id === cur) ? cur : ok[0]?.id ?? ''))
       })
-      .catch((e) => {
-        if (!cancelled) setMatrixLoadError(e instanceof Error ? e.message : String(e))
+      .catch(() => {
+        if (!cancelled) setTreePresets([])
       })
     return () => {
       cancelled = true
     }
-  }, [])
-
-  useEffect(() => {
-    if (!matrixPayload?.recipes?.length) return
-    const v = matrixPayload.version ?? 0
-    if (lastMatrixVersionRef.current === v) return
-    lastMatrixVersionRef.current = v
-    let hidden: string[] = []
-    try {
-      const raw = localStorage.getItem(MATRIX_HIDDEN_STORAGE_KEY)
-      if (raw) {
-        const parsed = JSON.parse(raw) as { version?: number; ids?: string[] }
-        if (parsed.version === v && Array.isArray(parsed.ids)) {
-          hidden = parsed.ids.filter((id) => matrixPayload.recipes.some((r) => r.id === id))
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-    setMatrixHiddenRecipeIds(hidden)
-    const hiddenSet = new Set(hidden)
-    setMatrixSelectedIds(matrixPayload.recipes.filter((r) => !hiddenSet.has(r.id)).map((r) => r.id))
-  }, [matrixPayload])
-
-  const visibleMatrixRecipes = useMemo(() => {
-    if (!matrixPayload?.recipes?.length) return []
-    const h = new Set(matrixHiddenRecipeIds)
-    return matrixPayload.recipes.filter((r) => !h.has(r.id))
-  }, [matrixPayload, matrixHiddenRecipeIds])
-
-  const persistMatrixHiddenIds = useCallback(
-    (ids: string[]) => {
-      if (!matrixPayload) return
-      const v = matrixPayload.version ?? 0
-      try {
-        localStorage.setItem(MATRIX_HIDDEN_STORAGE_KEY, JSON.stringify({ version: v, ids }))
-      } catch {
-        /* ignore */
-      }
-    },
-    [matrixPayload],
-  )
-
-  const hideMatrixRecipes = useCallback(
-    (ids: string[]) => {
-      if (ids.length === 0) return
-      setMatrixHiddenRecipeIds((prev) => {
-        const next = [...new Set([...prev, ...ids])]
-        persistMatrixHiddenIds(next)
-        return next
-      })
-      setMatrixSelectedIds((p) => p.filter((x) => !ids.includes(x)))
-    },
-    [persistMatrixHiddenIds],
-  )
-
-  const restoreMatrixRecipes = useCallback(() => {
-    setMatrixHiddenRecipeIds([])
-    try {
-      localStorage.removeItem(MATRIX_HIDDEN_STORAGE_KEY)
-    } catch {
-      /* ignore */
-    }
-    if (matrixPayload?.recipes?.length) {
-      setMatrixSelectedIds(matrixPayload.recipes.map((r) => r.id))
-    }
-  }, [matrixPayload])
-
-  const toggleMatrixRecipe = useCallback((id: string) => {
-    setMatrixSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
-  }, [])
-
-  const queueMatrixFromServerPath = useCallback(async () => {
-    setMatrixBannerError(null)
-    if (!matrixPayload?.recipes?.length) {
-      window.alert('Pipeline matrix is not loaded yet.')
-      return
-    }
-    const p = matrixPathInput.trim()
-    if (!p) {
-      window.alert('Enter the full path to the video on the machine running the Lab API (e.g. /Users/you/Desktop/clip.mp4).')
-      return
-    }
-    const sel = new Set(matrixSelectedIds)
-    const runs = matrixPayload.recipes
-      .filter((r) => sel.has(r.id))
-      .map((r) => ({ recipe_name: r.recipe_name, fields: { ...r.fields } }))
-    if (runs.length === 0) {
-      window.alert('Select at least one matrix recipe.')
-      return
-    }
-    setMatrixQueueing(true)
-    try {
-      const r = await fetch(`${API}/api/runs/batch_path`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_path: p,
-          runs,
-          source_label: '',
-        }),
-      })
-      const text = await r.text()
-      if (!r.ok) {
-        let msg = `Queue failed (HTTP ${r.status})`
-        try {
-          const j = JSON.parse(text) as { detail?: string }
-          if (typeof j.detail === 'string') msg = j.detail
-        } catch {
-          if (text.trim()) msg = text.slice(0, 280)
-        }
-        throw new Error(msg)
-      }
-      const j = JSON.parse(text) as { run_ids: string[] }
-      setSessionRunIds(j.run_ids)
-    } catch (e) {
-      setMatrixBannerError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setMatrixQueueing(false)
-    }
-  }, [matrixPayload, matrixPathInput, matrixSelectedIds, setSessionRunIds])
+  }, [schema])
 
   useEffect(() => {
     if (!labHydrated || !videoFile || !schema || drafts.length > 0 || sessionRunIds.length > 0) return
+    if (searchParams.get('batch')?.trim() || searchParams.get('runs')?.trim()) return
     addDraft()
-  }, [labHydrated, videoFile, schema, drafts.length, sessionRunIds.length, addDraft])
+  }, [labHydrated, videoFile, schema, drafts.length, sessionRunIds.length, addDraft, searchParams])
 
   useEffect(() => {
     const st = location.state as { appendSessionRunIds?: string[] } | null | undefined
@@ -791,19 +811,12 @@ export function LabPage() {
     [refreshSessionRuns, setSessionRunIds],
   )
 
-  const deleteSessionRun = useCallback(
-    async (runId: string) => {
+  const performDeleteSessionRun = useCallback(
+    async (runId: string): Promise<boolean> => {
       const row = runRows.find((r) => r.run_id === runId)
       if (row?.status === 'running' && row.subprocess_alive === true) {
         window.alert('Stop the run first, or wait until it finishes — a live pipeline process is still attached.')
-        return
-      }
-      if (
-        !window.confirm(
-          'Delete this run from disk? Outputs, logs, and previews will be removed. This cannot be undone.',
-        )
-      ) {
-        return
+        return false
       }
       setDeletingRunId(runId)
       try {
@@ -812,11 +825,11 @@ export function LabPage() {
           window.alert(
             'Cannot delete while the pipeline subprocess is still running. Click Stop, wait for it to exit, then try again.',
           )
-          return
+          return false
         }
         if (!r.ok && r.status !== 204) {
           window.alert(`Delete failed (HTTP ${r.status}).`)
-          return
+          return false
         }
         setSessionRunIds((prev) => prev.filter((id) => id !== runId))
         setRunRows((prev) => prev.filter((x) => x.run_id !== runId))
@@ -831,12 +844,61 @@ export function LabPage() {
           return next
         })
         setConfigRunId((cur) => (cur === runId ? null : cur))
+        return true
       } finally {
         setDeletingRunId(null)
       }
     },
     [runRows, setSessionRunIds],
   )
+
+  const deleteSessionRun = useCallback(
+    async (runId: string) => {
+      if (
+        !window.confirm(
+          'Delete this run from disk? Outputs, logs, and previews will be removed. This cannot be undone.',
+        )
+      ) {
+        return
+      }
+      await performDeleteSessionRun(runId)
+    },
+    [performDeleteSessionRun],
+  )
+
+  const startCheckpointTreeTwoVideos = useCallback(() => {
+    if (!treeVideoA || !treeVideoB || !treePresetId || treeQueueBusy) return
+    setTreeQueueError(null)
+    setTreeQueueBusy(true)
+    const body = new FormData()
+    body.append('video_0', treeVideoA)
+    body.append('video_1', treeVideoB)
+    body.append('preset', treePresetId)
+    fetch(`${API}/api/runs/tree_checkpoint_upload`, { method: 'POST', body })
+      .then(async (r) => {
+        const text = await r.text()
+        if (!r.ok) {
+          let msg = `Tree queue failed (HTTP ${r.status})`
+          try {
+            const j = JSON.parse(text) as { detail?: unknown }
+            if (typeof j.detail === 'string') msg = j.detail
+          } catch {
+            if (text.trim()) msg = text.slice(0, 280)
+          }
+          throw new Error(msg)
+        }
+        const j = JSON.parse(text) as { batch_id?: string }
+        const bid = typeof j.batch_id === 'string' ? j.batch_id : ''
+        if (!bid) throw new Error('No batch_id in response')
+        setSessionBatchFilterId(bid)
+        setSessionRunIds([])
+        nav('/', { replace: true })
+      })
+      .catch((e) => {
+        setTreeQueueError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => setTreeQueueBusy(false))
+  }, [treeVideoA, treeVideoB, treePresetId, treeQueueBusy, setSessionRunIds, setSessionBatchFilterId, nav])
 
   const startAll = () => {
     if (!videoFile || !schema || drafts.length === 0 || starting) return
@@ -874,6 +936,7 @@ export function LabPage() {
   }
 
   const planAnotherBatch = () => {
+    setSessionBatchFilterId(null)
     setSessionRunIds([])
     setRunRows([])
     setBatchError(null)
@@ -985,6 +1048,95 @@ export function LabPage() {
       return false
     })
 
+  const runMap = useMemo(() => {
+    const m = new Map<string, RunInfo>()
+    for (const r of runRows) m.set(r.run_id, r)
+    return m
+  }, [runRows])
+
+  const deleteSessionRunSubtree = useCallback(
+    async (rootId: string) => {
+      const ids = subtreeRunIdsInSession(rootId, sessionRunIds, runMap)
+      const depths = computePhaseDepths(sessionRunIds, runMap)
+      ids.sort((a, b) => (depths.get(b) ?? 0) - (depths.get(a) ?? 0))
+      const blocking = ids.filter((id) => {
+        const row = runRows.find((r) => r.run_id === id)
+        return row?.status === 'running' && row.subprocess_alive === true
+      })
+      if (blocking.length > 0) {
+        window.alert(
+          `Stop ${blocking.length} active run(s) in this subtree first, or wait until they finish — a live pipeline process is still attached.`,
+        )
+        return
+      }
+      for (const id of ids) {
+        const ok = await performDeleteSessionRun(id)
+        if (!ok) break
+      }
+    },
+    [performDeleteSessionRun, runRows, sessionRunIds, runMap],
+  )
+
+  const hasCheckpointTree = useMemo(
+    () => sessionHasCheckpointTree(sessionRunIds, runMap),
+    [sessionRunIds, runMap],
+  )
+
+  const treeCompareVisualOrder = useMemo(
+    () => flattenTreeVisualOrder(sessionRunIds, runMap),
+    [sessionRunIds, runMap],
+  )
+
+  useEffect(() => {
+    if (hasCheckpointTree) setBatchViewMode('tree')
+  }, [hasCheckpointTree])
+
+  useEffect(() => {
+    setTreeCompareSelected(new Set())
+    treeCompareAnchorRef.current = null
+  }, [sessionRunIds.join('\0')])
+
+  const onTreeCompareToggle = useCallback(
+    (runId: string, { shiftKey }: { shiftKey: boolean }) => {
+      const row = runMap.get(runId)
+      if (row?.status !== 'done') return
+
+      if (shiftKey && treeCompareVisualOrder.length > 0) {
+        const iClick = treeCompareVisualOrder.indexOf(runId)
+        if (iClick < 0) return
+        const anchor = treeCompareAnchorRef.current
+        const iAnchor = anchor != null ? treeCompareVisualOrder.indexOf(anchor) : -1
+        const i0 = iAnchor < 0 ? iClick : iAnchor
+        const lo = Math.min(i0, iClick)
+        const hi = Math.max(i0, iClick)
+        setTreeCompareSelected((prev) => {
+          const next = new Set(prev)
+          for (let i = lo; i <= hi; i++) {
+            const id = treeCompareVisualOrder[i]
+            if (runMap.get(id)?.status === 'done') next.add(id)
+          }
+          return next
+        })
+        return
+      }
+
+      treeCompareAnchorRef.current = runId
+      setTreeCompareSelected((prev) => {
+        const next = new Set(prev)
+        if (next.has(runId)) next.delete(runId)
+        else next.add(runId)
+        return next
+      })
+    },
+    [runMap, treeCompareVisualOrder],
+  )
+
+  const selectedDoneCompareIds = useMemo(() => {
+    return [...treeCompareSelected].filter((id) => runRows.find((r) => r.run_id === id)?.status === 'done')
+  }, [treeCompareSelected, runRows])
+
+  const canCompareSelected = selectedDoneCompareIds.length >= 2
+
   if (schemaError) {
     return (
       <div className="glass-panel" style={{ padding: '2rem', maxWidth: 560, margin: '0 auto' }}>
@@ -1000,7 +1152,7 @@ export function LabPage() {
             fontSize: '0.85rem',
           }}
         >
-          uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765
+          uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765
         </pre>
       </div>
     )
@@ -1024,223 +1176,187 @@ export function LabPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
-      <div className="glass-panel" style={{ padding: '1.25rem' }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-          <h2 style={{ margin: 0, fontSize: '1.05rem', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-            <ListChecks size={20} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
-            Pipeline matrix (server path)
-          </h2>
-          <button
-            type="button"
-            className="btn primary"
-            disabled={matrixQueueing || !matrixPayload}
-            onClick={() => void queueMatrixFromServerPath()}
-          >
-            {matrixQueueing ? 'Queueing…' : `Queue ${matrixSelectedIds.length} run(s)`}
-          </button>
-        </div>
-        <p style={{ margin: '0.5rem 0 0', fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 720 }}>
-          A/B recipes are defined in code (<code style={{ color: 'var(--halo-cyan)' }}>sway/pipeline_matrix_presets.py</code>
-          ) — each varies one stage vs. defaults. The path must exist on the computer running{' '}
-          <code style={{ color: 'var(--halo-cyan)' }}>uvicorn</code>, not necessarily your browser. CLI:{' '}
-          <code style={{ color: '#e2e8f0' }}>python -m tools.pipeline_matrix_runs --video /path/to/file.mp4</code>
-        </p>
-        {matrixLoadError && <p style={{ color: '#f87171', marginTop: '0.65rem', marginBottom: 0 }}>{matrixLoadError}</p>}
-        {matrixBannerError && <p style={{ color: '#f87171', marginTop: '0.65rem', marginBottom: 0 }}>{matrixBannerError}</p>}
-        <label style={{ display: 'block', marginTop: '0.85rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-          Video path on API server
-          <input
-            type="text"
-            value={matrixPathInput}
-            onChange={(e) => setMatrixPathInput(e.target.value)}
-            placeholder="/Users/you/Desktop/IMG_2946.MP4"
+      {fileDropOverlay && (
+        <div
+          role="presentation"
+          aria-hidden
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 20000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(8, 12, 20, 0.94)',
+            backdropFilter: 'blur(10px)',
+            WebkitBackdropFilter: 'blur(10px)',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            className="hero-upload dragover"
             style={{
-              display: 'block',
-              width: '100%',
-              maxWidth: 640,
-              marginTop: '0.35rem',
-              padding: '0.5rem 0.65rem',
-              borderRadius: 8,
-              border: '1px solid var(--glass-border)',
-              background: 'rgba(0,0,0,0.25)',
-              color: '#e2e8f0',
-              fontSize: '0.88rem',
+              pointerEvents: 'none',
+              maxWidth: 520,
+              width: 'min(520px, calc(100vw - 3rem))',
+              margin: '0 1.5rem',
+              padding: '3rem 2rem',
             }}
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </label>
-        {matrixPayload && (
-          <>
-            <p style={{ margin: '0.75rem 0 0', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{matrixPayload.intro}</p>
-            <div style={{ marginTop: '0.65rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
-              <button
-                type="button"
-                className="btn"
-                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
-                onClick={() => setMatrixSelectedIds(visibleMatrixRecipes.map((x) => x.id))}
-              >
-                Select all
-              </button>
-              <button
-                type="button"
-                className="btn"
-                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
-                onClick={() => setMatrixSelectedIds([])}
-              >
-                Clear selection
-              </button>
-              <button
-                type="button"
-                className="btn"
-                style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
-                disabled={matrixSelectedIds.length === 0}
-                onClick={() => hideMatrixRecipes(matrixSelectedIds)}
-                title="Hide selected recipes from this list (this browser only)"
-              >
-                Remove selected
-              </button>
-              {matrixHiddenRecipeIds.length > 0 && (
+          >
+            <Upload size={48} strokeWidth={1.25} style={{ color: 'var(--halo-cyan)', marginBottom: '0.35rem' }} aria-hidden />
+            <h2 style={{ fontSize: 'clamp(1.35rem, 4vw, 1.75rem)' }}>Drop a video here</h2>
+            <p style={{ marginBottom: 0 }}>MP4, MOV, WebM, MKV, AVI, M4V</p>
+          </div>
+        </div>
+      )}
+      {sessionRunIds.length === 0 && serverBatchesHint.length > 0 && (
+        <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.6rem', marginBottom: '0.65rem' }}>
+            <LayoutGrid size={20} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
+            <h2 style={{ margin: 0, fontSize: '1.05rem', color: '#fff' }}>Batches on this API</h2>
+          </div>
+          <p style={{ margin: '0 0 0.85rem', fontSize: '0.86rem', color: 'var(--text-muted)', lineHeight: 1.5, maxWidth: 720 }}>
+            Open one to attach it to this browser — no need for a special URL. Checkpoint trees switch to tree view
+            automatically once runs load.
+          </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+            {serverBatchesHint.map((b) => {
+              const active = b.n_queued + b.n_running_live
+              const short = b.batch_id.length > 10 ? `${b.batch_id.slice(0, 8)}…` : b.batch_id
+              const label =
+                active > 0
+                  ? `${short} · ${active} active, ${b.run_count} total`
+                  : `${short} · ${b.run_count} run${b.run_count === 1 ? '' : 's'}`
+              return (
                 <button
+                  key={b.batch_id}
                   type="button"
                   className="btn"
-                  style={{ padding: '0.35rem 0.65rem', fontSize: '0.78rem' }}
-                  onClick={restoreMatrixRecipes}
-                  title="Show all hidden matrix recipes again"
+                  style={{ fontSize: '0.78rem', padding: '0.4rem 0.65rem', textAlign: 'left' }}
+                  onClick={() => {
+                    setSessionBatchFilterId(b.batch_id)
+                    setServerBatchesHint([])
+                  }}
                 >
-                  Restore hidden ({matrixHiddenRecipeIds.length})
+                  {b.has_checkpoint_tree ? 'Tree · ' : ''}
+                  {label}
                 </button>
-              )}
-            </div>
-            <div
-              style={{
-                marginTop: '0.65rem',
-                maxHeight: 220,
-                overflow: 'auto',
-                borderRadius: 10,
-                border: '1px solid var(--glass-border)',
-                background: 'rgba(0,0,0,0.2)',
-              }}
-            >
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
-                <thead>
-                  <tr style={{ textAlign: 'left', color: 'var(--text-muted)' }}>
-                    <th style={{ padding: '0.45rem 0.5rem', width: 36 }} />
-                    <th style={{ padding: '0.45rem 0.5rem' }}>Recipe</th>
-                    <th style={{ padding: '0.45rem 0.5rem' }}>Axis</th>
-                    <th style={{ padding: '0.45rem 0.5rem', width: 44 }} aria-label="Remove from list" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleMatrixRecipes.length === 0 ? (
-                    <tr>
-                      <td colSpan={4} style={{ padding: '0.75rem 0.5rem', color: 'var(--text-muted)', textAlign: 'center' }}>
-                        All recipes are hidden in this browser. Use “Restore hidden” to show them again.
-                      </td>
-                    </tr>
-                  ) : (
-                    visibleMatrixRecipes.map((row) => (
-                      <tr key={row.id} style={{ borderTop: '1px solid var(--glass-border)' }}>
-                        <td style={{ padding: '0.35rem 0.5rem', verticalAlign: 'top' }}>
-                          <input
-                            type="checkbox"
-                            checked={matrixSelectedIds.includes(row.id)}
-                            onChange={() => toggleMatrixRecipe(row.id)}
-                            aria-label={`Include ${row.recipe_name}`}
-                          />
-                        </td>
-                        <td style={{ padding: '0.45rem 0.5rem', color: '#e2e8f0', verticalAlign: 'top' }}>
-                          <div style={{ fontWeight: 600 }}>{row.recipe_name}</div>
-                          {row.description && (
-                            <div style={{ color: 'var(--text-muted)', marginTop: '0.2rem', lineHeight: 1.45 }}>{row.description}</div>
-                          )}
-                        </td>
-                        <td style={{ padding: '0.45rem 0.5rem', color: 'var(--text-muted)', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                          {row.varies ?? '—'}
-                        </td>
-                        <td style={{ padding: '0.35rem 0.5rem', verticalAlign: 'top', textAlign: 'right' }}>
-                          <button
-                            type="button"
-                            className="btn"
-                            style={{
-                              padding: '0.25rem',
-                              minWidth: 32,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              color: 'var(--text-muted)',
-                            }}
-                            aria-label={`Remove ${row.recipe_name} from list`}
-                            title="Hide this recipe from the list (this browser only)"
-                            onClick={() => hideMatrixRecipes([row.id])}
-                          >
-                            <Trash2 size={14} strokeWidth={2} aria-hidden />
-                          </button>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
-      {/* Step 1: no video yet — empty Lab was rendering nothing here before */}
-      {!videoFile && (
+      {sessionRunIds.length === 0 && (
         <div className="glass-panel" style={{ padding: '1.5rem' }}>
-          <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>1. Add a source video</h2>
-          <p style={{ margin: '0.5rem 0 0', fontSize: '0.92rem', color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 640 }}>
-            One clip is shared across every run in a batch. Use the bar above or drop a file here, then configure runs and
-            start the pipeline.
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+            <GitBranch size={22} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
+            <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>Checkpoint tree — two videos</h2>
+          </div>
+          <p style={{ margin: '0.25rem 0 0', fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.55, maxWidth: 720 }}>
+            Upload two clips and run the <strong style={{ color: '#e2e8f0', fontWeight: 600 }}>same</strong> preset tree on
+            both, <strong style={{ color: '#e2e8f0', fontWeight: 600 }}>one after the other</strong> (all jobs share one batch
+            so you can track everything together). Video A completes every stage before video B starts.
           </p>
-          <input
-            id="sway-lab-video-input"
-            type="file"
-            accept={VIDEO_ACCEPT_ATTR}
-            className="sr-only-file-input"
-            onChange={(e) => {
-              applyVideoFile(e.target.files?.[0])
-              e.target.value = ''
-            }}
-          />
-          <label
-            htmlFor="sway-lab-video-input"
-            className={`hero-upload ${dropActive ? 'dragover' : ''}`}
-            style={{ marginTop: '1.25rem', display: 'flex' }}
-            onDragEnter={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              dropDepthRef.current += 1
-              setDropActive(true)
-            }}
-            onDragOver={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              e.dataTransfer.dropEffect = 'copy'
-            }}
-            onDragLeave={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              dropDepthRef.current = Math.max(0, dropDepthRef.current - 1)
-              if (dropDepthRef.current === 0) setDropActive(false)
-            }}
-            onDrop={(e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              dropDepthRef.current = 0
-              setDropActive(false)
-              applyVideoFile(e.dataTransfer.files?.[0])
-            }}
-          >
-            <Upload size={44} strokeWidth={1.25} style={{ color: 'var(--halo-cyan)', marginBottom: '0.35rem' }} aria-hidden />
-            <h2 style={{ fontSize: '1.35rem' }}>Drop a video here</h2>
-            <p>or click to browse — MP4, MOV, WebM, MKV, AVI, M4V</p>
-            <span className="btn primary" style={{ pointerEvents: 'none' }}>
-              Choose file
-            </span>
-          </label>
+          {treePresets.length === 0 ? (
+            <p style={{ marginTop: '1rem', color: 'var(--text-muted)', fontSize: '0.88rem' }}>
+              No presets found. Add <code style={{ color: 'var(--halo-cyan)' }}>*.yaml</code> under{' '}
+              <code style={{ color: 'var(--halo-cyan)' }}>pipeline_lab/tree_presets/</code>, or use the CLI{' '}
+              <code style={{ color: 'var(--halo-cyan)' }}>python -m tools.pipeline_tree_queue --video … --video …</code>.
+            </p>
+          ) : (
+            <div style={{ marginTop: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem', maxWidth: 520 }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                Tree preset
+                <select
+                  className="btn"
+                  style={{ padding: '0.5rem 0.65rem', cursor: 'pointer', textAlign: 'left' }}
+                  value={treePresetId}
+                  onChange={(e) => setTreePresetId(e.target.value)}
+                >
+                  {treePresets.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.filename}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 200px), 1fr))', gap: '0.75rem' }}>
+                <label
+                  htmlFor="sway-tree-video-a"
+                  style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.82rem', color: 'var(--text-muted)', cursor: 'pointer' }}
+                >
+                  Video A (runs first)
+                  <input
+                    type="file"
+                    accept={VIDEO_ACCEPT_ATTR}
+                    className="sr-only-file-input"
+                    id="sway-tree-video-a"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f && !isProbableVideoFile(f)) {
+                        window.alert('Please use a video file (MP4, MOV, WebM, MKV, AVI, or M4V).')
+                        e.target.value = ''
+                        return
+                      }
+                      setTreeVideoA(f ?? null)
+                      e.target.value = ''
+                    }}
+                  />
+                  <span
+                    className="btn"
+                    style={{ padding: '0.45rem 0.65rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {treeVideoA ? treeVideoA.name : 'Choose file…'}
+                  </span>
+                </label>
+                <label
+                  htmlFor="sway-tree-video-b"
+                  style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.82rem', color: 'var(--text-muted)', cursor: 'pointer' }}
+                >
+                  Video B (runs second)
+                  <input
+                    type="file"
+                    accept={VIDEO_ACCEPT_ATTR}
+                    className="sr-only-file-input"
+                    id="sway-tree-video-b"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f && !isProbableVideoFile(f)) {
+                        window.alert('Please use a video file (MP4, MOV, WebM, MKV, AVI, or M4V).')
+                        e.target.value = ''
+                        return
+                      }
+                      setTreeVideoB(f ?? null)
+                      e.target.value = ''
+                    }}
+                  />
+                  <span
+                    className="btn"
+                    style={{ padding: '0.45rem 0.65rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {treeVideoB ? treeVideoB.name : 'Choose file…'}
+                  </span>
+                </label>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={!treeVideoA || !treeVideoB || treeQueueBusy}
+                  onClick={startCheckpointTreeTwoVideos}
+                >
+                  <GitBranch size={16} /> {treeQueueBusy ? 'Queueing tree…' : 'Queue tree on both videos'}
+                </button>
+              </div>
+              <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                The API runs the orchestrator in the background (it must reach itself at{' '}
+                <code style={{ color: 'var(--halo-cyan)' }}>PIPELINE_LAB_INTERNAL_URL</code>, default{' '}
+                  <code style={{ color: 'var(--halo-cyan)' }}>{PIPELINE_LAB_LOCAL.apiOrigin}</code>).
+              </p>
+              {treeQueueError && <p style={{ margin: 0, color: '#f87171', fontSize: '0.88rem' }}>{treeQueueError}</p>}
+            </div>
+          )}
         </div>
       )}
 
@@ -1357,14 +1473,71 @@ export function LabPage() {
               </div>
             </div>
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              {hasCheckpointTree && (
+                <div
+                  role="group"
+                  aria-label="Batch layout"
+                  style={{
+                    display: 'inline-flex',
+                    borderRadius: 10,
+                    border: '1px solid var(--glass-border)',
+                    overflow: 'hidden',
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setBatchViewMode('list')}
+                    style={{
+                      borderRadius: 0,
+                      border: 'none',
+                      background: batchViewMode === 'list' ? 'rgba(34, 211, 238, 0.2)' : 'transparent',
+                      color: batchViewMode === 'list' ? '#e2e8f0' : 'var(--text-muted)',
+                    }}
+                  >
+                    <LayoutGrid size={16} aria-hidden /> List
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setBatchViewMode('tree')}
+                    style={{
+                      borderRadius: 0,
+                      border: 'none',
+                      borderLeft: '1px solid var(--glass-border)',
+                      background: batchViewMode === 'tree' ? 'rgba(34, 211, 238, 0.2)' : 'transparent',
+                      color: batchViewMode === 'tree' ? '#e2e8f0' : 'var(--text-muted)',
+                    }}
+                  >
+                    <GitBranch size={16} aria-hidden /> Tree
+                  </button>
+                </div>
+              )}
               <button
                 type="button"
                 className="btn primary"
                 disabled={!canCompare}
                 onClick={() => nav(`/compare?runs=${encodeURIComponent(doneIds.join(','))}`)}
               >
-                <Columns2 size={16} /> Compare outputs
+                <Columns2 size={16} /> Compare all finished
               </button>
+              {hasCheckpointTree && batchViewMode === 'tree' && (
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!canCompareSelected}
+                  title={
+                    canCompareSelected
+                      ? 'Open Compare with the runs you checked in the tree'
+                      : 'Check at least two finished runs in the tree (Compare column)'
+                  }
+                  onClick={() =>
+                    nav(`/compare?runs=${encodeURIComponent(selectedDoneCompareIds.join(','))}`)
+                  }
+                >
+                  <Columns2 size={16} /> Compare selected ({selectedDoneCompareIds.length})
+                </button>
+              )}
               {allTerminal && (
                 <button type="button" className="btn" onClick={planAnotherBatch}>
                   <Plus size={16} /> New runs (same video)
@@ -1427,15 +1600,71 @@ export function LabPage() {
             </div>
           )}
 
-          <div
-            style={{
-              marginTop: '1.25rem',
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 380px), 1fr))',
-              gap: '1rem',
-            }}
-          >
-            {sessionRunsOrdered.map(({ run, batchIndex, totalInBatch }) => {
+          {hasCheckpointTree && batchViewMode === 'tree' && (
+            <p
+              style={{
+                marginTop: '0.85rem',
+                marginBottom: 0,
+                fontSize: '0.88rem',
+                color: 'var(--text-muted)',
+                lineHeight: 1.5,
+                maxWidth: 720,
+              }}
+            >
+              Depth still matches checkpoint stages (roots = first stage); the canvas lays branches out like a tree so
+              children sit under their parent instead of one tall triangle. Scroll horizontally and vertically in the
+              desk area. Arrows show resume-from-parent relationships. Click a{' '}
+              <strong style={{ color: 'var(--text-main)' }}>Phase N — compare column</strong>{' '}
+              header to open Compare with every <strong style={{ color: 'var(--text-main)' }}>finished</strong> run in
+              that phase and the phase preview mapped to that depth (override the clip from Compare’s View menu). Or use
+              the <strong style={{ color: 'var(--text-main)' }}>Compare</strong> control on each run (not the card
+              background — that highlights the path from root and any downstream children of the clicked run).{' '}
+              <strong style={{ color: 'var(--text-main)' }}>Shift-click Compare</strong>{' '}
+              selects a range; then <strong style={{ color: 'var(--text-main)' }}>Compare selected</strong>.
+            </p>
+          )}
+
+          {batchViewMode === 'tree' && hasCheckpointTree ? (
+            <BatchTreeView
+              orderedIds={sessionRunIds}
+              runMap={runMap}
+              videoStemFallback={videoLabel.replace(/\.[^/.]+$/, '') || videoLabel}
+              treeCompareSelected={treeCompareSelected}
+              onToggleCompare={onTreeCompareToggle}
+              onOpenConfig={setConfigRunId}
+              onWatch={(runId) => nav(`/watch/${runId}`)}
+              onStop={(runId) => void stopSessionRun(runId)}
+              onRerun={(runId) => void rerunSessionRun(runId)}
+              onDelete={(runId) => void deleteSessionRun(runId)}
+              onDeleteSubtree={(rootId) => void deleteSessionRunSubtree(rootId)}
+              stoppingRunId={stoppingRunId}
+              rerunningRunId={rerunningRunId}
+              deletingRunId={deletingRunId}
+              onComparePhaseColumn={(colIdx, ids) => {
+                const done = ids.filter((id) => runRows.find((r) => r.run_id === id)?.status === 'done')
+                if (done.length < 2) {
+                  window.alert(
+                    `Need at least two finished runs in this phase to compare (this column has ${done.length}).`,
+                  )
+                  return
+                }
+                const view = compareViewModeForTreeColumn(colIdx)
+                const params = new URLSearchParams()
+                params.set('runs', done.join(','))
+                if (view !== 'final') params.set('view', view)
+                nav(`/compare?${params.toString()}`)
+              }}
+            />
+          ) : (
+            <div
+              style={{
+                marginTop: '1.25rem',
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
+                gap: '1rem',
+              }}
+            >
+              {sessionRunsOrdered.map(({ run, batchIndex, totalInBatch }) => {
               const pres = statusPresentationForRun(run)
               const { title: statusTitle, subtitle: statusSubtitle, color, Icon } = pres
               const isDone = run.status === 'done'
@@ -1682,7 +1911,8 @@ export function LabPage() {
                 </div>
               )
             })}
-          </div>
+            </div>
+          )}
         </div>
       )}
 

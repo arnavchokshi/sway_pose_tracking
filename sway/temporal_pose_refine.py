@@ -5,11 +5,11 @@ This is **not** the Poseidon architecture (multi-frame ViT backbone); it is a
 confidence-weighted spatial smooth over neighboring frames for the same track,
 inspired by the same ±window idea. Use when single-frame ViTPose is jittery.
 
-Default on (CLI). Disable with ``--no-temporal-pose-refine`` or ``SWAY_TEMPORAL_POSE_REFINE=0``.
-Explicit ``SWAY_TEMPORAL_POSE_REFINE=1`` forces on even if CLI disables.
+Default off (CLI / master stack). Enable with ``--temporal-pose-refine`` or ``SWAY_TEMPORAL_POSE_REFINE=1``.
+``SWAY_TEMPORAL_POSE_REFINE=0`` forces off even if CLI enables (unless unlock skips the lock).
 Radius: ``--temporal-pose-radius`` or ``SWAY_TEMPORAL_POSE_RADIUS`` (default 2).
-Production ``main.py`` / Lab set ``SWAY_TEMPORAL_POSE_RADIUS=2`` after params (§14.0.1) unless
-``SWAY_UNLOCK_SMOOTH_TUNING=1``.
+Production ``main.py`` / Lab set ``SWAY_TEMPORAL_POSE_RADIUS=2`` and ``SWAY_TEMPORAL_POSE_REFINE=0`` after params
+(§14.0.1) unless ``SWAY_UNLOCK_SMOOTH_TUNING=1``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def want_temporal_pose_refine(cli_flag: bool) -> bool:
     Tri-state env overrides CLI default:
       SWAY_TEMPORAL_POSE_REFINE=0|false|no|off  -> off
       SWAY_TEMPORAL_POSE_REFINE=1|true|yes|on   -> on
-      unset                                     -> cli_flag (default True in main.py)
+      unset                                     -> cli_flag (default False in main.py)
     """
     raw = os.environ.get("SWAY_TEMPORAL_POSE_REFINE", "").strip().lower()
     if raw in ("0", "false", "no", "off"):

@@ -2,8 +2,8 @@ import type { ReactNode } from 'react'
 
 export function SchemaFieldVisual({ fieldId, value }: { fieldId: string; value?: any }): ReactNode {
   const SvgBox = ({ children, viewBox = '0 0 240 80' }: { children: ReactNode; viewBox?: string }) => (
-    <div style={{ padding: '0.75rem 0', background: 'rgba(0,0,0,0.25)', borderTop: '1px solid rgba(255,255,255,0.05)', borderBottom: '1px solid rgba(255,255,255,0.05)', marginBottom: '0.5rem', marginTop: '0.2rem' }}>
-      <svg viewBox={viewBox} style={{ width: '100%', height: 'auto', display: 'block', maxWidth: 400, margin: '0 auto' }}>
+    <div style={{ padding: '0.4rem 0', background: 'rgba(0,0,0,0.25)', borderTop: '1px solid rgba(255,255,255,0.05)', borderBottom: '1px solid rgba(255,255,255,0.05)', marginBottom: '0.35rem', marginTop: '0.1rem' }}>
+      <svg viewBox={viewBox} style={{ width: '100%', height: 'auto', display: 'block', maxWidth: 360, margin: '0 auto', maxHeight: 76 }}>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-muted)" />

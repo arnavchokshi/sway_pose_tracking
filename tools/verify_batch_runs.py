@@ -2,7 +2,7 @@
 """
 Wait for all runs in a Pipeline Lab batch to finish, verify success on disk, rerun failures.
 
-  python3 -m tools.verify_batch_runs --batch-id <uuid> --lab-url http://127.0.0.1:8765
+  python3 -m tools.verify_batch_runs --batch-id <uuid> --lab-url http://localhost:8765
 
 Exit 0 only if every run ends as done with run_manifest.json (after optional reruns).
 """
@@ -122,7 +122,7 @@ def _rerun(base: str, run_id: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-id", required=True)
-    ap.add_argument("--lab-url", default="http://127.0.0.1:8765")
+    ap.add_argument("--lab-url", default="http://localhost:8765")
     ap.add_argument("--expected", type=int, default=23)
     ap.add_argument("--poll-s", type=float, default=20.0)
     ap.add_argument("--max-wait-s", type=float, default=4 * 3600.0)

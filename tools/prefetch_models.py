@@ -13,7 +13,7 @@ This touches:
   - Ultralytics YOLO (yolo26l.pt → models/ or hub cache)
   - Hugging Face ViTPose base + large + huge (HF cache, usually ~/.cache/huggingface)
   - BoxMOT OSNet Re-ID weights → models/osnet_x0_25_msmt17.pt (default tracker path)
-  - Optional: StrongSORT AFLink_epoch20.pth → models/ (enables neural global stitch; see step 6)
+  - StrongSORT AFLink_epoch20.pth → models/ (neural global stitch; step 6 downloads from official Drive)
 
 Fine-tuning YOLO26l on DanceTrack + CrowdHuman (optional): base weights `yolo26l.pt`
 are pulled automatically by Ultralytics the first time you run
@@ -40,6 +40,8 @@ if str(_REPO_ROOT) not in sys.path:
 _MOTIONAGFORMER_L_H36M_GDRIVE_ID = "1WI8QSsD84wlXIdK1dLp6hPZq4FPozmVZ"
 # PoseFormerV2 README: 243 frames, 27 kept, MPJPE 45.2 mm (27_243_45.2.bin).
 _POSEFORMERV2_243_GDRIVE_ID = "14SpqPyq9yiblCzTH5CorymKCUsXapmkg"
+# StrongSORT README "Data&Model Preparation" — AFLink_epoch20.pth (hosted as zip-wrapped torch save).
+_AFLINK_EPOCH20_GDRIVE_ID = "1DFMUkL-dc-j8-fibcJIq-46Xoq_bFoO9"
 
 
 def prefetch_motionagformer_l(models_dir: Path) -> None:
@@ -171,16 +173,30 @@ def main() -> None:
 
     print("[6/6] StrongSORT AFLink (neural global stitch) …")
     aflink_dst = root / "models" / "AFLink_epoch20.pth"
-    if aflink_dst.is_file():
+    if aflink_dst.is_file() and aflink_dst.stat().st_size > 1_000_000:
         print(f"      already present: {aflink_dst}\n")
     else:
-        print(
-            "      skipped — not in repo. With SWAY_GLOBAL_LINK=1, copy AFLink_epoch20.pth to:\n"
-            f"        {aflink_dst}\n"
-            "      or set SWAY_AFLINK_WEIGHTS to its path. Download from StrongSORT "
-            '"Data&Model Preparation" (Google Drive folder lists AFLink_epoch20.pth).\n'
-            "      https://github.com/dyhBUPT/StrongSORT#datamodel-preparation\n"
-        )
+        aflink_dst.parent.mkdir(parents=True, exist_ok=True)
+        print("      Downloading AFLink_epoch20.pth (~4.4MB, Google Drive)…")
+        try:
+            import gdown
+
+            gdown.download(
+                f"https://drive.google.com/uc?id={_AFLINK_EPOCH20_GDRIVE_ID}",
+                str(aflink_dst),
+                quiet=False,
+                fuzzy=False,
+            )
+        except Exception as ex:
+            print(f"      failed ({ex}). pip install gdown, or download manually:\n")
+            print(
+                f"        {aflink_dst}\n"
+                "      https://github.com/dyhBUPT/StrongSORT#datamodel-preparation\n"
+            )
+        if not aflink_dst.is_file() or aflink_dst.stat().st_size < 1_000_000:
+            print("      incomplete — remove partial file and retry prefetch.\n")
+        else:
+            print(f"      saved {aflink_dst}\n")
 
     print("Prefetch complete. Before an offline run:")
     print("  export SWAY_OFFLINE=1   # macOS/Linux")

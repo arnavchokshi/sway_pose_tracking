@@ -3,7 +3,7 @@ Pipeline Lab API: queue Sway pose runs, stream progress, serve outputs with Rang
 
   cd sway_pose_mvp
   pip install -r pipeline_lab/server/requirements.txt
-  uvicorn pipeline_lab.server.app:app --reload --host 127.0.0.1 --port 8765
+  uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765
 
 Static UI (after `npm run build` in pipeline_lab/web): set PIPELINE_LAB_WEB_DIST or use ../web/dist.
 
@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -42,6 +43,11 @@ from pydantic import BaseModel, Field
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_ROOT = REPO_ROOT / "pipeline_lab" / "runs"
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+TREE_PRESETS_DIR = REPO_ROOT / "pipeline_lab" / "tree_presets"
+TREE_UPLOAD_STAGING = RUNS_ROOT / "_tree_upload_staging"
+TREE_UPLOAD_STAGING.mkdir(parents=True, exist_ok=True)
+EXPERIMENTS_ROOT = REPO_ROOT / "pipeline_lab" / "experiments"
+EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _merge_lab_request_into_manifest(run_dir: Path) -> None:
@@ -91,10 +97,93 @@ def _disk_run_status(run_dir: Path) -> str:
         return "queued"
     return "unknown"
 
+
+# ``pipeline_tree_queue`` sets ``checkpoint.resume_from`` to ``../<parent_run_id>/output/checkpoints/...``
+_RESUME_PARENT_RE = re.compile(
+    r"^\.\./([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/",
+)
+
+
+def _parent_run_id_from_request_meta(meta: Dict[str, Any]) -> Optional[str]:
+    ck = meta.get("checkpoint")
+    if not isinstance(ck, dict):
+        return None
+    rf = ck.get("resume_from")
+    if not isinstance(rf, str) or not rf.strip():
+        return None
+    norm = rf.strip().replace("\\", "/")
+    m = _RESUME_PARENT_RE.match(norm)
+    if not m:
+        return None
+    return m.group(1).lower()
+
+
+def _accumulated_tree_fields_from_request_chain(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge ``fields`` from the checkpoint parent chain (root → leaf) so each run's effective
+    Lab snapshot includes earlier stages. Tree stage 2+ rows only store that stage's overrides
+    in ``request.json``; without this, Compare /config would show schema defaults (e.g.
+    ``sway_pretrack_nms_iou`` 0.5) for Phase 1 knobs even when the parent used 0.75.
+    """
+    layers: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = meta
+    seen: set[str] = set()
+    for _ in range(32):
+        if not isinstance(cur, dict):
+            break
+        raw = cur.get("fields")
+        layers.append(dict(raw) if isinstance(raw, dict) else {})
+        pid = _parent_run_id_from_request_meta(cur)
+        if not pid or pid in seen:
+            break
+        seen.add(pid)
+        req_path = RUNS_ROOT / pid / "request.json"
+        if not req_path.is_file():
+            break
+        try:
+            with open(req_path, encoding="utf-8") as f:
+                nxt = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            break
+        if not isinstance(nxt, dict):
+            break
+        cur = nxt
+    merged: Dict[str, Any] = {}
+    for layer in reversed(layers):
+        merged = {**merged, **layer}
+    return merged
+
+
+def _merge_request_json_into_run_row(out: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    """Augment list/get run payloads with batch + checkpoint-tree hints from ``request.json``."""
+    bid = str(meta.get("batch_id") or "").strip()
+    if bid:
+        out["batch_id"] = bid
+    pid = _parent_run_id_from_request_meta(meta)
+    if pid:
+        out["parent_run_id"] = pid
+
+
+def _merge_request_json_from_disk(out: Dict[str, Any], run_dir: Path) -> None:
+    req = run_dir / "request.json"
+    if not req.is_file():
+        return
+    try:
+        with open(req, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(meta, dict):
+        return
+    _merge_request_json_into_run_row(out, meta)
+
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from sway.pipeline_env_params import apply_sway_params_to_env  # noqa: E402
 from sway.pipeline_config_schema import (  # noqa: E402
+    LAB_UI_ENFORCED_DEFAULTS,
     PIPELINE_PARAM_FIELDS,
     apply_master_locked_post_pose_prune_params,
     apply_master_locked_pre_pose_prune_params,
@@ -129,8 +218,12 @@ def _effective_ui_fields(stored: Any) -> Dict[str, Any]:
     """Merge client overrides on top of schema defaults (drafts often send ``{}`` until Save)."""
     base = _default_ui_fields()
     if not isinstance(stored, dict):
-        return dict(base)
-    return {**base, **stored}
+        out = dict(base)
+    else:
+        out = {**base, **stored}
+    for k, v in LAB_UI_ENFORCED_DEFAULTS.items():
+        out[k] = v
+    return out
 
 
 # Lab UI enum labels -> main.py --pose-model (base|large|huge|rtmpose)
@@ -210,7 +303,6 @@ def _validate_pipeline_fields(_fields: Dict[str, Any]) -> None:
 
 _REID_PRESET_FILES = {
     "osnet_x0_25": REPO_ROOT / "models" / "osnet_x0_25_msmt17.pt",
-    "osnet_x1_0": REPO_ROOT / "models" / "osnet_x1_0_msmt17.pt",
 }
 
 
@@ -261,6 +353,8 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
     env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
     custom_rw = str(fields.get("sway_boxmot_reid_weights") or "").strip()
     preset = fields.get("sway_boxmot_reid_model")
+    if isinstance(preset, str) and preset.strip() == "osnet_x1_0":
+        preset = "osnet_x0_25"  # legacy saved runs / presets
     if tt == "deep_ocsort_osnet":
         env["SWAY_BOXMOT_REID_ON"] = "1"
         if custom_rw:
@@ -288,9 +382,16 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
         env.pop("SWAY_GLOBAL_AFLINK", None)
     freeze_lab_subprocess_detection_env(env)
     freeze_lab_subprocess_hybrid_sam_env(env)
+    p13 = str(fields.get("sway_phase13_mode", "standard") or "standard").strip().lower()
+    if p13 == "dancer_registry":
+        env["SWAY_PHASE13_MODE"] = "dancer_registry"
+    elif p13 == "sway_handshake":
+        env["SWAY_PHASE13_MODE"] = "sway_handshake"
+        env["SWAY_HYBRID_SAM_IOU_TRIGGER"] = "0.10"
+        env["SWAY_HYBRID_SAM_WEAK_CUES"] = "0"
     freeze_lab_subprocess_phase3_stitch_env(env)
     freeze_lab_subprocess_pose_env(env)
-    freeze_lab_subprocess_smooth_env(env)
+    freeze_lab_subprocess_smooth_env(env, fields)
     return env
 
 
@@ -374,6 +475,10 @@ def _execute_run(run_id: str) -> None:
     if fields.get("save_phase_previews") is not False:
         if "--save-phase-previews" not in cli_extra:
             cli_extra.append("--save-phase-previews")
+    # Live sandbox: persist phase3 + phase1 npz (pre-classical NMS layer) unless explicitly disabled
+    if fields.get("save_live_artifacts") is not False:
+        if "--save-live-artifacts" not in cli_extra:
+            cli_extra.append("--save-live-artifacts")
     py_exe = os.environ.get("PIPELINE_LAB_PYTHON", "python3")
     cmd = [
         py_exe,
@@ -388,7 +493,28 @@ def _execute_run(run_id: str) -> None:
         str(progress_path),
         "--run-manifest",
         str(manifest_path),
+        "--phase-debug-jsonl",
+        str(out_dir / "phase_debug.jsonl"),
     ] + cli_extra
+
+    ck = meta.get("checkpoint")
+    if isinstance(ck, dict):
+        sab = ck.get("stop_after_boundary")
+        if sab:
+            cmd.extend(["--stop-after-boundary", str(sab)])
+        rf = ck.get("resume_from")
+        if rf:
+            rp = Path(str(rf))
+            if not rp.is_absolute():
+                rp = (run_dir / rp).resolve()
+            else:
+                rp = rp.resolve()
+            cmd.extend(["--resume-from", str(rp)])
+        eb = ck.get("expect_boundary")
+        if eb:
+            cmd.extend(["--expect-boundary", str(eb)])
+        if ck.get("force_checkpoint_load"):
+            cmd.append("--force-checkpoint-load")
 
     env = _subprocess_env(fields)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -513,10 +639,14 @@ for _ in range(max(1, _max_parallel)):
     threading.Thread(target=_worker_loop, daemon=True).start()
 
 
+# Matches pipeline_lab/web/src/siteUrls.ts — dev UI on 5173, API on 8765 (bundled UI is same origin as API).
+_DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://localhost:8765"
 app = FastAPI(title="Sway Pipeline Lab", lifespan=_lab_lifespan)
+_cors_raw = os.environ.get("PIPELINE_LAB_CORS", _DEFAULT_CORS_ORIGINS)
+_cors_list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("PIPELINE_LAB_CORS", "http://127.0.0.1:5173,http://localhost:5173").split(","),
+    allow_origins=_cors_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -549,6 +679,91 @@ def get_pipeline_matrix() -> Dict[str, Any]:
     return pipeline_matrix_for_api()
 
 
+class ExperimentCreateBody(BaseModel):
+    label: str = ""
+
+
+@app.post("/api/experiments")
+def api_create_experiment(body: ExperimentCreateBody) -> JSONResponse:
+    eid = str(uuid.uuid4())
+    d = EXPERIMENTS_ROOT / eid
+    d.mkdir(parents=True, exist_ok=False)
+    graph = {
+        "id": eid,
+        "label": body.label or eid[:8],
+        "nodes": [],
+        "edges": [],
+    }
+    (d / "graph.json").write_text(json.dumps(graph, indent=2), encoding="utf-8")
+    return JSONResponse({"experiment_id": eid})
+
+
+@app.get("/api/experiments")
+def api_list_experiments() -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    if not EXPERIMENTS_ROOT.is_dir():
+        return {"experiments": rows}
+    for p in sorted(EXPERIMENTS_ROOT.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+        if not p.is_dir() or p.name.startswith("_"):
+            continue
+        g = p / "graph.json"
+        try:
+            if g.is_file():
+                rows.append(json.loads(g.read_text(encoding="utf-8")))
+            else:
+                rows.append({"id": p.name, "label": p.name, "nodes": [], "edges": []})
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {"experiments": rows}
+
+
+@app.get("/api/experiments/{exp_id}")
+def api_get_experiment(exp_id: str) -> Dict[str, Any]:
+    g = EXPERIMENTS_ROOT / exp_id / "graph.json"
+    if not g.is_file():
+        raise HTTPException(404, "experiment not found")
+    try:
+        return json.loads(g.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(500, str(e)) from e
+
+
+class ExperimentNodeBody(BaseModel):
+    run_id: str
+    parent_run_id: Optional[str] = None
+    boundary: str = ""
+    label: str = ""
+
+
+@app.post("/api/experiments/{exp_id}/nodes")
+def api_append_experiment_node(exp_id: str, body: ExperimentNodeBody) -> JSONResponse:
+    d = EXPERIMENTS_ROOT / exp_id
+    if not d.is_dir():
+        raise HTTPException(404, "experiment not found")
+    gpath = d / "graph.json"
+    try:
+        data = json.loads(gpath.read_text(encoding="utf-8")) if gpath.is_file() else {}
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("id", exp_id)
+    data.setdefault("label", exp_id[:8])
+    data.setdefault("nodes", [])
+    data.setdefault("edges", [])
+    data["nodes"].append(
+        {
+            "run_id": body.run_id,
+            "boundary": body.boundary,
+            "label": body.label,
+        }
+    )
+    if body.parent_run_id:
+        data["edges"].append({"from": body.parent_run_id, "to": body.run_id})
+    gpath.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return JSONResponse({"ok": True})
+
+
 def _link_or_copy_video(src: Path, dst: Path) -> None:
     """Hardlink when same filesystem (saves space for N-way matrix); else copy."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -568,7 +783,6 @@ def models_status() -> Dict[str, Any]:
         "yolo26l_dancetrack.pt",
         "yolo26x.pt",
         "osnet_x0_25_msmt17.pt",
-        "osnet_x1_0_msmt17.pt",
         "motionagformer-l-h36m.pth.tr",
         "27_243_45.2.bin",
     )
@@ -584,6 +798,8 @@ class CreateRunRequest(BaseModel):
     video_path: str
     recipe_name: str = ""
     fields: Dict[str, Any] = Field(default_factory=dict)
+    # stop_after_boundary, resume_from, expect_boundary, force_checkpoint_load
+    checkpoint: Optional[Dict[str, Any]] = None
 
 
 def _enqueue_run(
@@ -600,6 +816,9 @@ def _enqueue_run(
         "video_stem": video_stem,
         **meta_extra,
     }
+    ck = meta_extra.get("checkpoint")
+    if isinstance(ck, dict) and ck:
+        meta["checkpoint"] = ck
     bid = str(meta_extra.get("batch_id") or "").strip()
     if bid:
         meta["batch_id"] = bid
@@ -633,13 +852,16 @@ def create_run(req: CreateRunRequest) -> JSONResponse:
     ext = p.suffix or ".mp4"
     dest = run_dir / f"input_video{ext}"
     shutil.copy2(disk_path, dest)
+    extra: Dict[str, Any] = {"source_path": disk_path}
+    if req.checkpoint:
+        extra["checkpoint"] = req.checkpoint
     _enqueue_run(
         run_id,
         run_dir,
         req.recipe_name,
         req.fields,
         p.stem,
-        {"source_path": disk_path},
+        extra,
     )
     return JSONResponse({"run_id": run_id, "status": "queued"})
 
@@ -694,6 +916,25 @@ async def create_run_upload(
 class BatchRunSpec(BaseModel):
     recipe_name: str = ""
     fields: Dict[str, Any] = Field(default_factory=dict)
+    checkpoint: Optional[Dict[str, Any]] = None
+
+
+def _normalize_upload_checkpoint(ck: Dict[str, Any], prior_run_ids: List[str], run_index: int) -> Dict[str, Any]:
+    """
+    Resolve ``parent_batch_index`` + ``resume_checkpoint_subdir`` into ``resume_from`` for checkpoint trees.
+    ``prior_run_ids`` are run UUIDs already created for earlier entries in this batch (same order as specs).
+    """
+    out = dict(ck)
+    pidx = out.pop("parent_batch_index", None)
+    rsub = out.pop("resume_checkpoint_subdir", None)
+    if pidx is None:
+        return out
+    if not isinstance(pidx, int) or pidx < 0 or pidx >= len(prior_run_ids):
+        raise ValueError(f"invalid parent_batch_index {pidx!r} for run index {run_index} (need 0 <= i < {len(prior_run_ids)})")
+    parent_id = prior_run_ids[pidx]
+    sub = str(rsub or "after_phase_1").strip() or "after_phase_1"
+    out["resume_from"] = f"../{parent_id}/output/checkpoints/{sub}"
+    return out
 
 
 @app.post("/api/runs/batch_upload")
@@ -735,22 +976,31 @@ async def create_runs_batch_upload(
     batch_id = str(uuid.uuid4())
     run_ids: List[str] = []
 
-    for spec in specs:
+    for i, spec in enumerate(specs):
         run_id = str(uuid.uuid4())
         run_dir = RUNS_ROOT / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         dest = run_dir / f"input_video{ext}"
         dest.write_bytes(raw)
+        extra: Dict[str, Any] = {
+            "upload_filename": file.filename,
+            "batch_id": batch_id,
+        }
+        ck_in = spec.checkpoint
+        if isinstance(ck_in, dict) and ck_in:
+            try:
+                ck_norm = _normalize_upload_checkpoint(ck_in, run_ids, i)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            if ck_norm:
+                extra["checkpoint"] = ck_norm
         _enqueue_run(
             run_id,
             run_dir,
             spec.recipe_name,
             spec.fields,
             stem,
-            {
-                "upload_filename": file.filename,
-                "batch_id": batch_id,
-            },
+            extra,
         )
         run_ids.append(run_id)
 
@@ -760,6 +1010,8 @@ async def create_runs_batch_upload(
 class BatchPathRunSpec(BaseModel):
     recipe_name: str = ""
     fields: Dict[str, Any] = Field(default_factory=dict)
+    # Same shape as CreateRunRequest.checkpoint (stop_after_boundary, resume_from, expect_boundary, …)
+    checkpoint: Optional[Dict[str, Any]] = None
 
 
 class CreateBatchPathRequest(BaseModel):
@@ -768,6 +1020,8 @@ class CreateBatchPathRequest(BaseModel):
     video_path: str
     runs: List[BatchPathRunSpec]
     source_label: str = ""
+    # If set, all runs in this request share this batch_id (for UI filtering / ?batch= on Lab).
+    batch_id: str = ""
 
 
 @app.post("/api/runs/batch_path")
@@ -789,7 +1043,7 @@ def create_runs_batch_path(req: CreateBatchPathRequest) -> JSONResponse:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
 
-    batch_id = str(uuid.uuid4())
+    batch_id = str(req.batch_id).strip() or str(uuid.uuid4())
     ext = src.suffix or ".mp4"
     if ext.lower() not in (
         ".mp4",
@@ -801,7 +1055,8 @@ def create_runs_batch_path(req: CreateBatchPathRequest) -> JSONResponse:
     ):
         ext = ".mp4"
 
-    staging_dir = RUNS_ROOT / "_batch_staging" / batch_id
+    staging_id = str(uuid.uuid4())
+    staging_dir = RUNS_ROOT / "_batch_staging" / staging_id
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_video = staging_dir / f"source{ext}"
     shutil.copy2(src, staging_video)
@@ -817,17 +1072,21 @@ def create_runs_batch_path(req: CreateBatchPathRequest) -> JSONResponse:
         run_dir.mkdir(parents=True, exist_ok=True)
         dest = run_dir / f"input_video{ext}"
         _link_or_copy_video(staging_video, dest)
+        extra: Dict[str, Any] = {
+            "source_path": str(src.resolve()),
+            "batch_id": batch_id,
+            "batch_kind": "batch_path",
+        }
+        ck = spec.checkpoint
+        if isinstance(ck, dict) and ck:
+            extra["checkpoint"] = ck
         _enqueue_run(
             run_id,
             run_dir,
             spec.recipe_name,
             spec.fields,
             stem,
-            {
-                "source_path": str(src.resolve()),
-                "batch_id": batch_id,
-                "batch_kind": "batch_path",
-            },
+            extra,
         )
         run_ids.append(run_id)
 
@@ -849,6 +1108,141 @@ def create_runs_batch_path(req: CreateBatchPathRequest) -> JSONResponse:
     )
 
 
+def _resolve_tree_preset_path(preset: str) -> Path:
+    raw = (preset or "").strip()
+    if not raw:
+        raise HTTPException(400, "preset is required")
+    if ".." in raw or "/" in raw or "\\" in raw:
+        raise HTTPException(400, "invalid preset name")
+    stem = Path(raw).name
+    if not stem.endswith(".yaml"):
+        stem = f"{stem}.yaml"
+    target = (TREE_PRESETS_DIR / stem).resolve()
+    presets_resolved = TREE_PRESETS_DIR.resolve()
+    try:
+        target.relative_to(presets_resolved)
+    except ValueError as e:
+        raise HTTPException(400, "invalid preset path") from e
+    if not target.is_file():
+        raise HTTPException(404, f"unknown tree preset: {stem}")
+    return target
+
+
+def _tree_checkpoint_background(
+    *,
+    video_paths: List[Path],
+    preset_path: Path,
+    batch_id: str,
+    internal_base: str,
+    video_labels: List[str],
+) -> None:
+    """Runs in a daemon thread; queues the full tree per video over HTTP to this Lab."""
+    import sys
+
+    root = REPO_ROOT
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from tools.tree_checkpoint_queue_lib import (  # noqa: PLC0415
+        TreeQueueError,
+        load_tree_yaml,
+        run_checkpoint_tree_session,
+        validate_stages,
+    )
+
+    def log(msg: str) -> None:
+        print(f"[tree_checkpoint_upload {batch_id[:8]}] {msg}", flush=True)
+
+    try:
+        doc = load_tree_yaml(preset_path)
+        stages = validate_stages(doc.get("stages"))
+        run_checkpoint_tree_session(
+            base=internal_base.rstrip("/"),
+            stages=stages,
+            video_paths=video_paths,
+            batch_id=batch_id,
+            log=log,
+            video_display_labels=video_labels,
+        )
+    except TreeQueueError as e:
+        log(f"FAILED: {e}")
+    except Exception as e:  # pragma: no cover
+        log(f"FAILED (unexpected): {e!r}")
+
+
+@app.get("/api/tree_presets")
+def list_tree_presets() -> List[Dict[str, str]]:
+    """Basenames of ``pipeline_lab/tree_presets/*.yaml`` for the two-video tree uploader."""
+    if not TREE_PRESETS_DIR.is_dir():
+        return []
+    out: List[Dict[str, str]] = []
+    for p in sorted(TREE_PRESETS_DIR.glob("*.yaml")):
+        out.append({"id": p.stem, "filename": p.name})
+    return out
+
+
+@app.post("/api/runs/tree_checkpoint_upload")
+async def create_tree_checkpoint_upload(
+    video_0: UploadFile = File(...),
+    video_1: UploadFile = File(...),
+    preset: str = Form(...),
+) -> JSONResponse:
+    """
+    Save two clips, then run the same checkpoint tree on video A (full stages), then video B, sequentially.
+    All runs share ``batch_id`` (use Lab ``/?batch=``). Orchestration runs in a background thread and calls
+    this server's ``batch_path`` endpoint; set ``PIPELINE_LAB_INTERNAL_URL`` if the API is not at
+    ``http://localhost:8765``.
+    """
+    preset_path = _resolve_tree_preset_path(preset)
+    allowed = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+    upload_id = str(uuid.uuid4())
+    staging_dir = TREE_UPLOAD_STAGING / upload_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+    labels: List[str] = []
+    try:
+        for i, uf in enumerate((video_0, video_1)):
+            raw = await uf.read()
+            if not raw:
+                raise HTTPException(400, f"empty upload for video_{i}")
+            ext = Path(uf.filename or "video.mp4").suffix or ".mp4"
+            if ext.lower() not in allowed:
+                ext = ".mp4"
+            dest = staging_dir / f"video_{i}{ext}"
+            dest.write_bytes(raw)
+            saved.append(dest)
+            labels.append(Path(uf.filename or f"video_{i}").stem)
+    except HTTPException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    batch_id = str(uuid.uuid4())
+    internal = os.environ.get("PIPELINE_LAB_INTERNAL_URL", "http://localhost:8765").strip()
+
+    thread = threading.Thread(
+        target=_tree_checkpoint_background,
+        kwargs={
+            "video_paths": saved,
+            "preset_path": preset_path,
+            "batch_id": batch_id,
+            "internal_base": internal,
+            "video_labels": labels,
+        },
+        daemon=True,
+        name=f"tree-ck-{batch_id[:8]}",
+    )
+    thread.start()
+
+    return JSONResponse(
+        {
+            "batch_id": batch_id,
+            "status": "queued",
+            "staging_dir": str(staging_dir),
+            "preset": preset_path.name,
+            "message": "Tree orchestrator started; first batch_path jobs will appear shortly.",
+        }
+    )
+
+
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     """Merge in-memory state with runs on disk (survives API restart)."""
@@ -866,6 +1260,7 @@ def list_runs() -> List[Dict[str, Any]]:
             }
             if r.status == "running":
                 row["subprocess_alive"] = _pipeline_subprocess_is_alive(r)
+            _merge_request_json_from_disk(row, RUNS_ROOT / r.run_id)
             rows[r.run_id] = row
     for p in RUNS_ROOT.iterdir():
         if not p.is_dir():
@@ -879,13 +1274,16 @@ def list_runs() -> List[Dict[str, Any]]:
         recipe_name = ""
         video_stem = ""
         batch_id_disk = ""
+        req_meta: Optional[Dict[str, Any]] = None
         if meta.is_file():
             try:
                 with open(meta, encoding="utf-8") as f:
                     m = json.load(f)
-                recipe_name = m.get("recipe_name") or ""
-                video_stem = m.get("video_stem") or ""
-                batch_id_disk = str(m.get("batch_id") or "").strip()
+                if isinstance(m, dict):
+                    req_meta = m
+                    recipe_name = m.get("recipe_name") or ""
+                    video_stem = m.get("video_stem") or ""
+                    batch_id_disk = str(m.get("batch_id") or "").strip()
             except Exception:
                 pass
         status = _disk_run_status(p)
@@ -902,8 +1300,62 @@ def list_runs() -> List[Dict[str, Any]]:
         if status == "running":
             # No in-memory Popen after API restart — Stop will not work; Delete is allowed.
             disk_row["subprocess_alive"] = False
+        if req_meta is not None:
+            _merge_request_json_into_run_row(disk_row, req_meta)
         rows[rid] = disk_row
     return sorted(rows.values(), key=lambda x: (x.get("created") or "", x["run_id"]), reverse=True)
+
+
+@app.get("/api/batches")
+def list_batch_summaries() -> List[Dict[str, Any]]:
+    """
+    Group runs by ``batch_id`` for the Lab home page: resume CLI / tree jobs without ``?batch=``.
+    """
+    rows = list_runs()
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        bid = str(r.get("batch_id") or "").strip()
+        if not bid:
+            continue
+        groups.setdefault(bid, []).append(r)
+    summaries: List[Dict[str, Any]] = []
+    for bid, rs in groups.items():
+        has_tree = any(str(x.get("parent_run_id") or "").strip() for x in rs)
+        n_queued = sum(1 for x in rs if x.get("status") == "queued")
+        n_done = sum(1 for x in rs if x.get("status") == "done")
+        n_err = sum(1 for x in rs if x.get("status") == "error")
+        n_cancelled = sum(1 for x in rs if x.get("status") == "cancelled")
+        n_running_live = sum(
+            1
+            for x in rs
+            if x.get("status") == "running" and x.get("subprocess_alive") is not False
+        )
+        n_running_stale = sum(
+            1
+            for x in rs
+            if x.get("status") == "running" and x.get("subprocess_alive") is False
+        )
+        latest = ""
+        for x in rs:
+            c = str(x.get("created") or "")
+            if c > latest:
+                latest = c
+        summaries.append(
+            {
+                "batch_id": bid,
+                "run_count": len(rs),
+                "n_queued": n_queued,
+                "n_running_live": n_running_live,
+                "n_running_stale": n_running_stale,
+                "n_done": n_done,
+                "n_error": n_err,
+                "n_cancelled": n_cancelled,
+                "has_checkpoint_tree": has_tree,
+                "latest_created": latest,
+            }
+        )
+    summaries.sort(key=lambda s: str(s.get("latest_created") or ""), reverse=True)
+    return summaries
 
 
 @app.post("/api/runs/{run_id}/stop")
@@ -1026,13 +1478,21 @@ def rerun_run(run_id: str) -> JSONResponse:
     recipe_name = str(meta.get("recipe_name") or "")
     video_stem = str(meta.get("video_stem") or "").strip() or dest.stem
 
+    extra: Dict[str, Any] = {"rerun_of": run_id}
+    ck = meta.get("checkpoint")
+    if isinstance(ck, dict) and ck:
+        extra["checkpoint"] = ck
+    bid = str(meta.get("batch_id") or "").strip()
+    if bid:
+        extra["batch_id"] = bid
+
     _enqueue_run(
         new_id,
         new_dir,
         recipe_name,
         fields,
         video_stem,
-        {"rerun_of": run_id},
+        extra,
     )
     return JSONResponse({"run_id": new_id, "status": "queued", "rerun_of": run_id})
 
@@ -1046,16 +1506,18 @@ def get_run(run_id: str) -> Dict[str, Any]:
     with _run_lock:
         st = _runs.get(run_id)
     if st:
-        out: Dict[str, Any] = {
+        out = {
             "run_id": st.run_id,
             "status": st.status,
             "error": st.error,
             "recipe_name": st.recipe_name,
             "video_stem": st.video_stem,
             "created": st.created,
+            "batch_id": st.batch_id,
         }
         if st.status == "running":
             out["subprocess_alive"] = _pipeline_subprocess_is_alive(st)
+        _merge_request_json_from_disk(out, run_dir)
     else:
         disk_status = _disk_run_status(run_dir)
         out = {
@@ -1073,8 +1535,10 @@ def get_run(run_id: str) -> Dict[str, Any]:
             try:
                 with open(meta, encoding="utf-8") as f:
                     m = json.load(f)
-                out["recipe_name"] = m.get("recipe_name") or ""
-                out["video_stem"] = m.get("video_stem") or ""
+                if isinstance(m, dict):
+                    out["recipe_name"] = m.get("recipe_name") or ""
+                    out["video_stem"] = m.get("video_stem") or ""
+                    _merge_request_json_into_run_row(out, m)
             except Exception:
                 pass
     if manifest_path.is_file():
@@ -1094,7 +1558,8 @@ def get_run_config(run_id: str) -> Dict[str, Any]:
         raise HTTPException(404, "request.json not found (run not queued yet)")
     with open(req_path, encoding="utf-8") as f:
         request_meta: Dict[str, Any] = json.load(f)
-    merged_fields = _effective_ui_fields(request_meta.get("fields"))
+    accumulated = _accumulated_tree_fields_from_request_chain(request_meta)
+    merged_fields = _effective_ui_fields(accumulated)
     params_yaml: Optional[Dict[str, Any]] = None
     py = run_dir / "params.yaml"
     if py.is_file():
@@ -1201,6 +1666,162 @@ async def run_events(run_id: str):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+class LivePreviewBody(BaseModel):
+    """Interactive replay: phase1_nms = classical IoU on stored pre-NMS dets; phase4_prune = re-run pre-pose pruning."""
+
+    mode: str = "phase1_nms"
+    sway_pretrack_nms_iou: Optional[float] = None
+    frame_start: int = 0
+    frame_end: int = 60
+    params_overrides: Optional[Dict[str, Any]] = None
+
+
+@app.get("/api/runs/{run_id}/live_capabilities")
+def live_capabilities(run_id: str) -> Dict[str, Any]:
+    """Whether this run has on-disk data for /live_preview (requires a finished run with --save-live-artifacts)."""
+    run_dir = RUNS_ROOT / run_id
+    if not run_dir.is_dir():
+        raise HTTPException(404, "unknown run")
+    out = run_dir / "output"
+    npz_live = out / "live_artifacts" / "phase1_yolo.npz"
+    npz_ck = out / "checkpoints" / "after_phase_1" / "phase1_yolo.npz"
+    p3 = out / "live_artifacts" / "phase3_bundle.pkl.gz"
+    has_pc = False
+    for p in (npz_live, npz_ck):
+        if p.is_file():
+            try:
+                import numpy as np
+
+                z = np.load(p, allow_pickle=False)
+                has_pc = "counts_pc" in z.files
+                break
+            except OSError:
+                pass
+    vids = list(run_dir.glob("input_video*"))
+    vid_rel = vids[0].name if vids else None
+    return {
+        "has_phase3_bundle": p3.is_file(),
+        "has_phase1_npz": npz_live.is_file() or npz_ck.is_file(),
+        "has_phase1_pre_classical": has_pc,
+        "input_video_relpath": vid_rel,
+    }
+
+
+@app.post("/api/runs/{run_id}/live_preview")
+def live_preview(run_id: str, body: LivePreviewBody) -> Dict[str, Any]:
+    """Recompute a short frame range with overridden parameters (fast; uses cached artifacts)."""
+    run_dir = RUNS_ROOT / run_id
+    if not run_dir.is_dir():
+        raise HTTPException(404, "unknown run")
+    out = run_dir / "output"
+    vids = list(run_dir.glob("input_video*"))
+    if not vids:
+        raise HTTPException(400, "missing input video")
+    video_path = vids[0]
+    mode = (body.mode or "phase1_nms").strip().lower()
+    fs = max(0, int(body.frame_start))
+    fe = max(fs, int(body.frame_end))
+
+    if mode == "phase1_nms":
+        from sway.checkpoint_io import load_phase1_yolo_npz_file
+        from sway.live_replay import phase1_pre_classical_to_per_frame_boxes
+
+        npz_path = out / "live_artifacts" / "phase1_yolo.npz"
+        if not npz_path.is_file():
+            npz_path = out / "checkpoints" / "after_phase_1" / "phase1_yolo.npz"
+        if not npz_path.is_file():
+            raise HTTPException(
+                404,
+                "No phase1_yolo.npz — run with save live artifacts enabled or stop at after_phase_1.",
+            )
+        _y, meta = load_phase1_yolo_npz_file(npz_path)
+        pre = meta.get("phase1_pre_classical")
+        if not isinstance(pre, dict) or not pre:
+            raise HTTPException(
+                400,
+                "NPZ has no pre-classical NMS layer (counts_pc). Re-run the pipeline with a current build.",
+            )
+        tf = int(meta.get("total_frames", 0))
+        fe = min(fe, max(0, tf - 1))
+        iou = float(body.sway_pretrack_nms_iou) if body.sway_pretrack_nms_iou is not None else 0.5
+        frames = phase1_pre_classical_to_per_frame_boxes(pre, iou, fs, fe)
+        return {
+            "mode": "phase1_nms",
+            "sway_pretrack_nms_iou": iou,
+            "frame_start": fs,
+            "frame_end": fe,
+            "total_frames": tf,
+            "frames": frames,
+        }
+
+    if mode == "phase4_prune":
+        from sway.checkpoint_io import load_live_phase3_bundle
+        from sway.phase4_replay import run_pre_pose_prune_phase
+
+        bundle_path = out / "live_artifacts" / "phase3_bundle.pkl.gz"
+        if not bundle_path.is_file():
+            raise HTTPException(
+                404,
+                "No phase3_bundle — full pipeline must finish with save live artifacts (default in Lab).",
+            )
+        b = load_live_phase3_bundle(out)
+        raw_tracks = b["raw_tracks"]
+        total_frames = int(b["total_frames"])
+        frame_width = int(b["frame_width"])
+        frame_height = int(b["frame_height"])
+        fe = min(fe, max(0, total_frames - 1))
+        params_path = run_dir / "params.yaml"
+        params: Dict[str, Any] = {}
+        if params_path.is_file():
+            with open(params_path, encoding="utf-8") as f:
+                params = yaml.safe_load(f) or {}
+        ov = body.params_overrides or {}
+        if isinstance(ov, dict):
+            params = {**params, **ov}
+        apply_master_locked_pre_pose_prune_params(params)
+        apply_sway_params_to_env(params)
+        (
+            surviving_ids,
+            _prune_log,
+            tracking_results,
+            _initial_count,
+            _tracker_ids_before,
+        ) = run_pre_pose_prune_phase(
+            raw_tracks=raw_tracks,
+            total_frames=total_frames,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            video_path=video_path,
+            params=params,
+            lab_phase4_tick=None,
+            lab_state=None,
+            lab_update_context=None,
+            quiet=True,
+        )
+        frames_out: List[Dict[str, Any]] = []
+        for fi in range(fs, fe + 1):
+            if fi < 0 or fi >= len(tracking_results):
+                continue
+            t = tracking_results[fi]
+            frames_out.append(
+                {
+                    "frame_idx": fi,
+                    "boxes": t.get("boxes") or [],
+                    "track_ids": t.get("track_ids") or [],
+                }
+            )
+        return {
+            "mode": "phase4_prune",
+            "frame_start": fs,
+            "frame_end": fe,
+            "total_frames": total_frames,
+            "surviving_track_count": len(surviving_ids),
+            "frames": frames_out,
+        }
+
+    raise HTTPException(400, f"unknown mode {body.mode!r}")
+
+
 @app.get("/api/runs/{run_id}/pose_3d")
 def get_pose_3d(run_id: str) -> Dict[str, Any]:
     """Return data.json['pose_3d'] for the Three.js viewer (404 if missing)."""
@@ -1249,6 +1870,47 @@ def serve_run_file(run_id: str, path: str):
     return FileResponse(target, filename=target.name, media_type=media_type)
 
 
-web_dist = os.environ.get("PIPELINE_LAB_WEB_DIST")
-if web_dist and Path(web_dist).is_dir():
-    app.mount("/", StaticFiles(directory=web_dist, html=True), name="ui")
+def _register_web_ui(dist: Path) -> None:
+    """
+    Serve the Vite build with a real SPA fallback so /watch/<id>, /config, etc. work on refresh
+    (StaticFiles(html=True) only maps directory indexes, not arbitrary client routes).
+    """
+    dist = dist.resolve()
+    assets_dir = dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="web_assets")
+
+    @app.get("/")
+    def spa_index() -> FileResponse:
+        index = dist / "index.html"
+        if not index.is_file():
+            raise HTTPException(503, "UI dist missing index.html")
+        return FileResponse(index)
+
+    @app.get("/{resource_path:path}")
+    def spa_or_static(resource_path: str) -> FileResponse:
+        if resource_path == "api" or resource_path.startswith("api/"):
+            raise HTTPException(404, "not found")
+        target = (dist / resource_path).resolve()
+        try:
+            target.relative_to(dist)
+        except ValueError:
+            raise HTTPException(403, "invalid path") from None
+        if target.is_file():
+            return FileResponse(target)
+        index = dist / "index.html"
+        if not index.is_file():
+            raise HTTPException(503, "UI dist missing index.html")
+        return FileResponse(index)
+
+
+_web_dist_env = os.environ.get("PIPELINE_LAB_WEB_DIST")
+if _web_dist_env:
+    _web_dist_path = Path(_web_dist_env)
+    if _web_dist_path.is_dir():
+        _register_web_ui(_web_dist_path)
+    else:
+        print(
+            f"[pipeline_lab] PIPELINE_LAB_WEB_DIST is set but not a directory: {_web_dist_path} — UI not mounted.",
+            flush=True,
+        )
