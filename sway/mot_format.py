@@ -11,6 +11,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from sway.track_observation import coerce_observation
+
 # raw_tracks: track_id -> list of (frame_idx_0based, box_xyxy, conf)
 RawTrackEntry = Tuple[int, Tuple[float, float, float, float], float]
 
@@ -79,9 +81,10 @@ def build_phase3_tracking_data_json(
     )
     for tid, entries in raw_tracks.items():
         for entry in entries:
-            if not entry or len(entry) < 3:
+            if entry is None:
                 continue
-            f0, box, conf = int(entry[0]), entry[1], entry[2]
+            obs = coerce_observation(entry)
+            f0, box, conf = int(obs.frame_idx), obs.bbox, float(obs.conf)
             if len(box) < 4:
                 continue
             x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])

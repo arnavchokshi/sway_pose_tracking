@@ -1529,3 +1529,344 @@ p.sub {
 .sway-feed__line:active {
   transform: translateX(0);
 }
+
+/* —— Optuna sweep dashboard —— */
+.optuna-sweep-page {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 3rem;
+}
+.optuna-sweep-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.optuna-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.88rem;
+  margin-top: 0.35rem;
+}
+.optuna-back:hover {
+  color: var(--halo-cyan);
+}
+.optuna-sweep-titleblock {
+  flex: 1;
+  min-width: 200px;
+}
+.optuna-sweep-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.optuna-sweep-title-ico {
+  color: var(--halo-purple);
+  flex-shrink: 0;
+}
+.optuna-sweep-sub {
+  margin: 0.35rem 0 0;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+.optuna-sweep-sub code {
+  font-size: 0.82em;
+  color: var(--halo-cyan);
+}
+.optuna-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.optuna-spin {
+  animation: optuna-spin 0.85s linear infinite;
+}
+@keyframes optuna-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.optuna-error-card {
+  padding: 1.25rem 1.35rem;
+  border-radius: var(--card-radius);
+  background: rgba(127, 29, 29, 0.2);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  margin-bottom: 1.5rem;
+}
+.optuna-error-card h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+.optuna-error-card p {
+  margin: 0.35rem 0;
+  font-size: 0.9rem;
+}
+.optuna-info-card {
+  padding: 1.25rem 1.35rem;
+  border-radius: var(--card-radius);
+  background: var(--surface-1);
+  border: 1px solid var(--glass-border);
+  margin-bottom: 1.5rem;
+}
+.optuna-info-card h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+.optuna-info-card p {
+  margin: 0.35rem 0;
+  font-size: 0.9rem;
+}
+.optuna-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.85rem;
+  margin-bottom: 1.25rem;
+}
+.optuna-stat-card {
+  padding: 1rem 1.1rem;
+  border-radius: var(--card-radius);
+  background: var(--surface-1);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(12px);
+}
+.optuna-stat-label {
+  display: block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 0.25rem;
+}
+.optuna-stat-value {
+  display: block;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.optuna-stat-value--sm {
+  font-size: 0.92rem;
+  font-weight: 500;
+}
+.optuna-stat-hint {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-top: 0.35rem;
+}
+.optuna-stat-hint.mono {
+  font-family: ui-monospace, monospace;
+}
+.optuna-pulse {
+  color: var(--halo-cyan);
+}
+.optuna-best-card {
+  margin-bottom: 1.5rem;
+  padding: 1.25rem 1.35rem;
+  border-radius: var(--card-radius);
+  background: linear-gradient(135deg, rgba(167, 139, 250, 0.12), rgba(14, 165, 233, 0.08));
+  border: 1px solid rgba(167, 139, 250, 0.28);
+}
+.optuna-best-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.optuna-best-head h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+.optuna-best-ico {
+  color: var(--halo-pink);
+  flex-shrink: 0;
+}
+.optuna-best-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1.25rem;
+}
+.optuna-empty-best {
+  padding: 1rem;
+  margin-bottom: 1rem;
+  text-align: center;
+}
+.optuna-h2 {
+  margin: 0 0 0.65rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.optuna-h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.optuna-muted {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+.optuna-muted code {
+  font-size: 0.85em;
+  color: var(--halo-cyan);
+}
+.optuna-kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.optuna-kv th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-muted);
+  padding: 0.35rem 0.5rem 0.35rem 0;
+  vertical-align: top;
+  width: 42%;
+}
+.optuna-kv td {
+  padding: 0.35rem 0;
+  word-break: break-word;
+}
+.optuna-split {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(340px, 1.1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .optuna-split {
+    grid-template-columns: 1fr;
+  }
+}
+.optuna-table-panel,
+.optuna-video-panel {
+  padding: 1rem 1.1rem;
+  border-radius: var(--card-radius);
+  background: var(--surface-1);
+  border: 1px solid var(--glass-border);
+}
+.optuna-table-wrap {
+  overflow-x: auto;
+  max-height: min(520px, 58vh);
+  overflow-y: auto;
+}
+.optuna-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.optuna-table th {
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--glass-border);
+  position: sticky;
+  top: 0;
+  background: rgba(24, 24, 27, 0.92);
+}
+.optuna-table td {
+  padding: 0.45rem 0.65rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.optuna-table tbody tr {
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.optuna-table tbody tr:hover {
+  background: rgba(56, 189, 248, 0.06);
+}
+.optuna-row--active {
+  background: rgba(167, 139, 250, 0.12) !important;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.optuna-pill {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.optuna-pill--complete {
+  background: rgba(34, 197, 94, 0.2);
+  color: #86efac;
+}
+.optuna-pill--pruned {
+  background: rgba(234, 179, 8, 0.18);
+  color: #fde047;
+}
+.optuna-pill--running {
+  background: rgba(56, 189, 248, 0.2);
+  color: var(--halo-cyan);
+}
+.optuna-pill--fail,
+.optuna-pill--failed {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+.optuna-video-help {
+  margin: 0 0 0.85rem;
+}
+.optuna-video-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+.optuna-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.optuna-field--full {
+  width: 100%;
+  margin-bottom: 0.65rem;
+}
+.optuna-select,
+.optuna-input {
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-border);
+  background: rgba(8, 10, 20, 0.65);
+  color: var(--text-main);
+  font-size: 0.88rem;
+  min-width: 140px;
+}
+.optuna-video {
+  width: 100%;
+  max-height: min(420px, 50vh);
+  border-radius: var(--radius-sm);
+  background: #000;
+  border: 1px solid var(--glass-border);
+}
+.optuna-video-loading,
+.optuna-video-empty,
+.optuna-video-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  border: 1px dashed rgba(148, 163, 184, 0.2);
+}
+.optuna-video-empty svg {
+  opacity: 0.5;
+}

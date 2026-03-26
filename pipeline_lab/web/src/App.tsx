@@ -7,6 +7,7 @@ import { ComparePage } from './pages/ComparePage'
 import { WatchPage } from './pages/WatchPage'
 import { LiveSandboxPage } from './pages/LiveSandboxPage'
 import { SwayScoringPage } from './pages/SwayScoringPage'
+import { OptunaSweepPage } from './pages/OptunaSweepPage'
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
               <Route path="/watch/:id/live" element={<LiveSandboxPage />} />
               <Route path="/watch/:id" element={<WatchPage />} />
               <Route path="/scoring" element={<SwayScoringPage />} />
+              <Route path="/optuna-sweep" element={<OptunaSweepPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

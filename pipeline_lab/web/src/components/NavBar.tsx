@@ -42,6 +42,12 @@ export function NavBar() {
             <NavLink to="/scoring" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Scoring UI
             </NavLink>
+            <NavLink
+              to="/optuna-sweep"
+              className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}
+            >
+              Optuna sweep
+            </NavLink>
           </nav>
         </div>
 

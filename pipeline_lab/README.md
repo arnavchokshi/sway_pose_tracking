@@ -32,7 +32,7 @@ Source of truth for these strings: `pipeline_lab/web/src/siteUrls.ts`.
 **Single-tab “production” local (UI + API on the same port):**
 
 ```bash
-cd sway_pose_mvp
+cd sway_pose_mvp   # required — Python must resolve package `pipeline_lab` from this directory
 export PIPELINE_LAB_WEB_DIST="$(pwd)/pipeline_lab/web/dist"
 uvicorn pipeline_lab.server.app:app --host localhost --port 8765
 ```
@@ -42,11 +42,18 @@ Open **http://localhost:8765/** only.
 **Dev with hot reload (two processes, one browser tab):**
 
 ```bash
-# terminal 1 — API
+# terminal 1 — API (must cwd = sway_pose_mvp, or use scripts/run_pipeline_lab_api.sh)
+cd sway_pose_mvp
 uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765
 
 # terminal 2 — Vite (fixed port 5173)
 cd pipeline_lab/web && npm run dev
+```
+
+From a parent folder (e.g. `Desktop/sway_test`), either `cd sway_pose_mvp` first or:
+
+```bash
+bash sway_pose_mvp/scripts/run_pipeline_lab_api.sh --reload --host localhost --port 8765
 ```
 
 Open **http://localhost:5173/** only; the dev server proxies `/api` to port 8765.

@@ -23,7 +23,8 @@ def apply_boxmot_kf_unfreeze_guard() -> bool:
     def unfreeze_safe(self):  # type: ignore[no-untyped-def]
         try:
             return _orig(self)
-        except IndexError:
+        except (IndexError, TypeError):
+            # TypeError: e.g. numpy 2.x scalar vs float in w/float(h) inside boxmot KF
             self.attr_saved = None
 
     cls.unfreeze = unfreeze_safe  # type: ignore[method-assign]

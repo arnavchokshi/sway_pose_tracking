@@ -1234,7 +1234,9 @@ def _run_tracking_boxmot_diou(
     model = YOLO(model_path)
     print(f"  YOLO weights loaded; building BoxMOT {bmk} tracker…", flush=True)
     reid_w = _resolve_boxmot_reid_weights()
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # BoxMOT parses torch.device("cuda") as the string "cuda" and sets CUDA_VISIBLE_DEVICES=cuda
+    # (invalid). Use an explicit ordinal so DeepOcSort/ReID backends see device "0".
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _doc_kw = _deepocsort_extra_from_env()
     src_fps = probe_video_fps(video_path)
     tr_fps = max(1, int(round(src_fps)))
@@ -1693,7 +1695,7 @@ def run_boxmot_tracking_from_yolo_dets(
     bmk = boxmot_tracker_kind_from_env()
     print(f"[resume phase1→track] {model_path} BoxMOT {bmk}; hybrid SAM + tracker from checkpoint dets.")
     reid_w = _resolve_boxmot_reid_weights()
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _doc_kw = _deepocsort_extra_from_env()
     src_fps = probe_video_fps(video_path)
     tr_fps = max(1, int(round(src_fps)))

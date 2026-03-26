@@ -245,6 +245,8 @@ def _score_one_video(
     params_yaml: Path,
     out_dir: Path,
     timeout_s: Optional[int],
+    *,
+    save_phase_previews: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -258,6 +260,8 @@ def _score_one_video(
         "--stop-after-boundary",
         "after_phase_3",
     ]
+    if save_phase_previews:
+        cmd.append("--save-phase-previews")
     kwargs: Dict[str, Any] = {"cwd": str(REPO_ROOT)}
     if timeout_s is not None:
         kwargs["timeout"] = timeout_s
@@ -350,6 +354,11 @@ def main() -> None:
         action="store_true",
         help="Do not write sweep_status.json",
     )
+    parser.add_argument(
+        "--phase-previews",
+        action="store_true",
+        help="Pass --save-phase-previews to each main.py (phase_previews/*.mp4 for Lab / Optuna UI)",
+    )
     args = parser.parse_args()
 
     import optuna
@@ -440,6 +449,7 @@ def main() -> None:
                     params_path,
                     run_dir,
                     timeout,
+                    save_phase_previews=bool(args.phase_previews),
                 )
                 per_video_scores.append(score)
                 all_metrics[seq_name] = mflat

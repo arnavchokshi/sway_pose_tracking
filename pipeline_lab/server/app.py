@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import queue
 import re
 import shutil
@@ -33,7 +34,7 @@ import sys
 import yaml
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -48,6 +49,119 @@ TREE_UPLOAD_STAGING = RUNS_ROOT / "_tree_upload_staging"
 TREE_UPLOAD_STAGING.mkdir(parents=True, exist_ok=True)
 EXPERIMENTS_ROOT = REPO_ROOT / "pipeline_lab" / "experiments"
 EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _optuna_sweep_root() -> Path:
+    """Directory with sweep.db, sweep_status.json, trial_* subdirs. Override: SWAY_OPTUNA_SWEEP_DIR."""
+    raw = os.environ.get("SWAY_OPTUNA_SWEEP_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (REPO_ROOT / "output" / "sweeps" / "optuna").resolve()
+
+
+_DEFAULT_LAMBDA_REMOTE = "~/sway_pose_tracking/output/sweeps/optuna/sweep_status.json"
+# Primary sweep GPU instance (gpu_1x_a10, us-east-1). Override with SWAY_LAMBDA_SWEEP_*; set SWAY_LAMBDA_SWEEP_HOST=
+# to empty string to skip scp and only read local sweep_status.json.
+_SWAY_OPTUNA_LAMBDA_DEFAULT_IP = "150.136.111.175"
+_SWAY_OPTUNA_LAMBDA_DEFAULT_USER = "ubuntu"
+_SWAY_OPTUNA_LAMBDA_DEFAULT_PEM_CANDIDATES = (
+    Path.home() / "Downloads" / "pose-tracking.pem",
+    Path.home() / ".ssh" / "pose-tracking.pem",
+    Path.home() / ".ssh" / "pose-tracking",
+)
+_LAMBDA_HOST_PART_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$")
+
+
+def _default_lambda_pem_path() -> Optional[str]:
+    for p in _SWAY_OPTUNA_LAMBDA_DEFAULT_PEM_CANDIDATES:
+        try:
+            r = p.expanduser().resolve()
+        except OSError:
+            continue
+        if r.is_file():
+            return str(r)
+    return None
+
+
+def _parse_user_host(raw: str) -> Tuple[str, str]:
+    """Return (user, host) from ``host`` or ``user@host``."""
+    s = raw.strip()
+    if "@" in s:
+        u, _, h = s.partition("@")
+        u, h = u.strip(), h.strip()
+        if u and h:
+            return u, h
+    return os.environ.get("SWAY_LAMBDA_SWEEP_USER", "ubuntu").strip() or "ubuntu", s
+
+
+def _validate_lambda_host(host: str) -> None:
+    if not host or len(host) > 253:
+        raise HTTPException(status_code=400, detail="invalid Lambda host")
+    if not _LAMBDA_HOST_PART_RE.match(host):
+        raise HTTPException(status_code=400, detail="invalid Lambda host (use IP or hostname)")
+
+
+def _validate_lambda_remote_path(path: str) -> None:
+    if not path or len(path) > 512 or ".." in path or "\n" in path or "\r" in path:
+        raise HTTPException(status_code=400, detail="invalid remote_path")
+
+
+def _scp_pull_remote_file(
+    *,
+    host: str,
+    user: str,
+    pem: Optional[str],
+    remote_path: str,
+    dest: Path,
+) -> None:
+    """Copy ``remote_path`` from ``user@host`` to ``dest`` (atomic replace). Uses system ``scp``."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".pulltmp")
+    if tmp.is_file():
+        tmp.unlink()
+    remote_spec = f"{user}@{host}:{remote_path}"
+    cmd: List[str] = [
+        "scp",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=25",
+    ]
+    if pem:
+        cmd.extend(["-i", pem])
+    cmd.extend([remote_spec, str(tmp)])
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(REPO_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="scp timed out connecting to Lambda") from None
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="scp not found — install an OpenSSH client (macOS: built-in; Windows: OpenSSH optional feature)",
+        ) from None
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or "scp failed"
+        raise HTTPException(status_code=502, detail=msg) from None
+    tmp.replace(dest)
+
+
+class OptunaLambdaPullBody(BaseModel):
+    """Optional overrides for advanced use; defaults are the primary Lambda + pose-tracking key."""
+
+    host: Optional[str] = None
+    user: Optional[str] = None
+    pem: Optional[str] = None
+    remote_path: Optional[str] = None
+
+
+def _safe_optuna_sequence_segment(name: str) -> bool:
+    return bool(name) and re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$", name) is not None
 
 
 def _merge_lab_request_into_manifest(run_dir: Path) -> None:
@@ -676,6 +790,152 @@ def rehydrate_from_disk() -> Dict[str, Any]:
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
+
+
+@app.post("/api/optuna-sweep/pull-lambda")
+def optuna_pull_lambda(body: OptunaLambdaPullBody = Body(default_factory=OptunaLambdaPullBody)) -> Dict[str, Any]:
+    """
+    Pull latest ``sweep_status.json`` from the primary GPU instance (same as ``scripts/pull_lambda_sweep_status.sh``).
+
+    Defaults: IP ``150.136.111.175``, user ``ubuntu``, PEM ``~/Downloads/pose-tracking.pem`` or
+    ``~/.ssh/pose-tracking.pem`` / ``~/.ssh/pose-tracking`` when present. Override with ``SWAY_LAMBDA_SWEEP_HOST``,
+    ``SWAY_LAMBDA_SWEEP_USER``, ``SWAY_LAMBDA_SWEEP_PEM``, ``SWAY_LAMBDA_SWEEP_REMOTE_PATH``, or optional JSON body.
+    Set ``SWAY_LAMBDA_SWEEP_HOST`` to an empty value to disable scp (local JSON only). Writes into the Optuna sweep
+    root (``SWAY_OPTUNA_SWEEP_DIR`` or ``output/sweeps/optuna/``). Does **not** run a local sweep.
+    """
+    env_host = os.environ.get("SWAY_LAMBDA_SWEEP_HOST")
+    if env_host is not None and not env_host.strip():
+        return {"ok": True, "pulled": False, "reason": "no_lambda_target"}
+
+    raw_host = (body.host or env_host or _SWAY_OPTUNA_LAMBDA_DEFAULT_IP).strip()
+    if not raw_host:
+        return {"ok": True, "pulled": False, "reason": "no_lambda_target"}
+
+    env_user = os.environ.get("SWAY_LAMBDA_SWEEP_USER")
+    user_default = (
+        (body.user or (env_user if env_user is not None else "") or _SWAY_OPTUNA_LAMBDA_DEFAULT_USER).strip() or "ubuntu"
+    )
+    if "@" in raw_host:
+        user, host = _parse_user_host(raw_host)
+    else:
+        user, host = user_default, raw_host
+    _validate_lambda_host(host)
+
+    pem: Optional[str] = None
+    if "SWAY_LAMBDA_SWEEP_PEM" in os.environ:
+        pem_raw = os.environ["SWAY_LAMBDA_SWEEP_PEM"].strip()
+        if pem_raw:
+            pem_path = Path(pem_raw).expanduser().resolve()
+            if not pem_path.is_file():
+                raise HTTPException(status_code=400, detail=f"PEM file not found: {pem_path}")
+            pem = str(pem_path)
+    elif body.pem and str(body.pem).strip():
+        pem_path = Path(str(body.pem).strip()).expanduser().resolve()
+        if not pem_path.is_file():
+            raise HTTPException(status_code=400, detail=f"PEM file not found: {pem_path}")
+        pem = str(pem_path)
+    else:
+        pem = _default_lambda_pem_path()
+
+    remote = (body.remote_path or os.environ.get("SWAY_LAMBDA_SWEEP_REMOTE_PATH", "") or "").strip()
+    if not remote:
+        remote = _DEFAULT_LAMBDA_REMOTE
+    _validate_lambda_remote_path(remote)
+
+    dest = _optuna_sweep_root() / "sweep_status.json"
+    _scp_pull_remote_file(host=host, user=user, pem=pem, remote_path=remote, dest=dest)
+    return {"ok": True, "pulled": True, "wrote": str(dest)}
+
+
+@app.get("/api/optuna-sweep/status")
+def optuna_sweep_status() -> Dict[str, Any]:
+    """Latest atomic snapshot from ``tools.auto_sweep`` (``sweep_status.json``)."""
+    p = _optuna_sweep_root() / "sweep_status.json"
+    if not p.is_file():
+        # 200 + empty_state avoids log noise and JSON error blobs in the UI when no sweep has run yet.
+        return {
+            "schema": "sway_optuna_sweep_status_v1",
+            "empty_state": True,
+            "updated_unix": time.time(),
+            "study_name": "",
+            "direction": "minimize",
+            "n_trials_total": 0,
+            "n_complete": 0,
+            "n_pruned": 0,
+            "n_other": 0,
+            "best": None,
+            "trials": [],
+            "meta": {
+                "hint": "sweep_status.json not found — run auto_sweep locally or set SWAY_OPTUNA_SWEEP_DIR",
+            },
+        }
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"invalid sweep_status.json: {e}") from e
+
+
+@app.get("/api/optuna-sweep/trial/{trial_number}/sequence/{sequence_name}/media")
+def optuna_trial_media(trial_number: int, sequence_name: str) -> Dict[str, Any]:
+    """List MP4 artifacts under a sweep trial directory (phase_previews + output)."""
+    if not _safe_optuna_sequence_segment(sequence_name):
+        raise HTTPException(400, "invalid sequence name")
+    root = _optuna_sweep_root().resolve()
+    trial_dir = (root / f"trial_{trial_number:05d}_{sequence_name}").resolve()
+    try:
+        trial_dir.relative_to(root)
+    except ValueError:
+        raise HTTPException(403, "invalid trial path") from None
+    if not trial_dir.is_dir():
+        return {
+            "trial": trial_number,
+            "sequence": sequence_name,
+            "items": [],
+            "note": "No trial output directory yet (or wrong sequence name).",
+        }
+    items: List[Dict[str, str]] = []
+    for sub, kind in (("phase_previews", "phase_preview"), ("output", "output")):
+        d = trial_dir / sub
+        if not d.is_dir():
+            continue
+        for fp in sorted(d.glob("*.mp4")):
+            rel = f"{sub}/{fp.name}"
+            items.append({"kind": kind, "filename": fp.name, "path": rel})
+    return {"trial": trial_number, "sequence": sequence_name, "items": items}
+
+
+@app.get("/api/optuna-sweep/trial/{trial_number}/sequence/{sequence_name}/file")
+def optuna_trial_file(trial_number: int, sequence_name: str, path: str):
+    """Serve a file from ``output/sweeps/optuna/trial_XXXXX_<sequence>/`` (e.g. phase preview MP4)."""
+    if not _safe_optuna_sequence_segment(sequence_name):
+        raise HTTPException(400, "invalid sequence name")
+    pnorm = Path(path)
+    if not path or pnorm.is_absolute() or ".." in pnorm.parts:
+        raise HTTPException(400, "invalid path")
+    root = _optuna_sweep_root().resolve()
+    trial_dir = (root / f"trial_{trial_number:05d}_{sequence_name}").resolve()
+    try:
+        trial_dir.relative_to(root)
+    except ValueError:
+        raise HTTPException(403, "invalid trial path") from None
+    target = (trial_dir / path).resolve()
+    try:
+        target.relative_to(trial_dir)
+    except ValueError:
+        raise HTTPException(403, "path escapes trial dir") from None
+    if not target.is_file():
+        raise HTTPException(404, "not found")
+    media_type = None
+    suf = target.suffix.lower()
+    if suf == ".mp4":
+        media_type = "video/mp4"
+    elif suf == ".webm":
+        media_type = "video/webm"
+    elif suf == ".mov":
+        media_type = "video/quicktime"
+    elif suf == ".json":
+        media_type = "application/json"
+    return FileResponse(target, filename=target.name, media_type=media_type)
 
 
 @app.get("/api/schema")

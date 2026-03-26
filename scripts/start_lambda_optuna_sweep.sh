@@ -20,7 +20,11 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   exit 1
 fi
 
-CMD="cd '$ROOT' && export SWAY_SERVER_PERF=1 && '$PY' -u -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml 2>&1 | tee -a output/sweeps/optuna/sweep_runner.log"
+EXTRA=""
+if [[ "${SWAY_SWEEP_PHASE_PREVIEWS:-0}" == "1" ]]; then
+  EXTRA=" --phase-previews"
+fi
+CMD="cd '$ROOT' && export SWAY_SERVER_PERF=1 && '$PY' -u -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml$EXTRA 2>&1 | tee -a output/sweeps/optuna/sweep_runner.log"
 
 tmux new-session -d -s "$SESSION" bash -lc "$CMD"
 echo "Started tmux session: $SESSION"
