@@ -7,6 +7,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 SESSION="${SWEEP_TMUX_SESSION:-sway_sweep}"
 
+PY="$ROOT/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="${PYTHON:-python3}"
+fi
+
 export SWAY_SERVER_PERF="${SWAY_SERVER_PERF:-1}"
 mkdir -p output/sweeps/optuna
 
@@ -15,7 +20,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   exit 1
 fi
 
-CMD="cd '$ROOT' && export SWAY_SERVER_PERF=1 && python -u -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml 2>&1 | tee -a output/sweeps/optuna/sweep_runner.log"
+CMD="cd '$ROOT' && export SWAY_SERVER_PERF=1 && '$PY' -u -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml 2>&1 | tee -a output/sweeps/optuna/sweep_runner.log"
 
 tmux new-session -d -s "$SESSION" bash -lc "$CMD"
 echo "Started tmux session: $SESSION"
