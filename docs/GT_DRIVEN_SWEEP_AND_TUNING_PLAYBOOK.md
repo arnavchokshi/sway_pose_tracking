@@ -166,6 +166,8 @@ python -m tools.smoke_server_perf_env --pipeline --timeout 60
 
 **One-shot on the box:** `bash scripts/lambda_preflight.sh` (installs requirements, checks models + `sweep_sequences.yaml` paths, runs the env smoke). Add **`PIPELINE=1`** for `main.py` smoke; override timeout with **`PIPELINE_TIMEOUT=90`**.
 
+**Lambda `gpu_1x_a10` (us-east-1, x86_64):** matches the repo’s **cu124** PyTorch path in `scripts/phase2_public_training/setup_lambda_training.sh` (not GH200/cu128). **`SWAY_SERVER_PERF=1`** still applies. VRAM is **~24 GB** (not 40 GB): keep the default **`SWAY_YOLO_INFER_BATCH=1`** for Phase 1–3 sweeps; try **`2`** only after a short run or smoke proves no CUDA OOM with hybrid SAM + pose on your clips. If you OOM, leave batch at 1 and rely on server perf + TF32.
+
 ### 5.2 Batch sources
 
 | Mechanism | Role |
@@ -283,6 +285,8 @@ python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml
 optuna-dashboard sqlite:///$(pwd)/output/sweeps/optuna/sweep.db   # optional
 ```
 
+**Live status (custom UI / laptop):** Each completed trial updates atomic **`output/sweeps/optuna/sweep_status.json`** (all trials, `best`, counts, per-trial `params` + `user_attrs`). **`sweep_log.jsonl`** is append-only (one object per finished trial). From your Mac, poll with `scp ubuntu@<IP>:~/sway_pose_tracking/output/sweeps/optuna/sweep_status.json .` or `watch -n 30 scp …`. Re-read only the DB without a running sweep: `python -m tools.export_optuna_study_status`. **Built-in UI:** install `optuna-dashboard`, SSH tunnel `ssh -L 8080:localhost:8080 ubuntu@<IP>`, on the instance `optuna-dashboard sqlite:///$PWD/output/sweeps/optuna/sweep.db --port 8080 --host 127.0.0.1`, then open `http://127.0.0.1:8080` locally. **Console log:** `tail -f output/sweeps/optuna/sweep_runner.log` if you start the sweep with `tee` (see `scripts/start_lambda_optuna_sweep.sh`).
+
 **MedianPruner:** `auto_sweep.py` calls `trial.report(score, step)` **after each** benchmark video (`sequence_order` in config). If the first clip scores below the running median, Optuna **prunes** the trial and skips the remaining videos — important for paid GPU time.
 
 ---
@@ -296,7 +300,10 @@ tools/auto_sweep.py        # Optuna TPE + MedianPruner (per-video report)
 tools/convert_data_json_to_mot.py
 output/sweeps/optuna/sweep.db    # default SQLite storage (under gitignored output/)
 output/sweeps/optuna/sweep_log.jsonl
+output/sweeps/optuna/sweep_status.json   # atomic snapshot after each trial (live UI; --no-status-json to disable)
+output/sweeps/optuna/sweep_runner.log    # optional: tee from start script
 output/sweeps/optuna/STOP        # optional: create while running to stop after current trial (--stop-file to override path)
+tools/export_optuna_study_status.py  # refresh sweep_status.json from DB only
 ```
 
 **MOT file:** `python -m tools.convert_data_json_to_mot data.json pred.txt`  

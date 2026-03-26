@@ -65,7 +65,7 @@ assert cuda, 'CUDA not available — wrong wheels or driver'"
 
 echo "==> Done. Training uses: $PY"
 echo "==> For inference / sweeps (main.py, tools.auto_sweep): export SWAY_SERVER_PERF=1"
-echo "    Optional: SWAY_PERF_CPU_THREADS=16 on large instances; try SWAY_YOLO_INFER_BATCH=2–4 on 40GB if stable."
+echo "    Inference sweep: SWAY_SERVER_PERF=1; on A10 (~24GB) keep SWAY_YOLO_INFER_BATCH=1 unless smoke OK at 2; A100-class can try 2–4."
 echo "==> Next (pick one):"
 echo "    bash scripts/phase2_public_training/run_lambda_crowdhuman_skip_dancetrack.sh   # CrowdHuman only (upload DanceTrack .pt first)"
 echo "    bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh"

@@ -1,5 +1,5 @@
 """
-Tuning for high-core NVIDIA servers (e.g. Lambda 1×A100, ~30 vCPU, large RAM).
+Tuning for high-core NVIDIA servers (e.g. Lambda **gpu_1x_a10** or 1×A100, many vCPUs, ample RAM).
 
 Export ``SWAY_SERVER_PERF=1`` before ``python main.py``. Sweep drivers merge the same
 flags into subprocess environments when this var is already set in the parent shell.

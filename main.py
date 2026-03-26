@@ -95,6 +95,7 @@ from sway.checkpoint_io import (
     save_phase1_yolo_dets,
     validate_manifest,
 )
+from sway.mot_format import build_phase3_tracking_data_json
 from sway.phase_debug_log import PhaseDebugLogger
 from sway.tracker import (
     _use_boxmot,
@@ -1597,6 +1598,16 @@ def main():
         _lab_update_context(track_stats_path=str(ts_path.name))
 
     if phase3_checkpoint_stop_pending:
+        dj = build_phase3_tracking_data_json(
+            video_path=str(video_path),
+            raw_tracks=raw_tracks,
+            total_frames=int(total_frames),
+            native_fps=float(native_fps),
+            output_fps=float(output_fps),
+        )
+        data_path = output_dir / "data.json"
+        data_path.write_text(json.dumps(dj, separators=(",", ":")), encoding="utf-8")
+        print(f"  Tracking-only data.json written: {data_path}", flush=True)
         _lab_update_context(
             checkpoint_boundary="after_phase_3",
             vitpose_model_id="(not loaded — stopped before pose)",

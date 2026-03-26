@@ -8,15 +8,21 @@ Optuna TPE sweep for Phase 1–3 (``--stop-after-boundary after_phase_3``).
 
 Config: copy ``data/ground_truth/sweep_sequences.example.yaml`` → ``sweep_sequences.yaml``.
 
-On Lambda / multi-vCPU NVIDIA hosts, export ``SWAY_SERVER_PERF=1`` so each ``main.py``
-child gets cuDNN autotune, TF32, and bounded CPU thread pools (see ``sway.server_runtime_perf``).
-Verify propagation: ``python -m tools.smoke_server_perf_env`` (optional ``--pipeline --timeout 60``).
+On Lambda (**gpu_1x_a10**, A100-class, etc.) or other multi-vCPU NVIDIA hosts, export
+``SWAY_SERVER_PERF=1`` so each ``main.py`` child gets cuDNN autotune, TF32, and bounded CPU
+thread pools (see ``sway.server_runtime_perf``). **A10 (~24 GB):** keep default YOLO infer
+batch **1** unless you have headroom. Verify propagation: ``python -m tools.smoke_server_perf_env``
+(optional ``--pipeline --timeout 60``).
 
   python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml
 
 Runs until you stop it: **Ctrl+C** (SIGINT), **SIGTERM**, or ``touch`` the stop file
 (default: ``output/sweeps/optuna/STOP``) — the **current trial** finishes, then the study exits.
 Optional cap: ``--n-trials 60``. Show best so far: ``--show-best``.
+
+**Live monitoring:** by default writes atomic ``output/sweeps/optuna/sweep_status.json`` after
+each trial (all trials + best); ``sweep_log.jsonl`` appends one line per completed trial.
+Disable JSON with ``--no-status-json``. Refresh from DB only: ``python -m tools.export_optuna_study_status``.
 """
 
 from __future__ import annotations
@@ -333,6 +339,17 @@ def main() -> None:
         default=None,
         help="Append one JSON line per completed trial (default: under output/sweeps/optuna/)",
     )
+    parser.add_argument(
+        "--status-json",
+        type=Path,
+        default=None,
+        help="Atomic JSON after each trial for live UI (default: output/sweeps/optuna/sweep_status.json)",
+    )
+    parser.add_argument(
+        "--no-status-json",
+        action="store_true",
+        help="Do not write sweep_status.json",
+    )
     args = parser.parse_args()
 
     import optuna
@@ -375,8 +392,19 @@ def main() -> None:
             sys.exit(2)
 
     log_jsonl = args.log_jsonl or (opt_dir / "sweep_log.jsonl")
+    status_path: Optional[Path] = None
+    if not args.no_status_json:
+        status_path = (args.status_json or (opt_dir / "sweep_status.json")).resolve()
     available_weights = _available_yolo_weights()
     stop_path = (args.stop_file if args.stop_file is not None else (opt_dir / "STOP")).resolve()
+
+    status_meta: Dict[str, Any] = {
+        "config": str(args.config.resolve()),
+        "sequence_order": list(order),
+        "log_jsonl": str(log_jsonl.resolve()),
+        "storage": storage,
+        "git_sha": _git_sha_short(),
+    }
 
     n_trials_cap = args.n_trials
     if n_trials_cap is not None and n_trials_cap <= 0:
@@ -459,6 +487,15 @@ def main() -> None:
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
     )
 
+    if status_path:
+        try:
+            from sway.optuna_live_status import write_live_sweep_status
+
+            write_live_sweep_status(study, status_path, extra=status_meta)
+            print(f"Live status JSON: {status_path}", flush=True)
+        except Exception as ex:
+            print(f"(status-json initial write failed: {ex})", flush=True)
+
     def _on_signal(_signum: int, _frame: Any) -> None:
         print(
             "\nStop requested — current trial will finish, then the sweep exits.",
@@ -475,6 +512,13 @@ def main() -> None:
         pass
 
     def _after_trial(study_obj: Any, _finished_trial: Any) -> None:
+        if status_path:
+            try:
+                from sway.optuna_live_status import write_live_sweep_status
+
+                write_live_sweep_status(study_obj, status_path, extra=status_meta)
+            except Exception as ex:
+                print(f"(status-json write failed: {ex})", flush=True)
         if stop_path.is_file():
             print(
                 f"\nStop file detected ({stop_path}); stopping after this trial.",

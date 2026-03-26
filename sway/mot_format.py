@@ -7,6 +7,7 @@ MOT row (comma-separated): frame, id, x, y, w, h, conf, -1, -1, -1
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -57,6 +58,58 @@ def xyxy_to_mot_line(
     if is_gt:
         return f"{frame_1based},{track_id},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},1,1,1"
     return f"{frame_1based},{track_id},{x1:.2f},{y1:.2f},{w:.2f},{h:.2f},{conf:.4f},1,1"
+
+
+def build_phase3_tracking_data_json(
+    *,
+    video_path: str,
+    raw_tracks: Dict[int, List[RawTrackEntry]],
+    total_frames: int,
+    native_fps: float,
+    output_fps: float,
+) -> Dict[str, Any]:
+    """
+    Minimal ``data.json`` for runs that stop at ``after_phase_3`` (no pose / full export).
+
+    Matches the shape consumed by :func:`data_json_to_mot_lines` so TrackEval / ``auto_sweep``
+    can score without running Phase 4+.
+    """
+    per_frame: Dict[int, List[Tuple[int, Tuple[float, float, float, float], float]]] = defaultdict(
+        list
+    )
+    for tid, entries in raw_tracks.items():
+        for entry in entries:
+            if not entry or len(entry) < 3:
+                continue
+            f0, box, conf = int(entry[0]), entry[1], entry[2]
+            if len(box) < 4:
+                continue
+            x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            per_frame[f0].append((int(tid), (x1, y1, x2, y2), float(conf)))
+
+    frames: List[Dict[str, Any]] = []
+    for fi in range(int(total_frames)):
+        rows = per_frame.get(fi, [])
+        rows.sort(key=lambda x: x[0])
+        tracks: Dict[str, Any] = {}
+        for tid, box, conf in rows:
+            tracks[str(tid)] = {
+                "box": [box[0], box[1], box[2], box[3]],
+                "confidence": conf,
+            }
+        frames.append({"frame_idx": fi, "tracks": tracks})
+
+    return {
+        "metadata": {
+            "video_path": video_path,
+            "fps": float(output_fps),
+            "native_fps": float(native_fps),
+            "num_frames": int(total_frames),
+            "export_kind": "tracking_only_after_phase_3",
+        },
+        "track_summaries": {},
+        "frames": frames,
+    }
 
 
 def data_json_to_mot_lines(data: Dict[str, Any]) -> List[str]:

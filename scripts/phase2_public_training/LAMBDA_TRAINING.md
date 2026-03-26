@@ -85,6 +85,8 @@ Launch an **Ubuntu** GPU instance (e.g. **`gpu_1x_a10`**, **GH200**, or whatever
 
 **Hardware note:** **A10** instances are **x86_64**; **GH200** is **ARM64**. The repo’s `setup_lambda_training.sh` picks the right PyTorch wheels automatically. **A10 24GB** is usually enough for YOLO26l @ 960; if training **OOM**s, lower `BATCH` or `IMGSZ` in `train_yolo26l.py`. Use a recent **ultralytics** (YOLO26); after `git pull`, run `.venv/bin/pip install -U ultralytics` on the instance if `yolo26l.pt` fails to load.
 
+**Phase 1–3 Optuna sweep (MOT / `after_phase_3`):** **`gpu_1x_a10`** is the right default when A100 is unavailable. From repo root: `bash scripts/lambda_preflight.sh`, then `export SWAY_SERVER_PERF=1` and `python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml` (see **`docs/GT_DRIVEN_SWEEP_AND_TUNING_PLAYBOOK.md`**). On **~24 GB VRAM**, keep **`SWAY_YOLO_INFER_BATCH` unset (default 1)** until a short run proves you can raise it without OOM (hybrid SAM + ViTPose stack).
+
 ### 2. Mac → SSH into the instance
 
 ```bash
