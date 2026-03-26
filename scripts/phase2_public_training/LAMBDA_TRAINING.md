@@ -6,7 +6,7 @@ Clone on the GPU box goes to **`~/sway_pose_tracking`**. DanceTrack is **downloa
 
 **SSH user** is almost always **`ubuntu`** (the dashboard’s **SSH Login** line often shows `ubuntu@<ip>` once the VM is ready).
 
-**Current instance IP (update this when you launch a new VM):** **`150.136.6.38`** (`gpu_1x_a10`, **us-east-1**) — the commands below use this address. If SSH fails, open the Lambda dashboard and replace it with the **IP Address** shown there (new instance ⇒ new IP).
+**Current instance IP (update this when you launch a new VM):** **`150.136.111.175`** (`gpu_1x_a10`, **us-east-1**) — the commands below use this address. If SSH fails, open the Lambda dashboard and replace it with the **IP Address** shown there (new instance ⇒ new IP).
 
 **While status is “Booting”:** IP and SSH fields may show **—**. Wait until the instance is **running**; then refresh or reopen the instance page and copy the IP.
 
@@ -90,7 +90,7 @@ Launch an **Ubuntu** GPU instance (e.g. **`gpu_1x_a10`**, **GH200**, or whatever
 ### 2. Mac → SSH into the instance
 
 ```bash
-ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@150.136.6.38
+ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem ubuntu@150.136.111.175
 ```
 
 ### 3. On the instance — clone repo and train
@@ -131,7 +131,7 @@ Weights when done:
 **Quick status from your Mac** (one-shot, safe in Cursor — replace IP if the dashboard changed):
 
 ```bash
-ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem -o ConnectTimeout=15 ubuntu@150.136.6.38 \
+ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem -o ConnectTimeout=15 ubuntu@150.136.111.175 \
   'date -u; pgrep -c -f train_yolo26l || true; ls -la ~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt 2>/dev/null || echo "best.pt: not yet"; tail -n 3 ~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/results.csv 2>/dev/null || echo "results.csv: not yet"; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader'
 ```
 
@@ -144,7 +144,7 @@ ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem -o ConnectTimeout=15 ubun
 **Last lines of the full log (Cursor-safe)** — always take the **end** of the stream on your Mac (`tail -n`), not `head -c`. **`head -c N` keeps the first N bytes**, so if anything streams from the start of the file you will see the beginning of training (wrong) instead of the latest tqdm lines.
 
 ```bash
-ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem -o ConnectTimeout=15 -o BatchMode=yes -T ubuntu@150.136.6.38 'tail -n 20 "$HOME/sway_pose_tracking/training_full_latest.log" 2>/dev/null || { f=$(find "$HOME/sway_pose_tracking" -maxdepth 1 -name "training_full_*.log" -type f -printf "%T@\t%p\n" 2>/dev/null | sort -n | tail -1 | cut -f2-); [ -n "$f" ] && tail -n 20 "$f"; }' | tail -n 25
+ssh -i /Users/arnavchokshi/Downloads/pose-tracking.pem -o ConnectTimeout=15 -o BatchMode=yes -T ubuntu@150.136.111.175 'tail -n 20 "$HOME/sway_pose_tracking/training_full_latest.log" 2>/dev/null || { f=$(find "$HOME/sway_pose_tracking" -maxdepth 1 -name "training_full_*.log" -type f -printf "%T@\t%p\n" 2>/dev/null | sort -n | tail -1 | cut -f2-); [ -n "$f" ] && tail -n 20 "$f"; }' | tail -n 25
 ```
 
 If `training_full_latest.log` is missing (run started before that symlink existed), the `find … sort -n | tail -1` branch picks the log with the **newest mtime**. Pipe through **`tail -n 25` locally** so Cursor never renders more than 25 lines even if the remote misbehaves.
@@ -169,7 +169,7 @@ New Terminal tab on your Mac.
 
 ```bash
 scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
-  ubuntu@150.136.6.38:~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt \
+  ubuntu@150.136.111.175:~/sway_pose_tracking/runs/detect/yolo26l_dancetrack_only/weights/best.pt \
   ~/Desktop/yolo26l_dancetrack_only_best.pt
 ```
 
@@ -177,7 +177,7 @@ scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
 
 ```bash
 scp -i /Users/arnavchokshi/Downloads/pose-tracking.pem \
-  ubuntu@150.136.6.38:~/sway_pose_tracking/runs/detect/yolo26l_crowdhuman_ft/weights/best.pt \
+  ubuntu@150.136.111.175:~/sway_pose_tracking/runs/detect/yolo26l_crowdhuman_ft/weights/best.pt \
   ~/Desktop/yolo26l_crowdhuman_ft_best.pt
 ```
 
