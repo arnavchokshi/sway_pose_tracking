@@ -64,6 +64,8 @@ assert cuda, 'CUDA not available — wrong wheels or driver'"
 "$PY" -c "from ultralytics import YOLO; import huggingface_hub; print('OK: ultralytics + huggingface_hub')"
 
 echo "==> Done. Training uses: $PY"
+echo "==> For inference / sweeps (main.py, tools.auto_sweep): export SWAY_SERVER_PERF=1"
+echo "    Optional: SWAY_PERF_CPU_THREADS=16 on large instances; try SWAY_YOLO_INFER_BATCH=2–4 on 40GB if stable."
 echo "==> Next (pick one):"
 echo "    bash scripts/phase2_public_training/run_lambda_crowdhuman_skip_dancetrack.sh   # CrowdHuman only (upload DanceTrack .pt first)"
 echo "    bash scripts/phase2_public_training/run_lambda_train_dancetrack.sh"

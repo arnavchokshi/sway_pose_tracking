@@ -8,8 +8,15 @@ Optuna TPE sweep for Phase 1–3 (``--stop-after-boundary after_phase_3``).
 
 Config: copy ``data/ground_truth/sweep_sequences.example.yaml`` → ``sweep_sequences.yaml``.
 
+On Lambda / multi-vCPU NVIDIA hosts, export ``SWAY_SERVER_PERF=1`` so each ``main.py``
+child gets cuDNN autotune, TF32, and bounded CPU thread pools (see ``sway.server_runtime_perf``).
+Verify propagation: ``python -m tools.smoke_server_perf_env`` (optional ``--pipeline --timeout 60``).
+
   python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml
-  python -m tools.auto_sweep --n-trials 60 --show-best
+
+Runs until you stop it: **Ctrl+C** (SIGINT), **SIGTERM**, or ``touch`` the stop file
+(default: ``output/sweeps/optuna/STOP``) — the **current trial** finishes, then the study exits.
+Optional cap: ``--n-trials 60``. Show best so far: ``--show-best``.
 """
 
 from __future__ import annotations
@@ -17,6 +24,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -29,6 +38,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from sway.server_runtime_perf import subprocess_env_overlay
 
 # --- YOLO weights (playbook §9.1) ---
 YOLO_WEIGHT_CHOICES = ("yolo26l", "yolo26l_dancetrack", "yolo26l_dancetrack_crowdhuman")
@@ -244,6 +255,9 @@ def _score_one_video(
     kwargs: Dict[str, Any] = {"cwd": str(REPO_ROOT)}
     if timeout_s is not None:
         kwargs["timeout"] = timeout_s
+    sub_env = os.environ.copy()
+    sub_env.update(subprocess_env_overlay())
+    kwargs["env"] = sub_env
     r = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     data_json = out_dir / "data.json"
     if r.returncode != 0 or not data_json.is_file():
@@ -284,7 +298,21 @@ def main() -> None:
         default=REPO_ROOT / "data" / "ground_truth" / "sweep_sequences.yaml",
         help="YAML with sequence_order + sequences (see sweep_sequences.example.yaml)",
     )
-    parser.add_argument("--n-trials", type=int, default=40)
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after N completed trials (default: unlimited until signal or stop file)",
+    )
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="While the sweep runs, create this file to stop after the current trial "
+        "(default: output/sweeps/optuna/STOP)",
+    )
     parser.add_argument("--study-name", type=str, default="sway_phase13_v1")
     parser.add_argument(
         "--storage",
@@ -348,6 +376,11 @@ def main() -> None:
 
     log_jsonl = args.log_jsonl or (opt_dir / "sweep_log.jsonl")
     available_weights = _available_yolo_weights()
+    stop_path = (args.stop_file if args.stop_file is not None else (opt_dir / "STOP")).resolve()
+
+    n_trials_cap = args.n_trials
+    if n_trials_cap is not None and n_trials_cap <= 0:
+        n_trials_cap = None
 
     timeout = args.timeout_per_video if args.timeout_per_video > 0 else None
 
@@ -425,11 +458,51 @@ def main() -> None:
         sampler=TPESampler(seed=42),
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
     )
-    study.optimize(objective, n_trials=args.n_trials)
+
+    def _on_signal(_signum: int, _frame: Any) -> None:
+        print(
+            "\nStop requested — current trial will finish, then the sweep exits.",
+            flush=True,
+        )
+        study.stop()
+
+    try:
+        signal.signal(signal.SIGINT, _on_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _on_signal)
+    except ValueError:
+        # e.g. not main thread
+        pass
+
+    def _after_trial(study_obj: Any, _finished_trial: Any) -> None:
+        if stop_path.is_file():
+            print(
+                f"\nStop file detected ({stop_path}); stopping after this trial.",
+                flush=True,
+            )
+            study_obj.stop()
+            try:
+                stop_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if n_trials_cap is None:
+        print(
+            "Sweep: unlimited trials. Stop with Ctrl+C / SIGTERM, or: "
+            f"touch {stop_path}",
+            flush=True,
+        )
+    else:
+        print(f"Sweep: will stop after {n_trials_cap} trial(s).", flush=True)
+
+    study.optimize(objective, n_trials=n_trials_cap, callbacks=[_after_trial])
 
     print("=== Done ===")
-    print(f"Best value (harmonic mean): {study.best_value}")
-    print(f"Best params: {study.best_params}")
+    try:
+        print(f"Best value (harmonic mean): {study.best_value}")
+        print(f"Best params: {study.best_params}")
+    except ValueError:
+        print("No completed trials in this study yet.", file=sys.stderr)
     try:
         import optuna.importance
 

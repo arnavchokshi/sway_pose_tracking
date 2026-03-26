@@ -62,6 +62,10 @@ import cv2
 import numpy as np
 import torch
 
+from sway.server_runtime_perf import apply_server_runtime_perf
+
+apply_server_runtime_perf()
+
 from sway.bidirectional_track_merge import (
     bidirectional_iou_threshold,
     bidirectional_min_match_frames,
@@ -308,7 +312,8 @@ def get_device() -> torch.device:
     """Select compute device for ViTPose and shared sway inference.
 
     Override with ``SWAY_TORCH_DEVICE``: ``cpu``, ``mps``, or ``cuda`` / ``cuda:0``.
-    Default: MPS on Apple Silicon when available, else CPU.
+    Default: MPS on Apple Silicon when available, else CUDA when available (servers / Lambda),
+    else CPU.
     """
     import os
 
@@ -325,6 +330,8 @@ def get_device() -> torch.device:
         return torch.device("cpu")
     if torch.backends.mps.is_available():
         return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
     return torch.device("cpu")
 
 

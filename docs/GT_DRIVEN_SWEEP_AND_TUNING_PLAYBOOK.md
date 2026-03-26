@@ -154,6 +154,18 @@ Use **`--phase-debug-jsonl`** for per-phase timings/counters (**MASTER §4.5**).
 
 **GPU / OOM:** After **every** job (before the next), call **`gc.collect()`**; if CUDA is used, **`torch.cuda.synchronize()`** and **`torch.cuda.empty_cache()`**. Subprocess-only `main.py` usually frees child VRAM on exit; the parent still needs this if it imports PyTorch or uses persistent workers.
 
+**Server perf env (Lambda / multi-vCPU NVIDIA):** export **`SWAY_SERVER_PERF=1`** so `main.py` enables cuDNN autotune, TF32, and bounded CPU thread pools (`sway/server_runtime_perf.py`). **`tools/auto_sweep`** and **`tools/run_sweep`** merge the same overlay into each child process **only if** the parent shell already has `SWAY_SERVER_PERF=1`.
+
+Before an overnight sweep, run a quick smoke (subprocess env + optional ≤60s `main.py` on a synthetic clip):
+
+```bash
+export SWAY_SERVER_PERF=1
+python -m tools.smoke_server_perf_env
+python -m tools.smoke_server_perf_env --pipeline --timeout 60
+```
+
+**One-shot on the box:** `bash scripts/lambda_preflight.sh` (installs requirements, checks models + `sweep_sequences.yaml` paths, runs the env smoke). Add **`PIPELINE=1`** for `main.py` smoke; override timeout with **`PIPELINE_TIMEOUT=90`**.
+
 ### 5.2 Batch sources
 
 | Mechanism | Role |
@@ -265,7 +277,8 @@ study.optimize(objective, n_trials=40, timeout=None)
 # After copying data/ground_truth/sweep_sequences.example.yaml → sweep_sequences.yaml
 # and placing videos + MOT files (paths relative to repo root — works on Lambda after rsync):
 python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml
-python -m tools.auto_sweep --n-trials 60 --show-best
+# Runs until stopped: Ctrl+C / SIGTERM, or `touch output/sweeps/optuna/STOP` (current trial finishes first).
+# Optional hard cap: --n-trials 60   Best so far: --show-best
 # Default DB: output/sweeps/optuna/sweep.db
 optuna-dashboard sqlite:///$(pwd)/output/sweeps/optuna/sweep.db   # optional
 ```
@@ -283,6 +296,7 @@ tools/auto_sweep.py        # Optuna TPE + MedianPruner (per-video report)
 tools/convert_data_json_to_mot.py
 output/sweeps/optuna/sweep.db    # default SQLite storage (under gitignored output/)
 output/sweeps/optuna/sweep_log.jsonl
+output/sweeps/optuna/STOP        # optional: create while running to stop after current trial (--stop-file to override path)
 ```
 
 **MOT file:** `python -m tools.convert_data_json_to_mot data.json pred.txt`  
@@ -470,7 +484,8 @@ python -m tools.benchmark_trackeval --ground-truth benchmarks/my_gt.yaml --json 
 python -m tools.benchmark --ground-truth benchmarks/my_gt.yaml --json output/.../data.json --trackeval
 
 python -m tools.auto_sweep --config data/ground_truth/sweep_sequences.yaml
-python -m tools.auto_sweep --timeout-per-video 900 --n-trials 40
+python -m tools.auto_sweep --timeout-per-video 900
+python -m tools.auto_sweep --n-trials 40   # optional fixed cap instead of run-until-stopped
 ```
 
 ---

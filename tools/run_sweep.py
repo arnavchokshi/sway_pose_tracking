@@ -6,6 +6,10 @@ Fully autonomous — no input required. Just run from sway_pose_mvp/:
 
   python -m tools.run_sweep
 
+Export ``SWAY_SERVER_PERF=1`` on NVIDIA servers so spawned ``main.py`` runs use
+``sway.server_runtime_perf`` (cuDNN benchmark, TF32, CPU thread caps). Check propagation:
+``python -m tools.smoke_server_perf_env``.
+
 By default passes ``--stop-after-boundary after_phase_3`` (Phases 1–3 only). For
 legacy sweeps that tune Phase 6+ params (e.g. benchmarks/sweep_config.yaml), use
 ``--no-stop-after-boundary``.
@@ -29,6 +33,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from sway.server_runtime_perf import subprocess_env_overlay
 
 # Run from repo root so benchmarks/ and output/ paths in config work
 os.chdir(REPO_ROOT)
@@ -224,7 +230,9 @@ def main():
             ]
             if not args.no_stop_after_boundary:
                 cmd.extend(["--stop-after-boundary", args.stop_after_boundary])
-            result = subprocess.run(cmd, cwd=REPO_ROOT)
+            sub_env = os.environ.copy()
+            sub_env.update(subprocess_env_overlay())
+            result = subprocess.run(cmd, cwd=REPO_ROOT, env=sub_env)
             if result.returncode != 0:
                 print(f"      Pipeline failed (exit {result.returncode})")
                 log_entry = {
