@@ -56,6 +56,15 @@ echo "==> Installing PyTorch + torchvision (CUDA) into venv"
 echo "==> Installing Ultralytics + helpers"
 "$PIP" install -r "$ROOT/scripts/phase2_public_training/requirements-train-lambda.txt"
 
+# Newer pip ``torch`` wheels may pull CUDA 13 + require a bleeding-edge host driver.
+# Re-pin cu124 stack so Ubuntu 24.04 + 535/570-class drivers work on Lambda bare images.
+if [[ "$ARCH" != "aarch64" ]]; then
+  echo "==> Re-pin torch==2.5.1+cu124 (driver compatibility on cloud GPUs)"
+  "$PIP" install --force-reinstall torch==2.5.1 torchvision==0.20.1 \
+    --index-url "$PYTORCH_INDEX" \
+    --extra-index-url https://pypi.org/simple
+fi
+
 echo "==> Sanity check (venv only — not system Python)"
 "$PY" -c "import torch; v=torch.__version__; cuda=torch.cuda.is_available(); print('torch', v, 'cuda_available=', cuda);
 assert '+cpu' not in v, 'CPU-only torch in venv — wrong index?';
