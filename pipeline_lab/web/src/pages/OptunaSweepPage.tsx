@@ -10,6 +10,7 @@ import {
   Sparkles,
   VideoOff,
 } from 'lucide-react'
+import { PIPELINE_LAB_LOCAL } from '../siteUrls'
 import { API } from '../types'
 
 type OptunaSweepMeta = {
@@ -73,9 +74,15 @@ function mediaUrl(trial: number, sequence: string) {
   return `${API}/api/optuna-sweep/trial/${trial}/sequence/${encodeURIComponent(sequence)}/media`
 }
 
+/**
+ * MP4 URLs for `<video>`. In Vite dev, use the API origin directly: the dev proxy can mishandle
+ * long `Range` streams for large phase previews, which shows as a gray player at 0:00.
+ */
 function fileUrl(trial: number, sequence: string, relPath: string) {
   const q = new URLSearchParams({ path: relPath })
-  return `${API}/api/optuna-sweep/trial/${trial}/sequence/${encodeURIComponent(sequence)}/file?${q}`
+  const base =
+    import.meta.env.DEV && typeof window !== 'undefined' ? PIPELINE_LAB_LOCAL.apiOrigin : API
+  return `${base}/api/optuna-sweep/trial/${trial}/sequence/${encodeURIComponent(sequence)}/file?${q}`
 }
 
 function formatTime(ts: number) {
