@@ -78,18 +78,20 @@ def test_qa_1_2_per_person_norm_hips_at_origin_corner_4k() -> None:
     assert float(np.min(xy)) >= -1.2 - 1e-3
 
 
-def test_qa_1_3_pelvis_anchor_before_camera_rotation() -> None:
-    """1.3: After subtracting pelvis, COCO 11/12 midpoint is origin (pre-H36M step)."""
+def test_qa_1_3_pelvis_anchor_after_centering() -> None:
+    """1.3: After centering on pelvis + Y-negate, mid-hip at origin, Y flipped."""
     post = np.random.RandomState(0).randn(17, 3).astype(np.float32) * 0.5
-    pelvis = (post[11, :] + post[12, :]) * 0.5
-    centered = post - pelvis
-    mid = (centered[11, :] + centered[12, :]) * 0.5
-    assert np.allclose(mid, 0.0, atol=1e-6)
+    pelvis_before = (post[11, :] + post[12, :]) * 0.5
 
-    # Full postprocess must not be assumed to leave pelvis at origin (rotation follows).
     out = pl3._postprocess_pose3d_frame(post)
+
+    # After centering, pelvis midpoint should be at origin
     mid_after = (out[11, :] + out[12, :]) * 0.5
-    assert float(np.linalg.norm(mid_after)) > 0.01
+    assert np.allclose(mid_after, 0.0, atol=1e-5)
+
+    # Y should be negated (camera Y-down → world Y-up)
+    centered = post - pelvis_before
+    assert np.allclose(out[:, 1], -centered[:, 1], atol=1e-5)
 
 
 # --- Phase 2: PBD / bone filter ---

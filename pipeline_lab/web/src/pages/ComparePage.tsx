@@ -757,7 +757,7 @@ export function ComparePage() {
 
   if (runIds.length < 2) {
     return (
-      <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center' }}>
+      <div className="glass-panel sway-compare-empty-panel">
         <p style={{ color: 'var(--text-muted)' }}>Select at least two finished runs to compare.</p>
         <p style={{ marginTop: '1rem' }}>
           <Link to="/" className="btn primary" style={{ textDecoration: 'none' }}>
@@ -774,25 +774,17 @@ export function ComparePage() {
       : displaySlots.length > 0 && displaySlots.every((s) => s.src)
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-      <div className="glass-panel" style={{ padding: '1rem 1.5rem' }}>
+    <div className="sway-compare-page">
+      <div className="glass-panel sway-compare-header-panel">
         <h1 style={{ fontSize: '1.5rem', margin: 0 }}>Compare</h1>
         <p className="sub" style={{ margin: 0, fontSize: '0.9rem' }}>
           {compareLayout === 'tinder'
             ? 'Two clips at a time: pick the better one, add notes, then see a full ranking when you finish.'
             : 'One playhead scrubs and plays every output together.'}
         </p>
-        <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+        <div className="sway-compare-toolbar">
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Layout:</span>
-          <div
-            style={{
-              display: 'inline-flex',
-              borderRadius: 8,
-              border: '1px solid var(--glass-border)',
-              overflow: 'hidden',
-              fontSize: '0.82rem',
-            }}
-          >
+          <div className="sway-compare-toolbar__segment">
             <button
               type="button"
               onClick={() => setCompareLayout('grid')}
@@ -883,7 +875,7 @@ export function ComparePage() {
             Click a run name on a tile (e.g. <code style={{ fontSize: '0.7rem' }}>tree_p2_motion_neural_sam30</code>) to see that run&apos;s Lab configuration.
           </p>
         )}
-        <div style={{ marginTop: '0.6rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+        <div className="sway-compare-run-row">
           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
             {assetCheckPending ? (
               <>Checking which runs have this clip…</>
@@ -938,19 +930,8 @@ export function ComparePage() {
         )}
       </div>
 
-      <div
-        className="glass-panel"
-        style={{
-          padding: '0.75rem 1.5rem',
-          position: 'sticky',
-          top: '4.5rem',
-          zIndex: 40,
-          background: 'rgba(20, 24, 34, 0.92)',
-          backdropFilter: 'blur(10px)',
-          borderBottom: '1px solid var(--glass-border)',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', width: '100%' }}>
+      <div className="glass-panel sway-compare-transport">
+        <div className="sway-compare-transport__row">
           <button type="button" className="btn" onClick={() => syncTime(0)} aria-label="Seek start" style={{ padding: '0.5rem' }}>
             <SkipBack size={18} />
           </button>
@@ -987,13 +968,20 @@ export function ComparePage() {
               scrubbing.current = false
             }}
             onChange={(e) => syncTime(parseFloat(e.target.value))}
+            className="sway-compare-transport__scrub"
             style={{ flex: 1, minWidth: 120, accentColor: 'var(--halo-cyan)' }}
           />
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', minWidth: '80px', textAlign: 'right' }}>
+          <span
+            className="sway-compare-transport__time"
+            style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', minWidth: '80px', textAlign: 'right' }}
+          >
             {formatTime(current)} / {formatTime(duration)}
           </span>
           {compareLayout === 'tinder' && (
-            <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', width: '100%', textAlign: 'right' }}>
+            <span
+              className="sway-compare-transport__tinder-hint"
+              style={{ fontSize: '0.78rem', color: 'var(--text-muted)', width: '100%', textAlign: 'right' }}
+            >
               {orderedRunIdsForTinder.length < 2
                 ? 'Need at least two visible clips with this view.'
                 : tinderRank.state.endedEarly
@@ -1009,24 +997,15 @@ export function ComparePage() {
       </div>
 
       {compareLayout === 'tinder' && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+        <div className="sway-compare-tinder-stack">
           {orderedRunIdsForTinder.length < 2 ? (
-            <div className="glass-panel" style={{ padding: '1.5rem', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+            <div className="glass-panel sway-compare-empty-panel" style={{ color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'left' }}>
               Tinder mode needs at least two runs that have this clip and are checked &ldquo;Show&rdquo; in the grid. Switch to Grid,
               enable at least two tiles, then return here.
             </div>
           ) : (
             <>
-              <div
-                className="glass-panel"
-                style={{
-                  padding: '0.85rem 1.25rem',
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  gap: '0.65rem',
-                  alignItems: 'center',
-                }}
-              >
+              <div className="glass-panel sway-compare-tinder-toolbar">
                 <button
                   type="button"
                   className="btn"
@@ -1202,13 +1181,7 @@ export function ComparePage() {
               )}
 
               {tinderPairSlots.length === 2 && tinderRank.pairForSync && (
-                <div
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
-                    gap: '1rem',
-                  }}
-                >
+                <div className="sway-compare-pair-grid">
                   {tinderPairSlots.map((s, colIdx) => {
                     const side: 'left' | 'right' = colIdx === 0 ? 'left' : 'right'
                     const role = colIdx === 0 ? 'Clip A (left)' : 'Clip B (right)'
@@ -1337,15 +1310,12 @@ export function ComparePage() {
       )}
 
       {compareLayout === 'grid' && (
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))',
-          gap: '1rem',
-        }}
-      >
+      <div className="sway-compare-video-grid">
         {!assetCheckPending && eligibleRunIdsList.length === 0 && slots.length > 0 && (
-          <div className="glass-panel" style={{ padding: '2rem', gridColumn: '1 / -1', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+          <div
+            className="glass-panel sway-compare-empty-panel"
+            style={{ gridColumn: '1 / -1', color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'left' }}
+          >
             No tiles to show for this view — every run in the compare list is missing this output file.
           </div>
         )}
@@ -1455,7 +1425,7 @@ export function ComparePage() {
       )}
 
       {slots.length > 0 && compareLayout === 'grid' && (
-        <div style={{ marginTop: '2rem' }}>
+        <div className="sway-compare-metrics-section">
           <h2 style={{ fontSize: '1.25rem', marginBottom: '0.35rem', color: '#fff' }}>Tracking & pipeline impact</h2>
           <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5, maxWidth: 720 }}>
             Heuristic track cards plus manifest diagnostics so you can see how hybrid SAM, interpolation, and global stitch differed
@@ -1467,7 +1437,7 @@ export function ComparePage() {
             </p>
           )}
           {eligibleRunIdsList.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${displaySlots.length || 1}, minmax(320px, 1fr))`, gap: '1rem' }}>
+          <div className="sway-compare-metrics-grid">
             {displaySlots.map((s) => (
               <div key={s.run_id} className="glass-panel" style={{ padding: '1.25rem' }}>
                 <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#e2e8f0', marginBottom: '0.5rem' }}>{s.label}</div>
@@ -1495,14 +1465,16 @@ export function ComparePage() {
           </div>
           )}
 
-          <h2 style={{ fontSize: '1.25rem', margin: '2.5rem 0 0.35rem', color: '#fff' }}>Configuration differences</h2>
+          <h2 className="sway-compare-diff-heading" style={{ fontSize: '1.25rem', color: '#fff' }}>
+            Configuration differences
+          </h2>
           <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 1rem', lineHeight: 1.5, maxWidth: 720 }}>
             Only keys whose values differ across the visible runs. Enum-style values show a short explanation with the raw value
             underneath. Effective settings use the same merge as the Lab config API (checkpoint-tree ancestors + defaults). Tracker +
             Re-ID + long-range merge are listed first. If several runs share the same recipe name, the run id under the header tells
             columns apart.
           </p>
-          <div className="glass-panel" style={{ padding: '1.25rem', overflowX: 'auto' }}>
+          <div className="glass-panel sway-compare-diff-panel">
             {eligibleRunIdsList.length === 0 ? (
               <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
                 No runs with this clip — switch view or re-run with phase previews to compare configuration here.
@@ -1543,15 +1515,7 @@ export function ComparePage() {
               return (
                 <>
                   {sigGroups.size > 1 && (
-                    <div
-                      style={{
-                        marginBottom: '1.1rem',
-                        padding: '0.85rem 1rem',
-                        borderRadius: 10,
-                        background: 'rgba(15, 23, 42, 0.55)',
-                        border: '1px solid var(--glass-border)',
-                      }}
-                    >
+                    <div className="sway-compare-sig-callout">
                       <div
                         style={{
                           fontSize: '0.78rem',
@@ -1601,24 +1565,12 @@ export function ComparePage() {
                       </ul>
                     </div>
                   )}
-                  <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+                  <table className="sway-compare-diff-table">
                     <thead>
                       <tr>
-                        <th
-                          style={{
-                            padding: '0.75rem',
-                            borderBottom: '1px solid var(--glass-border)',
-                            color: 'var(--halo-cyan)',
-                            width: '28%',
-                          }}
-                        >
-                          Parameter
-                        </th>
+                        <th className="sway-compare-diff-table__param-head">Parameter</th>
                         {displaySlots.map((s) => (
-                          <th
-                            key={s.run_id}
-                            style={{ padding: '0.75rem', borderBottom: '1px solid var(--glass-border)', color: '#f8fafc' }}
-                          >
+                          <th key={s.run_id} className="sway-compare-diff-table__run-head">
                             <div>{s.label}</div>
                             {(recipeLabelCounts.get(s.label) ?? 0) > 1 && (
                               <div
@@ -1643,7 +1595,7 @@ export function ComparePage() {
                     <tbody>
                       {diffKeys.map((k) => (
                         <tr key={k} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                          <td style={{ padding: '0.75rem', color: 'var(--text-muted)', verticalAlign: 'top' }}>
+                          <td className="sway-compare-diff-table__param-cell">
                             <div style={{ color: '#e2e8f0', fontWeight: 600 }}>{fieldLabel(k) ?? k}</div>
                             {fieldLabel(k) && (
                               <div style={{ fontSize: '0.72rem', fontFamily: 'ui-monospace, monospace', marginTop: '0.2rem', opacity: 0.85 }}>
@@ -1654,7 +1606,7 @@ export function ComparePage() {
                           {displaySlots.map((s) => {
                             const val = (s.fields || {})[k]
                             return (
-                              <td key={s.run_id} style={{ padding: '0.75rem', color: '#fff', verticalAlign: 'top', lineHeight: 1.45 }}>
+                              <td key={s.run_id} className="sway-compare-diff-table__val-cell">
                                 {renderCompareConfigCell(k, val)}
                               </td>
                             )
@@ -1692,30 +1644,9 @@ function CompareRunConfigModal({
   }, [onClose])
 
   return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 200,
-        background: 'rgba(0,0,0,0.72)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: '1.25rem',
-      }}
-      onClick={onClose}
-      role="presentation"
-    >
+    <div className="sway-compare-config-modal-backdrop" onClick={onClose} role="presentation">
       <div
-        className="glass-panel"
-        style={{
-          maxWidth: 800,
-          width: '100%',
-          maxHeight: 'min(90vh, 900px)',
-          overflow: 'auto',
-          padding: '1.25rem',
-          position: 'relative',
-        }}
+        className="glass-panel sway-compare-config-modal-panel"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"

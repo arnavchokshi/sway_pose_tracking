@@ -15,15 +15,37 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _coalesce_trial_duration_s(t: Any) -> Optional[float]:
+    """Prefer Optuna start→complete; else sweep attrs (trial_duration_s or sum of duration_s_*)."""
+    duration_s: Optional[float] = None
+    if getattr(t, "datetime_start", None) and getattr(t, "datetime_complete", None):
+        duration_s = round((t.datetime_complete - t.datetime_start).total_seconds(), 1)
+    ua = dict(t.user_attrs) if getattr(t, "user_attrs", None) else {}
+    if duration_s is None or duration_s <= 0:
+        td = ua.get("trial_duration_s")
+        if isinstance(td, (int, float)) and float(td) > 0:
+            duration_s = round(float(td), 1)
+    if duration_s is None or duration_s <= 0:
+        s = 0.0
+        for k, v in ua.items():
+            if isinstance(k, str) and k.startswith("duration_s_") and isinstance(v, (int, float)) and float(v) > 0:
+                s += float(v)
+        if s > 0:
+            duration_s = round(s, 1)
+    return duration_s if duration_s and duration_s > 0 else None
+
+
 def build_study_status_payload(study: Any, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Flat dict safe for JSON (trial states, params, user_attrs, best)."""
     trials_out: List[Dict[str, Any]] = []
     for t in study.get_trials(deepcopy=False):
+        duration_s = _coalesce_trial_duration_s(t)
         trials_out.append(
             {
                 "number": int(t.number),
                 "state": t.state.name if hasattr(t.state, "name") else str(t.state),
                 "value": t.value,
+                "duration_s": duration_s,
                 "params": dict(t.params) if t.params else {},
                 "user_attrs": dict(t.user_attrs) if t.user_attrs else {},
             }

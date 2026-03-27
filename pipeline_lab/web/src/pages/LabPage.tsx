@@ -1179,7 +1179,7 @@ export function LabPage() {
 
   if (schemaError) {
     return (
-      <div className="glass-panel" style={{ padding: '2rem', maxWidth: 560, margin: '0 auto' }}>
+      <div className="glass-panel sway-lab-panel sway-lab-panel--center">
         <p style={{ color: '#f87171' }}>{schemaError}</p>
         <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>
           Start the API from <code style={{ color: 'var(--halo-cyan)' }}>sway_pose_mvp</code>:
@@ -1200,7 +1200,7 @@ export function LabPage() {
 
   if (!schema) {
     return (
-      <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>
+      <div className="glass-panel sway-lab-panel sway-lab-panel--center-lg" style={{ color: 'var(--text-main)' }}>
         Loading…
       </div>
     )
@@ -1208,14 +1208,14 @@ export function LabPage() {
 
   if (!labHydrated) {
     return (
-      <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center', color: 'var(--text-muted)' }}>
+      <div className="glass-panel sway-lab-panel sway-lab-panel--center-lg" style={{ color: 'var(--text-muted)' }}>
         Restoring your lab session…
       </div>
     )
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
+    <div className="sway-lab-page">
       {fileDropOverlay && (
         <div
           role="presentation"
@@ -1238,9 +1238,9 @@ export function LabPage() {
             style={{
               pointerEvents: 'none',
               maxWidth: 520,
-              width: 'min(520px, calc(100vw - 3rem))',
-              margin: '0 1.5rem',
-              padding: '3rem 2rem',
+              width: 'min(520px, calc(100vw - 1.5rem))',
+              margin: '0 0.75rem',
+              padding: 'clamp(1.5rem, 5vw, 3rem) clamp(1rem, 4vw, 2rem)',
             }}
           >
             <Upload size={48} strokeWidth={1.25} style={{ color: 'var(--halo-cyan)', marginBottom: '0.35rem' }} aria-hidden />
@@ -1250,7 +1250,7 @@ export function LabPage() {
         </div>
       )}
       {sessionRunIds.length === 0 && serverBatchesHint.length > 0 && (
-        <div className="glass-panel" style={{ padding: '1.25rem 1.5rem' }}>
+        <div className="glass-panel sway-lab-panel sway-lab-panel--compact">
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.6rem', marginBottom: '0.65rem' }}>
             <LayoutGrid size={20} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
             <h2 style={{ margin: 0, fontSize: '1.05rem', color: '#fff' }}>Batches on this API</h2>
@@ -1288,7 +1288,7 @@ export function LabPage() {
       )}
 
       {sessionRunIds.length === 0 && (
-        <div className="glass-panel" style={{ padding: '1.5rem' }}>
+        <div className="glass-panel sway-lab-panel">
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
             <GitBranch size={22} strokeWidth={1.5} style={{ color: 'var(--halo-cyan)' }} aria-hidden />
             <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>Checkpoint tree — two videos</h2>
@@ -1402,8 +1402,8 @@ export function LabPage() {
 
       {/* Step 2: drafts */}
       {videoFile && sessionRunIds.length === 0 && (
-        <div className="glass-panel" style={{ padding: '1.5rem' }}>
-          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
+        <div className="glass-panel sway-lab-panel">
+          <div className="sway-lab-page__header-row sway-lab-page__header-row--center">
             <div>
               <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>2. Runs on this video</h2>
               <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)', maxWidth: 560, lineHeight: 1.45 }}>
@@ -1420,7 +1420,7 @@ export function LabPage() {
                 )}
               </p>
             </div>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+            <div className="sway-lab-page__header-actions">
               <div
                 role="group"
                 aria-label="Plan layout"
@@ -1527,9 +1527,9 @@ export function LabPage() {
       )}
       {/* Step 3: active / completed batch */}
       {sessionRunIds.length > 0 && (
-        <div className="glass-panel" style={{ padding: '1.5rem' }}>
-          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', justifyContent: 'space-between', gap: '1rem' }}>
-            <div style={{ flex: '1 1 220px' }}>
+        <div className="glass-panel sway-lab-panel">
+          <div className="sway-lab-page__header-row">
+            <div style={{ flex: '1 1 220px', minWidth: 0 }}>
               <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#fff' }}>3. Batch progress</h2>
               <p style={{ margin: '0.5rem 0 0', fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.5, maxWidth: 560 }}>
                 Each card is one full pipeline on your shared video. Jobs start in order: by default only one is{' '}
@@ -1574,7 +1574,7 @@ export function LabPage() {
                 <span style={{ padding: '0.25rem 0', color: 'var(--text-muted)' }}>· {batchStats.total} runs in this batch</span>
               </div>
             </div>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            <div className="sway-lab-page__header-actions sway-lab-page__header-actions--batch">
               {hasCheckpointTree && (
                 <div
                   role="group"
@@ -1758,14 +1758,7 @@ export function LabPage() {
               }}
             />
           ) : (
-            <div
-              style={{
-                marginTop: '1.25rem',
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))',
-                gap: '1rem',
-              }}
-            >
+            <div className="sway-lab-run-grid">
               {sessionRunsOrdered.map(({ run, batchIndex, totalInBatch }) => {
               const pres = statusPresentationForRun(run)
               const { title: statusTitle, subtitle: statusSubtitle, color, Icon } = pres
@@ -1783,16 +1776,15 @@ export function LabPage() {
               return (
                 <div
                   key={run.run_id}
-                  className="glass-panel"
+                  className="glass-panel sway-lab-panel sway-lab-panel--card"
                   style={{
-                    padding: '1.25rem',
                     border: `1px solid ${color}40`,
                     display: 'flex',
                     flexDirection: 'column',
                     gap: '0.65rem',
                   }}
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '0.75rem' }}>
+                  <div className="sway-lab-run-card__top">
                     <span
                       style={{
                         fontSize: '0.72rem',
@@ -1800,13 +1792,12 @@ export function LabPage() {
                         letterSpacing: '0.04em',
                         textTransform: 'uppercase',
                         color: 'var(--text-muted)',
+                        flexShrink: 0,
                       }}
                     >
                       Run {batchIndex} of {totalInBatch}
                     </span>
-                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontFamily: 'ui-monospace, monospace' }}>
-                      {formatShortId(run.run_id)}
-                    </span>
+                    <span className="sway-lab-run-card__id">{formatShortId(run.run_id)}</span>
                   </div>
 
                   <div>

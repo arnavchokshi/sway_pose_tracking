@@ -487,6 +487,7 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+let fittedOnce = false;
 function animate(timestamp) {
   requestAnimationFrame(animate);
 
@@ -503,6 +504,12 @@ function animate(timestamp) {
   const fi = frameIndex();
   updateAllScene(fi);
   updateIndividualScene(fi);
+
+  // Auto-fit camera on first render so skeletons are visible
+  if (!fittedOnce) {
+    fitCameraToScene();
+    fittedOnce = true;
+  }
 
   controlsAll.update();
   controlsInd.update();

@@ -88,7 +88,7 @@ export function ConfigPage() {
 
   if (schemaError) {
     return (
-      <div className="glass-panel" style={{ padding: '2rem 2.5rem', maxWidth: 640, margin: '0 auto' }}>
+      <div className="glass-panel sway-config-error-panel">
         <p style={{ color: '#f87171', margin: '0 0 1rem', lineHeight: 1.5 }}>{schemaError}</p>
         <p style={{ color: 'var(--text-muted)', margin: '0 0 1rem', fontSize: '0.95rem', lineHeight: 1.5 }}>
           From the <code style={{ color: 'var(--halo-cyan)' }}>sway_pose_mvp</code> directory (after installing{' '}
@@ -118,7 +118,7 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
   }
 
   if (!schema) {
-    return <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>Loading schema...</div>
+    return <div className="glass-panel sway-config-loading-panel">Loading schema...</div>
   }
 
   const stages = schema.stages
@@ -160,7 +160,7 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
   )
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem', height: '100%' }}>
+    <div className="sway-config-page">
       <div className="glass-panel config-page-settings-panel">
         <header className="config-page-settings-header">
           <div className="config-page-settings-header__row">
@@ -197,8 +197,7 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
       </div>
 
       <div
-        className="glass-panel config-page-steps-panel"
-        style={{ padding: '0.85rem 1rem' }}
+        className="glass-panel config-page-steps-panel config-page-steps-panel--padded"
         aria-label="Pipeline steps; workload estimate shown as background motion"
       >
         <div className="config-page-workload-bg" aria-hidden>
@@ -251,11 +250,11 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
         </div>
       </div>
 
-      <div className="glass-panel" style={{ padding: '1rem 1.25rem 1.25rem', flex: 1 }}>
+      <div className="glass-panel config-page-editor-panel">
         <h2 className="config-page-panel-title">
           {intro?.headline ?? activeStage?.label}
           {activeStage ? (
-            <span style={{ fontWeight: 500, color: '#64748b', fontSize: '0.85rem', marginLeft: '0.5rem' }}>
+            <span className="config-page-panel-title-meta">
               ({activeStage.short}
               {activeStage.main_phases ? (
                 <>
@@ -272,35 +271,13 @@ uvicorn pipeline_lab.server.app:app --reload --host localhost --port 8765`}
 
         <div key={activeStage?.id}>
           {showOverlapHiddenBanner && (
-            <div
-              style={{
-                marginBottom: '1.25rem',
-                padding: '1rem 1.15rem',
-                borderRadius: 12,
-                border: '1px solid rgba(148, 163, 184, 0.35)',
-                background: 'rgba(30, 41, 59, 0.45)',
-                color: 'var(--text-muted)',
-                fontSize: '0.88rem',
-                lineHeight: 1.55,
-              }}
-            >
+            <div className="config-page-inline-banner config-page-inline-banner--neutral">
               Overlap refinement only applies on the default tracker path. These controls are hidden when ByteTrack
               is selected (server disables SAM for that engine).
             </div>
           )}
           {activeStage?.id === 'handshake' && activePhase13 === 'sway_handshake' && !hideOverlapBecauseTracker && (
-            <div
-              style={{
-                marginBottom: '1.25rem',
-                padding: '1rem 1.15rem',
-                borderRadius: 12,
-                border: '1px solid rgba(45, 212, 191, 0.35)',
-                background: 'rgba(6, 95, 70, 0.2)',
-                color: 'var(--text-muted)',
-                fontSize: '0.88rem',
-                lineHeight: 1.55,
-              }}
-            >
+            <div className="config-page-inline-banner config-page-inline-banner--handshake">
               <strong style={{ color: '#e2e8f0' }}>Sway handshake</strong> forces hybrid SAM IoU to{' '}
               <strong style={{ color: '#e2e8f0' }}>0.10</strong> and weak cues off at enqueue — overlap sliders are hidden.
             </div>

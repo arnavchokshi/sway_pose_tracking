@@ -257,9 +257,13 @@ def _compute_unified_world_keypoints(
     img_h: int,
     z_root: Optional[float] = None,
 ) -> Tuple[List[List[float]], List[float]]:
-    """Pelvis anchor from mid-hip un-projection + scaled lift relative to hip in lift space.
+    """2D-anchored world projection: X,Y from tracked pixel positions, Z from lift model.
 
     World convention: X right, Y up, Z positive into the scene (away from camera / depth).
+
+    Uses the accurate 2D pixel positions (from tracking/pose estimation) for X and Y
+    world coordinates via pinhole un-projection. Only the Z depth comes from the lift
+    model's relative offsets. This creates a 1:1 mapping from video to 3D.
 
     If ``z_root`` is set (e.g. after per-track temporal smoothing), it overrides depth/default.
     """
@@ -274,24 +278,40 @@ def _compute_unified_world_keypoints(
         Z_root = _resolve_z_root_from_depth(depth_map, uh, vh, z_near, z_far)
 
     scale_mul = float(os.environ.get("SWAY_LIFT_WORLD_SCALE", "1.0"))
-    Xr = (uh - cx) * Z_root / max(fx, 1e-6)
-    Yr = -(vh - cy) * Z_root / max(fy, 1e-6)
-    Zr = Z_root
-    T_pelvis = np.array([Xr, Yr, Zr], dtype=np.float64)
 
+    # --- Compute Z-depth scale factor ---
+    # The lift model outputs relative 3D in its own units. We need to scale
+    # the Z-component so that the depth offsets are in real-world units.
+    # Scale: world_height(pixels) / lift_height(model_units)
     hip_lift = (lift_a[11] + lift_a[12]) * 0.5
     lift_rel = lift_a - hip_lift
-    ankle_y = max(float(k2[15, 1]), float(k2[16, 1]))
-    nose_y = float(k2[0, 1])
-    raw_h = max(abs(ankle_y - nose_y), 1.0)
-    approx_h_cam = raw_h * Z_root / max(fy, 1e-6)
-    span_lift = float(np.max(np.linalg.norm(lift_rel, axis=1)))
-    span_lift = max(span_lift, 1e-6)
-    s = (approx_h_cam / span_lift) * scale_mul
+    ankle_y_px = max(float(k2[15, 1]), float(k2[16, 1]))
+    nose_y_px = float(k2[0, 1])
+    raw_h_px = max(abs(ankle_y_px - nose_y_px), 1.0)
+    approx_h_world = raw_h_px * Z_root / max(fy, 1e-6)
+    # Vertical span from lift model (Y-axis = height after postprocess)
+    y_vals = lift_rel[:, 1]
+    span_lift_y = float(np.max(y_vals) - np.min(y_vals))
+    span_lift_y = max(span_lift_y, 1e-6)
+    z_scale = (approx_h_world / span_lift_y) * scale_mul
 
-    world = T_pelvis + s * lift_rel
-    root_xyz = [float(T_pelvis[0]), float(T_pelvis[1]), float(T_pelvis[2])]
-    return [[float(world[i, j]) for j in range(3)] for i in range(17)], root_xyz
+    # --- Per-joint world coordinates ---
+    # X, Y: un-project each joint's 2D pixel position using per-joint depth
+    # Z: root depth + scaled lift Z-offset
+    world = np.zeros((17, 3), dtype=np.float64)
+    for j in range(17):
+        u_j = float(k2[j, 0])
+        v_j = float(k2[j, 1])
+        dz_j = z_scale * float(lift_rel[j, 2])  # depth offset from lift model
+        Z_j = Z_root + dz_j
+        world[j, 0] = (u_j - cx) * Z_j / max(fx, 1e-6)   # X: right
+        world[j, 1] = -(v_j - cy) * Z_j / max(fy, 1e-6)   # Y: up (negate for Y-up)
+        world[j, 2] = Z_j                                   # Z: depth
+
+    Xr = (uh - cx) * Z_root / max(fx, 1e-6)
+    Yr = -(vh - cy) * Z_root / max(fy, 1e-6)
+    root_xyz = [float(Xr), float(Yr), float(Z_root)]
+    return [[float(world[i, c]) for c in range(3)] for i in range(17)], root_xyz
 
 
 # H36M demo: fixed camera quaternion
@@ -623,15 +643,22 @@ def _pad_clip_to_n(
 
 
 def _postprocess_pose3d_frame(post_out: np.ndarray) -> np.ndarray:
-    """post_out: (17, 3) COCO-ordered joints; root at COCO pelvis (mid-hip), not nose."""
+    """post_out: (17, 3) COCO-ordered joints from the lift model.
+
+    Center on pelvis, negate Y (camera Y-down → world Y-up), no rotation.
+    Preserves the model's camera-space coordinates so that downstream
+    2D-anchored world projection produces a 1:1 mapping to the video.
+
+    The H36M demo rotation is intentionally removed — it was specific to
+    H36M's camera rig and caused incorrect lean on real-world videos.
+    """
     post_out = np.asarray(post_out, dtype=np.float32).copy()
     pelvis = (post_out[11, :] + post_out[12, :]) * 0.5
     post_out -= pelvis
-    post_out = _camera_to_world_np(post_out, _H36M_DEMO_QUAT, 0.0)
-    post_out[:, 2] -= float(np.min(post_out[:, 2]))
-    mx = float(np.max(np.abs(post_out)))
-    if mx > 1e-8:
-        post_out /= mx
+    # Camera coordinate system: X right, Y down, Z forward.
+    # World/viewer: X right, Y up, Z forward.
+    # Negate Y to convert Y-down → Y-up.
+    post_out[:, 1] *= -1.0
     return post_out
 
 

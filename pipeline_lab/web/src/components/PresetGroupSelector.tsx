@@ -11,7 +11,10 @@ export function PresetGroupSelector({
   compact?: boolean
 }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: compact ? '0.75rem' : '1.1rem' }}>
+    <div
+      className="preset-group-selector"
+      style={{ display: 'flex', flexDirection: 'column', gap: compact ? '0.75rem' : '1.1rem' }}
+    >
       {PHASE_GROUPS.map((group) => {
         const presets = PRESETS_BY_GROUP[group.id]
         const selectedId = selectedPresets[group.id]
@@ -104,11 +107,10 @@ function PresetGroupRow({
             <button
               key={preset.id}
               type="button"
-              className="btn"
+              className="btn preset-group-preset-btn"
               title={preset.description}
               onClick={() => onSelect(preset.id)}
               style={{
-                whiteSpace: 'nowrap',
                 fontSize: compact ? '0.72rem' : '0.78rem',
                 padding: compact ? '0.3rem 0.55rem' : '0.4rem 0.7rem',
                 borderRadius: 8,
