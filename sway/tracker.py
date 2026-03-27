@@ -390,12 +390,6 @@ def _create_boxmot_tracker(
             use_byte=oc_use_byte,
         )
     if kind == "strongsort":
-        if not reid_w.is_file():
-            raise FileNotFoundError(
-                f"StrongSORT requires Re-ID weights on disk; missing: {reid_w}\n"
-                "Run: python -m tools.prefetch_models\n"
-                "Or set SWAY_BOXMOT_REID_WEIGHTS to an existing OSNet .pt file."
-            )
         ss_cos = float(os.environ.get("SWAY_STRONGSORT_MAX_COS_DIST", "").strip() or "0.2")
         ss_iou = float(os.environ.get("SWAY_STRONGSORT_MAX_IOU_DIST", "").strip() or "0.7")
         ss_ninit = int(os.environ.get("SWAY_STRONGSORT_N_INIT", "").strip() or "3")
