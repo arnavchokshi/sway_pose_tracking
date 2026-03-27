@@ -374,17 +374,20 @@ def _create_boxmot_tracker(
             embedding_off=bool(doc_kw["embedding_off"]),
         )
     if kind == "bytetrack":
+        bt_match = float(os.environ.get("SWAY_BYTETRACK_MATCH_THRESH", "").strip() or "0.8")
+        bt_buffer = int(os.environ.get("SWAY_BYTETRACK_TRACK_BUFFER", "").strip() or "25")
         return ByteTrack(
             min_conf=max(0.01, float(yconf) * 0.25),
             track_thresh=float(yconf),
-            match_thresh=0.8,
-            track_buffer=25,
+            match_thresh=bt_match,
+            track_buffer=bt_buffer,
             frame_rate=tr_fps,
         )
     if kind == "ocsort":
+        oc_use_byte = os.environ.get("SWAY_OCSORT_USE_BYTE", "1").strip().lower() not in ("0", "false", "no")
         return OcSort(
             min_conf=max(0.01, float(yconf) * 0.25),
-            use_byte=True,
+            use_byte=oc_use_byte,
         )
     if kind == "strongsort":
         if not reid_w.is_file():
@@ -393,16 +396,20 @@ def _create_boxmot_tracker(
                 "Run: python -m tools.prefetch_models\n"
                 "Or set SWAY_BOXMOT_REID_WEIGHTS to an existing OSNet .pt file."
             )
+        ss_cos = float(os.environ.get("SWAY_STRONGSORT_MAX_COS_DIST", "").strip() or "0.2")
+        ss_iou = float(os.environ.get("SWAY_STRONGSORT_MAX_IOU_DIST", "").strip() or "0.7")
+        ss_ninit = int(os.environ.get("SWAY_STRONGSORT_N_INIT", "").strip() or "3")
+        ss_budget = int(os.environ.get("SWAY_STRONGSORT_NN_BUDGET", "").strip() or "100")
         return StrongSort(
             reid_weights=reid_w,
             device=dev,
             half=half_cuda,
             min_conf=max(0.01, float(yconf) * 0.25),
-            max_cos_dist=0.2,
-            max_iou_dist=0.7,
+            max_cos_dist=ss_cos,
+            max_iou_dist=ss_iou,
             max_age=int(doc_kw["max_age"]),
-            n_init=3,
-            nn_budget=100,
+            n_init=ss_ninit,
+            nn_budget=ss_budget,
         )
     return _create_boxmot_tracker(
         "deepocsort", yconf, dev, reid_w, doc_kw, tracker_frame_rate=tracker_frame_rate
@@ -439,6 +446,17 @@ def _resolve_boxmot_reid_weights() -> Path:
         p = Path(env).expanduser()
         if p.is_file():
             return p
+        # Try as a model name relative to models/ dir
+        repo = Path(__file__).resolve().parent.parent
+        cand_name = repo / "models" / env
+        if cand_name.is_file():
+            return cand_name
+        # Try BoxMOT weights cache dir — auto-download will happen at tracker init
+        try:
+            from boxmot.utils import WEIGHTS
+            return WEIGHTS / env
+        except Exception:
+            pass
     repo = Path(__file__).resolve().parent.parent
     cand = repo / "models" / "osnet_x0_25_msmt17.pt"
     if cand.is_file():

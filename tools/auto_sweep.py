@@ -33,6 +33,7 @@ import json
 import os
 import signal
 import statistics
+import time
 import subprocess
 import sys
 import tempfile
@@ -145,15 +146,24 @@ def composite_score(metrics: Dict[str, Any]) -> float:
 
 
 def suggest_env_for_trial(trial: Any, available_weights: List[str]) -> Dict[str, str]:
-    """Build SWAY_* env map per docs/GT_DRIVEN_SWEEP_AND_TUNING_PLAYBOOK §9."""
+    """Build SWAY_* env map — expanded search space for breakthrough scores.
+
+    Sweeps across 5 major dimensions:
+      1. Detection: YOLO weights, confidence, NMS, detection size
+      2. Tracker: type (deepocsort/bytetrack/ocsort), Re-ID, association metric, max age
+      3. Post-track stitching: stitch gap, radius, dormant gap, coalescence, box interp
+      4. Hybrid SAM: IoU trigger, mask thresh, bbox pad, ROI pad, weak cues
+      5. Phase 1–3 mode: standard / dancer_registry / sway_handshake + sub-params
+    """
     env: Dict[str, str] = {}
 
+    # ── 1. Detection ─────────────────────────────────────────────────────
     w = trial.suggest_categorical("SWAY_YOLO_WEIGHTS", available_weights)
     env["SWAY_YOLO_WEIGHTS"] = w
 
     env["SWAY_YOLO_CONF"] = str(
         trial.suggest_categorical(
-            "SWAY_YOLO_CONF", ["0.15", "0.18", "0.22", "0.26", "0.30"]
+            "SWAY_YOLO_CONF", ["0.12", "0.15", "0.18", "0.22", "0.26", "0.30"]
         )
     )
     env["SWAY_PRETRACK_NMS_IOU"] = str(
@@ -161,43 +171,193 @@ def suggest_env_for_trial(trial: Any, available_weights: List[str]) -> Dict[str,
             "SWAY_PRETRACK_NMS_IOU", ["0.40", "0.45", "0.50", "0.55", "0.60"]
         )
     )
-    env["SWAY_BOXMOT_MAX_AGE"] = str(
-        trial.suggest_categorical("SWAY_BOXMOT_MAX_AGE", ["90", "120", "150", "180"])
-    )
-    env["SWAY_BOXMOT_MATCH_THRESH"] = str(
+    # Detection resolution: higher catches more distant/small dancers
+    env["SWAY_DETECT_SIZE"] = str(
         trial.suggest_categorical(
-            "SWAY_BOXMOT_MATCH_THRESH", ["0.20", "0.25", "0.30", "0.35"]
-        )
-    )
-    env["SWAY_STITCH_MAX_FRAME_GAP"] = str(
-        trial.suggest_categorical(
-            "SWAY_STITCH_MAX_FRAME_GAP", ["45", "60", "75", "90", "120"]
+            "SWAY_DETECT_SIZE", ["640", "800", "960"]
         )
     )
 
+    env["SWAY_YOLO_DETECTION_STRIDE"] = "1"
+
+    # ── 2. Tracker ───────────────────────────────────────────────────────
+    env["SWAY_USE_BOXMOT"] = "1"
+
+    tracker_type = trial.suggest_categorical(
+        "SWAY_BOXMOT_TRACKER", ["deepocsort", "bytetrack", "ocsort", "strongsort"]
+    )
+    env["SWAY_BOXMOT_TRACKER"] = tracker_type
+
+    env["SWAY_BOXMOT_MAX_AGE"] = str(
+        trial.suggest_categorical("SWAY_BOXMOT_MAX_AGE", ["60", "90", "120", "150", "180"])
+    )
+    env["SWAY_BOXMOT_MATCH_THRESH"] = str(
+        trial.suggest_categorical(
+            "SWAY_BOXMOT_MATCH_THRESH", ["0.20", "0.25", "0.30", "0.35", "0.40"]
+        )
+    )
+
+    # Re-ID embeddings: can massively help ID switches during occlusion
+    # StrongSORT requires Re-ID, DeepOcSort can use it, ByteTrack/OcSort don't use it
+    if tracker_type == "strongsort":
+        reid_on = "1"  # StrongSORT always uses Re-ID
+    else:
+        reid_on = trial.suggest_categorical(
+            "SWAY_BOXMOT_REID_ON", ["0", "1"]
+        )
+    env["SWAY_BOXMOT_REID_ON"] = reid_on
+
+    # OSNet Re-ID model variant (only when Re-ID is enabled)
+    if reid_on == "1":
+        reid_model = trial.suggest_categorical(
+            "SWAY_BOXMOT_REID_WEIGHTS",
+            [
+                "osnet_x0_25_msmt17.pt",    # Tiny (fastest, default)
+                "osnet_x1_0_msmt17.pt",      # Full-size (most accurate)
+                "osnet_x0_25_market1501.pt", # Market1501-trained (diff domain)
+            ],
+        )
+        env["SWAY_BOXMOT_REID_WEIGHTS"] = reid_model
+
+    # ── Tracker-specific sub-configurations ──
+    if tracker_type == "deepocsort":
+        # Association metric: center-distance awareness for dense groups
+        env["SWAY_BOXMOT_ASSOC_METRIC"] = trial.suggest_categorical(
+            "branch_doc_SWAY_BOXMOT_ASSOC_METRIC", ["iou", "giou", "ciou"]
+        )
+    elif tracker_type == "bytetrack":
+        # ByteTrack's second-stage matching threshold
+        env["SWAY_BYTETRACK_MATCH_THRESH"] = str(
+            trial.suggest_categorical(
+                "branch_bt_SWAY_BYTETRACK_MATCH_THRESH",
+                ["0.70", "0.75", "0.80", "0.85", "0.90"],
+            )
+        )
+        # Track buffer: how many frames to keep lost tracks before deletion
+        env["SWAY_BYTETRACK_TRACK_BUFFER"] = str(
+            trial.suggest_categorical(
+                "branch_bt_SWAY_BYTETRACK_TRACK_BUFFER",
+                ["15", "20", "25", "30", "40"],
+            )
+        )
+    elif tracker_type == "ocsort":
+        # OcSort with/without ByteTrack-style low-conf second-stage matching
+        env["SWAY_OCSORT_USE_BYTE"] = trial.suggest_categorical(
+            "branch_oc_SWAY_OCSORT_USE_BYTE", ["0", "1"]
+        )
+    elif tracker_type == "strongsort":
+        # Max cosine distance for Re-ID matching
+        env["SWAY_STRONGSORT_MAX_COS_DIST"] = str(
+            trial.suggest_categorical(
+                "branch_ss_SWAY_STRONGSORT_MAX_COS_DIST",
+                ["0.15", "0.20", "0.25", "0.30", "0.40"],
+            )
+        )
+        # Max IoU distance for position-based matching
+        env["SWAY_STRONGSORT_MAX_IOU_DIST"] = str(
+            trial.suggest_categorical(
+                "branch_ss_SWAY_STRONGSORT_MAX_IOU_DIST",
+                ["0.50", "0.60", "0.70", "0.80"],
+            )
+        )
+        # Minimum consecutive detections before track is confirmed
+        env["SWAY_STRONGSORT_N_INIT"] = str(
+            trial.suggest_categorical(
+                "branch_ss_SWAY_STRONGSORT_N_INIT", ["1", "2", "3", "5"]
+            )
+        )
+        # Neural network gallery budget (Re-ID feature memory)
+        env["SWAY_STRONGSORT_NN_BUDGET"] = str(
+            trial.suggest_categorical(
+                "branch_ss_SWAY_STRONGSORT_NN_BUDGET", ["50", "75", "100", "150"]
+            )
+        )
+
+    # ── 3. Post-track stitching & merging ────────────────────────────────
+    env["SWAY_STITCH_MAX_FRAME_GAP"] = str(
+        trial.suggest_categorical(
+            "SWAY_STITCH_MAX_FRAME_GAP", ["30", "45", "60", "75", "90", "120"]
+        )
+    )
+    # Stitch radius: fraction of bbox height for occlusion recovery distance
+    env["SWAY_STITCH_RADIUS_BBOX_FRAC"] = str(
+        trial.suggest_categorical(
+            "SWAY_STITCH_RADIUS_BBOX_FRAC", ["0.3", "0.5", "0.7", "1.0"]
+        )
+    )
+    # Short gap threshold: gaps this short use generous matching
+    env["SWAY_SHORT_GAP_FRAMES"] = str(
+        trial.suggest_categorical(
+            "SWAY_SHORT_GAP_FRAMES", ["10", "15", "20", "30"]
+        )
+    )
+    # Dormant track relinking distance
+    env["SWAY_DORMANT_MAX_GAP"] = str(
+        trial.suggest_categorical(
+            "SWAY_DORMANT_MAX_GAP", ["90", "120", "150", "200", "250"]
+        )
+    )
+    # Coalescence: duplicate track dedup
+    env["SWAY_COALESCENCE_IOU_THRESH"] = str(
+        trial.suggest_categorical(
+            "SWAY_COALESCENCE_IOU_THRESH", ["0.55", "0.65", "0.70", "0.80", "0.85"]
+        )
+    )
+    env["SWAY_COALESCENCE_CONSECUTIVE_FRAMES"] = str(
+        trial.suggest_categorical(
+            "SWAY_COALESCENCE_CONSECUTIVE_FRAMES", ["5", "8", "12", "15"]
+        )
+    )
+    # Box interpolation for gap filling
+    box_interp = trial.suggest_categorical(
+        "SWAY_BOX_INTERP_MODE", ["linear", "gsi"]
+    )
+    env["SWAY_BOX_INTERP_MODE"] = box_interp
+    if box_interp == "gsi":
+        env["SWAY_GSI_LENGTHSCALE"] = str(
+            trial.suggest_categorical(
+                "branch_gsi_SWAY_GSI_LENGTHSCALE", ["0.20", "0.35", "0.50", "0.70"]
+            )
+        )
+
+    # Global link mode
     aflink_mode = trial.suggest_categorical(
         "sway_global_aflink_mode", ["neural_if_available", "force_heuristic"]
     )
     if aflink_mode == "force_heuristic" or not AFLINK_DEFAULT.is_file():
         env["SWAY_GLOBAL_AFLINK"] = "0"
-    # neural_if_available + weights present → omit SWAY_GLOBAL_AFLINK (allow neural linker)
 
+    # ── 4. Hybrid SAM sub-params (always set for any mode) ───────────────
+    # Mask binarization threshold
+    env["SWAY_HYBRID_SAM_MASK_THRESH"] = str(
+        trial.suggest_categorical(
+            "SWAY_HYBRID_SAM_MASK_THRESH", ["0.40", "0.50", "0.60"]
+        )
+    )
+    # Box padding after mask-to-bbox conversion
+    env["SWAY_HYBRID_SAM_BBOX_PAD"] = str(
+        trial.suggest_categorical(
+            "SWAY_HYBRID_SAM_BBOX_PAD", ["0", "2", "4", "6"]
+        )
+    )
+    # ROI crop expansion for SAM inference
+    env["SWAY_HYBRID_SAM_ROI_PAD_FRAC"] = str(
+        trial.suggest_categorical(
+            "SWAY_HYBRID_SAM_ROI_PAD_FRAC", ["0.05", "0.10", "0.15", "0.20"]
+        )
+    )
+
+    # ── 5. Phase 1–3 mode + branch-specific params ───────────────────────
     mode = trial.suggest_categorical(
         "SWAY_PHASE13_MODE", ["standard", "dancer_registry", "sway_handshake"]
     )
     env["SWAY_PHASE13_MODE"] = mode
 
-    env["SWAY_YOLO_DETECTION_STRIDE"] = "1"
-
-    env["SWAY_USE_BOXMOT"] = "1"
-    env["SWAY_BOXMOT_TRACKER"] = "deepocsort"
-    env["SWAY_BOXMOT_REID_ON"] = "0"
-
     if mode == "standard":
         env["SWAY_HYBRID_SAM_IOU_TRIGGER"] = str(
             trial.suggest_categorical(
                 "branch_std_SWAY_HYBRID_SAM_IOU_TRIGGER",
-                ["0.35", "0.40", "0.42", "0.45", "0.50", "0.55", "0.60"],
+                ["0.30", "0.35", "0.40", "0.42", "0.45", "0.50", "0.55", "0.60"],
             )
         )
     elif mode == "dancer_registry":
@@ -213,19 +373,44 @@ def suggest_env_for_trial(trial: Any, available_weights: List[str]) -> Dict[str,
                 ["0.02", "0.04", "0.06", "0.08", "0.10", "0.12", "0.15"],
             )
         )
-        env["SWAY_DORMANT_MAX_GAP"] = str(
+        # Registry isolation: how far apart dancers must be for profile updates
+        env["SWAY_REGISTRY_ISOLATION_MULT"] = str(
             trial.suggest_categorical(
-                "branch_reg_SWAY_DORMANT_MAX_GAP", ["90", "120", "150", "180", "200"]
+                "branch_reg_SWAY_REGISTRY_ISOLATION_MULT",
+                ["1.2", "1.5", "1.8", "2.0"],
+            )
+        )
+        # Appearance dormant match threshold
+        env["SWAY_REGISTRY_DORMANT_MATCH"] = str(
+            trial.suggest_categorical(
+                "branch_reg_SWAY_REGISTRY_DORMANT_MATCH",
+                ["0.75", "0.80", "0.82", "0.85", "0.90"],
             )
         )
     else:  # sway_handshake
         env["SWAY_HYBRID_SAM_IOU_TRIGGER"] = str(
             trial.suggest_categorical(
                 "branch_hs_SWAY_HYBRID_SAM_IOU_TRIGGER",
-                ["0.05", "0.10", "0.15", "0.20", "0.25"],
+                ["0.03", "0.05", "0.08", "0.10", "0.15", "0.20", "0.25"],
             )
         )
-        env["SWAY_HYBRID_SAM_WEAK_CUES"] = "0"
+        # Weak cues: temporal stability gate — skip SAM when boxes look stable
+        env["SWAY_HYBRID_SAM_WEAK_CUES"] = trial.suggest_categorical(
+            "branch_hs_SWAY_HYBRID_SAM_WEAK_CUES", ["0", "1"]
+        )
+        # Handshake verification frequency
+        env["SWAY_HANDSHAKE_VERIFY_STRIDE"] = str(
+            trial.suggest_categorical(
+                "branch_hs_SWAY_HANDSHAKE_VERIFY_STRIDE", ["1", "2", "3", "5"]
+            )
+        )
+        # Handshake isolation multiplier for fingerprint updates
+        env["SWAY_REGISTRY_ISOLATION_MULT"] = str(
+            trial.suggest_categorical(
+                "branch_hs_SWAY_REGISTRY_ISOLATION_MULT",
+                ["1.0", "1.3", "1.5", "2.0"],
+            )
+        )
 
     return env
 
@@ -362,7 +547,7 @@ def main() -> None:
     args = parser.parse_args()
 
     import optuna
-    from optuna.pruners import MedianPruner
+    from optuna.pruners import NopPruner
     from optuna.samplers import TPESampler
 
     opt_dir = REPO_ROOT / "output" / "sweeps" / "optuna"
@@ -422,8 +607,10 @@ def main() -> None:
     timeout = args.timeout_per_video if args.timeout_per_video > 0 else None
 
     def objective(trial: optuna.Trial) -> float:
+        trial_start = time.time()
         env_map = suggest_env_for_trial(trial, available_weights)
         per_video_scores: List[float] = []
+        per_video_durations: Dict[str, float] = {}
         all_metrics: Dict[str, Any] = {}
 
         with tempfile.NamedTemporaryFile(
@@ -440,6 +627,7 @@ def main() -> None:
                 im_w = int(spec.get("im_width", 1280))
                 im_h = int(spec.get("im_height", 720))
                 run_dir = opt_dir / f"trial_{trial.number:05d}_{seq_name}"
+                _t0 = time.time()
                 score, mflat = _score_one_video(
                     seq_name,
                     video,
@@ -451,25 +639,29 @@ def main() -> None:
                     timeout,
                     save_phase_previews=bool(args.phase_previews),
                 )
+                _video_dur = round(time.time() - _t0, 1)
                 per_video_scores.append(score)
+                per_video_durations[seq_name] = _video_dur
                 all_metrics[seq_name] = mflat
-                trial.report(score, step=step)
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
 
-            if min(per_video_scores) <= 0:
-                agg = 0.0
-            else:
-                agg = statistics.harmonic_mean(per_video_scores)
+            # Floor each score at a tiny epsilon so harmonic mean is still informative
+            # even when one video fails (0.0 → 1e-6 rather than zeroing the whole trial).
+            floored = [max(s, 1e-6) for s in per_video_scores]
+            agg = statistics.harmonic_mean(floored)
+            trial_dur = round(time.time() - trial_start, 1)
             for seq_name, sc in zip(order, per_video_scores):
                 trial.set_user_attr(f"score_{seq_name}", sc)
+                trial.set_user_attr(f"duration_s_{seq_name}", per_video_durations.get(seq_name, 0.0))
             trial.set_user_attr("aggregate_harmonic_mean", agg)
+            trial.set_user_attr("trial_duration_s", trial_dur)
 
             entry = {
                 "trial": trial.number,
                 "git_sha": _git_sha_short(),
                 "aggregate": agg,
                 "per_video": dict(zip(order, per_video_scores)),
+                "per_video_duration_s": per_video_durations,
+                "trial_duration_s": trial_dur,
                 "env": env_map,
             }
             with open(log_jsonl, "a", encoding="utf-8") as lf:
@@ -494,7 +686,7 @@ def main() -> None:
         load_if_exists=True,
         direction="maximize",
         sampler=TPESampler(seed=42),
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+        pruner=NopPruner(),  # no pruning — all videos always run, all scores recorded
     )
 
     if status_path:
