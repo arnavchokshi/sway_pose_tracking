@@ -9,6 +9,8 @@ import { LiveSandboxPage } from './pages/LiveSandboxPage'
 import { SwayScoringPage } from './pages/SwayScoringPage'
 import { OptunaSweepPage } from './pages/OptunaSweepPage'
 
+import { HomePage } from './pages/HomePage'
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -17,7 +19,8 @@ export default function App() {
           <NavBar />
           <main className="main-content">
             <Routes>
-              <Route path="/" element={<LabPage />} />
+              <Route path="/" element={<HomePage />} />
+              <Route path="/lab" element={<LabPage />} />
               <Route path="/config" element={<ConfigPage />} />
               <Route path="/compare" element={<ComparePage />} />
               <Route path="/watch/:id/live" element={<LiveSandboxPage />} />

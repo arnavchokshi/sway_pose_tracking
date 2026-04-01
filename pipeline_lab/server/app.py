@@ -60,10 +60,10 @@ def _optuna_sweep_root() -> Path:
     return (REPO_ROOT / "output" / "sweeps" / "optuna").resolve()
 
 
-_DEFAULT_LAMBDA_REMOTE = "~/sway_pose_tracking/output/sweeps/optuna/sweep_status.json"
-# Primary sweep GPU instance (gpu_1x_a10, us-east-1). Override with SWAY_LAMBDA_SWEEP_*; set SWAY_LAMBDA_SWEEP_HOST=
+_DEFAULT_LAMBDA_REMOTE = "~/sway_test/sway_pose_mvp/output/sweeps/optuna/sweep_status.json"
+# Primary sweep GPU instance (gpu_1x_a10, us-west-1). Override with SWAY_LAMBDA_SWEEP_*; set SWAY_LAMBDA_SWEEP_HOST=
 # to empty string to skip scp and only read local sweep_status.json.
-_SWAY_OPTUNA_LAMBDA_DEFAULT_IP = "150.136.111.175"
+_SWAY_OPTUNA_LAMBDA_DEFAULT_IP = "146.235.225.0"
 _SWAY_OPTUNA_LAMBDA_DEFAULT_USER = "ubuntu"
 _SWAY_OPTUNA_LAMBDA_DEFAULT_PEM_CANDIDATES = (
     Path.home() / "Downloads" / "pose-tracking.pem",
@@ -117,9 +117,8 @@ def _scp_pull_remote_file(
 ) -> None:
     """Copy ``remote_path`` from ``user@host`` to ``dest`` (atomic replace). Uses system ``scp``."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".pulltmp")
-    if tmp.is_file():
-        tmp.unlink()
+    # Use a per-request temp file so concurrent pull requests cannot clobber each other.
+    tmp = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.pulltmp")
     remote_spec = f"{user}@{host}:{remote_path}"
     cmd: List[str] = [
         "scp",
@@ -134,7 +133,8 @@ def _scp_pull_remote_file(
     try:
         proc = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.DEVNULL,  # must NOT capture stdout: macOS scp (sftp backend) writes file
+            stderr=subprocess.PIPE,     # content to stdout when it is a pipe, silently skipping the dest
             text=True,
             timeout=120,
             cwd=str(REPO_ROOT),
@@ -147,9 +147,24 @@ def _scp_pull_remote_file(
             detail="scp not found — install an OpenSSH client (macOS: built-in; Windows: OpenSSH optional feature)",
         ) from None
     if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout or "").strip() or "scp failed"
+        msg = (proc.stderr or "").strip() or "scp failed"
         raise HTTPException(status_code=502, detail=msg) from None
-    tmp.replace(dest)
+    # macOS/OpenSSH can occasionally return before metadata is visible on some filesystems.
+    # Give the tmp path a brief chance to materialize before declaring pull failure.
+    for _ in range(6):
+        if tmp.is_file():
+            break
+        time.sleep(0.05)
+    if not tmp.is_file():
+        raise HTTPException(status_code=502, detail="scp returned 0 but destination file was not created") from None
+    try:
+        tmp.replace(dest)
+    except FileNotFoundError:
+        # Avoid bubbling an unhandled exception as 500: this is treated as a failed pull.
+        raise HTTPException(
+            status_code=502,
+            detail="pulled tmp file disappeared before atomic replace; retry pull",
+        ) from None
 
 
 def _rsync_optuna_dir_from_remote(
@@ -217,7 +232,7 @@ class OptunaLambdaPullBody(BaseModel):
     )
     remote_optuna_dir: Optional[str] = Field(
         None,
-        description="Override remote optuna directory (default ~/sway_pose_tracking/output/sweeps/optuna/).",
+        description="Override remote optuna directory (default ~/sway_test/sway_pose_mvp/output/sweeps/optuna/).",
     )
 
 
@@ -458,7 +473,11 @@ def _build_params_yaml(fields: Dict[str, Any]) -> Dict[str, Any]:
         key = spec["key"]
         t = spec["type"]
         if t == "bool":
-            out[key] = bool(val)
+            if isinstance(val, bool):
+                out[key] = val
+            else:
+                s = str(val).strip().lower()
+                out[key] = s in ("1", "true", "yes", "on")
         elif t == "int":
             out[key] = int(val)
         elif t == "float":
@@ -515,7 +534,12 @@ def _subprocess_env(fields: Dict[str, Any]) -> Dict[str, str]:
         key = spec["key"]
         t = spec["type"]
         if t == "bool":
-            env[key] = "1" if val else "0"
+            if isinstance(val, bool):
+                b = val
+            else:
+                s = str(val).strip().lower()
+                b = s in ("1", "true", "yes", "on")
+            env[key] = "1" if b else "0"
         else:
             env[key] = str(val)
     # Normalize association metric for tracker.py (case-insensitive)
@@ -858,7 +882,7 @@ def optuna_pull_lambda(body: OptunaLambdaPullBody = Body(default_factory=OptunaL
     """
     Pull latest ``sweep_status.json`` from the primary GPU instance (same as ``scripts/pull_lambda_sweep_status.sh``).
 
-    Defaults: IP ``150.136.111.175``, user ``ubuntu``, PEM ``~/Downloads/pose-tracking.pem`` or
+    Defaults: IP ``146.235.225.0``, user ``ubuntu``, PEM ``~/Downloads/pose-tracking.pem`` or
     ``~/.ssh/pose-tracking.pem`` / ``~/.ssh/pose-tracking`` when present. Override with ``SWAY_LAMBDA_SWEEP_HOST``,
     ``SWAY_LAMBDA_SWEEP_USER``, ``SWAY_LAMBDA_SWEEP_PEM``, ``SWAY_LAMBDA_SWEEP_REMOTE_PATH``, or optional JSON body.
     Set ``SWAY_LAMBDA_SWEEP_HOST`` to an empty value to disable scp (local JSON only). Writes into the Optuna sweep
@@ -916,7 +940,7 @@ def optuna_pull_lambda(body: OptunaLambdaPullBody = Body(default_factory=OptunaL
     if body.sync_trial_artifacts:
         ro = (body.remote_optuna_dir or os.environ.get("SWAY_LAMBDA_SWEEP_REMOTE_OPTUNA_DIR") or "").strip()
         if not ro:
-            ro = "~/sway_pose_tracking/output/sweeps/optuna/"
+            ro = "~/sway_test/sway_pose_mvp/output/sweeps/optuna/"
         _validate_lambda_remote_path(ro)
         root = _optuna_sweep_root()
         _rsync_optuna_dir_from_remote(

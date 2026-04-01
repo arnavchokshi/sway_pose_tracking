@@ -110,10 +110,12 @@ def bone_length_filter_enabled() -> bool:
 
 
 def lift_backend() -> str:
-    """motionagformer | poseformerv2"""
+    """motionagformer | poseformerv2 | motionbert"""
     v = os.environ.get("SWAY_LIFT_BACKEND", "motionagformer").strip().lower()
     if v in ("poseformerv2", "poseformer_v2", "pfv2"):
         return "poseformerv2"
+    if v in ("motionbert", "motion_bert", "mbert"):
+        return "motionbert"
     return "motionagformer"
 
 
@@ -879,8 +881,22 @@ def _infer_full_sequence(
     keypoints_btc: (1, T, 17, 3) pixel x,y + score.
     Returns (T, 17, 3) postprocessed 3D (COCO order).
     """
-    if lift_backend() == "poseformerv2":
+    backend = lift_backend()
+    if backend == "poseformerv2":
         return _infer_poseformerv2_sequence(keypoints_btc, img_w, img_h)
+    # MotionBERT backend (PLAN_18)
+    if backend == "motionbert":
+        from sway.motionbert_lifter import MotionBERTLifter
+        import torch
+
+        if torch.cuda.is_available():
+            device_str = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device_str = "mps"
+        else:
+            device_str = "cpu"
+        lifter = MotionBERTLifter(device=device_str)
+        return lifter.infer_sequence(keypoints_btc, img_w, img_h)
     return _infer_motionagformer_sequence(keypoints_btc, img_w, img_h)
 
 
@@ -1073,9 +1089,14 @@ def lift_poses_to_3d(
     When SWAY_UNIFIED_3D_EXPORT=1 (default), keypoints_3d are world XYZ (camera-consistent)
     for the Three.js viewer. Otherwise legacy [pixel_x, pixel_y, z_lift].
     """
-    if lift_backend() == "poseformerv2":
+    _lift_backend = lift_backend()
+    if _lift_backend == "poseformerv2":
         model, _ = _load_poseformerv2_model()
         backend_name = "PoseFormerV2"
+    # MotionBERT backend (PLAN_18)
+    elif _lift_backend == "motionbert":
+        model = True  # MotionBERTLifter is loaded lazily in _infer_full_sequence
+        backend_name = "MotionBERT"
     else:
         model, _ = _load_motionagformer_model()
         backend_name = "MotionAGFormer"

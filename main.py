@@ -80,12 +80,14 @@ from sway.experimental_hooks import (
 )
 from sway.checkpoint_io import (
     CHECKPOINT_BOUNDARIES,
+    load_after_phase_2,
     load_after_phase_3,
     load_after_phase_4,
     load_after_phase_5,
     load_after_phase_8,
     load_phase1_yolo_dets,
     read_manifest,
+    save_after_phase_2,
     save_after_phase_3,
     save_after_phase_4,
     save_after_phase_5,
@@ -97,6 +99,7 @@ from sway.checkpoint_io import (
 )
 from sway.mot_format import build_phase3_tracking_data_json
 from sway.phase_debug_log import PhaseDebugLogger
+from sway.calibration import get_temperature_scaler, scale_probability
 from sway.tracker import (
     _use_boxmot,
     apply_post_track_stitching,
@@ -204,6 +207,91 @@ from sway.visualizer import (
     draw_frame,
 )
 
+# --- Future pipeline module imports (gated by SWAY_* env vars) ---
+from sway.detector_factory import create_detector
+from sway.tracker_factory import create_tracker as create_tracker_engine
+from sway.track_state import (
+    TrackState,
+    TrackLifecycle,
+    update_state as update_track_state,
+    should_run_pose as should_run_pose_for_state,
+    lifecycle_to_dict,
+)
+from sway.enrollment import (
+    auto_select_enrollment_frame,
+    enroll_dancers,
+    save_gallery,
+    is_enrollment_enabled,
+    enrollment_gallery_signals,
+    enrollment_part_model,
+)
+from sway.mask_guided_pose import MaskGuidedPoseEstimator
+from sway.reid_fusion import ReIDFusionEngine, ReIDQuery, UNKNOWN_ID
+from sway.pose_gated_ema import PoseGatedEMA
+from sway.reid_factory import create_reid_ensemble
+from sway.collision_solver import CoalescenceDetector, solve_collision
+from sway.backward_pass import (
+    is_backward_pass_enabled as is_future_backward_enabled,
+    run_backward_pass,
+    stitch_forward_reverse,
+    ForwardTrack,
+)
+from sway.critique_engine import CritiqueEngine
+from sway.cross_object_interaction import CrossObjectInteraction
+from sway.mote_disocclusion import MOTEDisocclusion, is_mote_enabled
+from sway.sentinel_sbm import SentinelSBM, is_sentinel_enabled
+from sway.umot_backtrack import UMOTBacktracker, is_umot_enabled
+
+
+def _use_future_tracker() -> bool:
+    """True when SWAY_TRACKER_ENGINE requests a non-default tracker (SAM2MOT, MeMoSORT, etc.)."""
+    engine = os.environ.get("SWAY_TRACKER_ENGINE", "").strip().lower()
+    return engine not in ("", "solidtrack")
+
+
+def _use_future_detector() -> bool:
+    """True when SWAY_DETECTOR_PRIMARY requests a non-YOLO detector (RT-DETR, Co-DETR, etc.)."""
+    primary = os.environ.get("SWAY_DETECTOR_PRIMARY", "").strip().lower()
+    return primary not in ("", "yolo26l_dancetrack") and not primary.startswith("yolo")
+
+
+def _future_tracker_to_raw_tracks(
+    tracker_results_by_frame: dict,
+    total_frames: int,
+) -> dict:
+    """Convert future tracker per-frame results to the raw_tracks format Phase 3+ expects.
+    
+    raw_tracks: Dict[int, List[TrackObservation]] keyed by track_id.
+    """
+    from sway.track_observation import TrackObservation
+    raw: dict = {}
+    for fidx in range(total_frames):
+        results = tracker_results_by_frame.get(fidx, [])
+        for r in results:
+            tid = r.track_id
+            obs = TrackObservation(
+                frame_idx=fidx,
+                bbox=tuple(r.bbox_xyxy.tolist()),
+                conf=r.confidence,
+            )
+            if r.mask is not None:
+                obs.segmentation_mask = r.mask
+            raw.setdefault(tid, []).append(obs)
+    return raw
+
+
+def _phase1_dets_from_future_frame_results(tracker_results_by_frame: dict) -> Dict[int, Any]:
+    """Build phase1_dets_by_frame for phase preview MP4 (boxes + conf per frame)."""
+    out: Dict[int, Any] = {}
+    for fidx, results in tracker_results_by_frame.items():
+        pairs = []
+        for r in results:
+            x1, y1, x2, y2 = [float(v) for v in r.bbox_xyxy.tolist()]
+            pairs.append(((x1, y1, x2, y2), float(r.confidence)))
+        if pairs:
+            out[int(fidx)] = pairs
+    return out
+
 
 def _apply_stack_default_env() -> None:
     """
@@ -214,6 +302,33 @@ def _apply_stack_default_env() -> None:
     os.environ.setdefault("SWAY_GLOBAL_LINK", "1")
     # Depth-based stage polygon is easy to get wrong on group/competition video; opt-in via SWAY_AUTO_STAGE_DEPTH=1.
     os.environ.setdefault("SWAY_AUTO_STAGE_DEPTH", "0")
+
+
+def _run_optional_smoke_hooks() -> None:
+    """Execute explicit opt-in smoke hooks from SWAY_* flags."""
+    truthy = ("1", "true", "yes", "on")
+
+    if os.environ.get("SWAY_GNN_TRACK_SMOKE", "").strip().lower() in truthy:
+        from tools.gnn_group_track_stub import main as gnn_smoke_main
+
+        if int(gnn_smoke_main()) != 0:
+            raise SystemExit("SWAY_GNN_TRACK_SMOKE requested but GNN smoke hook failed.")
+
+    if os.environ.get("SWAY_HMR_SMOKE", "").strip().lower() in truthy:
+        from tools.hmr_3d_optional_stub import main as hmr_smoke_main
+
+        if int(hmr_smoke_main()) != 0:
+            raise SystemExit("SWAY_HMR_SMOKE requested but HMR smoke hook failed.")
+
+    if os.environ.get("SWAY_SAPIENS_SMOKE", "").strip().lower() in truthy:
+        import subprocess
+
+        rc = subprocess.call(
+            [sys.executable, "-m", "tools.sapiens_qualitative_smoke", "--yes-i-know"],
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        if int(rc) != 0:
+            raise SystemExit("SWAY_SAPIENS_SMOKE requested but Sapiens smoke hook failed.")
 
 
 def _ensure_collision_cleanup_logging() -> None:
@@ -334,6 +449,31 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
+
+
+def _keypoints_to_critique17x3(raw: Any) -> np.ndarray:
+    """Force COCO-17 × (x,y,conf) so per-frame np.stack never hits ragged shapes."""
+    if raw is None:
+        return np.zeros((17, 3), dtype=np.float32)
+    k = np.asarray(raw, dtype=np.float32)
+    if k.size == 0:
+        return np.zeros((17, 3), dtype=np.float32)
+    if k.ndim == 1:
+        if k.size == 51:
+            return k.reshape(17, 3)
+        if k.size == 34:
+            out = np.zeros((17, 3), dtype=np.float32)
+            out[:, :2] = k.reshape(17, 2)
+            out[:, 2] = 1.0
+            return out
+        return np.zeros((17, 3), dtype=np.float32)
+    out = np.zeros((17, 3), dtype=np.float32)
+    n = min(17, k.shape[0])
+    w = min(3, k.shape[1])
+    out[:n, :w] = k[:n, :w]
+    if w == 2:
+        out[:n, 2] = 1.0
+    return out
 
 
 _LAB_CTX: Optional[Dict[str, Any]] = None
@@ -1020,6 +1160,7 @@ def main():
     )
     args = parser.parse_args()
     _apply_stack_default_env()
+    _run_optional_smoke_hooks()
 
     params = {}
     if args.params:
@@ -1040,6 +1181,28 @@ def main():
     apply_master_locked_phase3_stitch_env()
     apply_master_locked_pose_env()
     apply_master_locked_smooth_env()
+
+    # Optional env-first pose model override for sweep/matrix runs.
+    # Accept both legacy CLI labels and doc labels (vitpose_large, rtmw_l, ...).
+    _pose_env = os.environ.get("SWAY_POSE_MODEL", "").strip().lower()
+    if _pose_env:
+        _pose_alias = {
+            "base": "base",
+            "vitpose_base": "base",
+            "large": "large",
+            "vitpose_large": "large",
+            "huge": "huge",
+            "vitpose_huge": "huge",
+            "rtmpose": "rtmpose",
+            "rtmw_l": "rtmpose",
+            "rtmw_x": "rtmpose",
+            "sapiens": "sapiens",
+        }
+        _mapped = _pose_alias.get(_pose_env)
+        if _mapped is not None:
+            args.pose_model = _mapped
+        else:
+            print(f"  Warning: SWAY_POSE_MODEL={_pose_env!r} not recognized; keeping CLI --pose-model={args.pose_model}")
 
     video_path = Path(args.video_path)
     if not video_path.exists():
@@ -1091,6 +1254,7 @@ def main():
         b0 = str(man0.get("boundary_id") or "")
         start_marker = {
             "after_phase_1": 2,
+            "after_phase_2": 3,
             "after_phase_3": 4,
             "after_phase_4": 5,
             "after_phase_5": 6,
@@ -1115,6 +1279,7 @@ def main():
     log_resource_usage("startup")
 
     total_start = time.time()
+    phase2_checkpoint_stop_pending = False
     phase3_checkpoint_stop_pending = False
 
     _stop_b = args.stop_after_boundary
@@ -1220,6 +1385,47 @@ def main():
         phase1_pre_classical_by_frame = {}
         dt_track = 0.0
         dt_stitch = 0.0
+    elif start_marker == 3:
+        b2 = load_after_phase_2(resume_dir)
+        raw_pre = b2["raw_pre"]
+        total_frames = int(b2["total_frames"])
+        output_fps = float(b2["output_fps"])
+        native_fps = float(b2["native_fps"])
+        frame_width = int(b2["frame_width"])
+        frame_height = int(b2["frame_height"])
+        ystride = int(b2["ystride"])
+        hybrid_sam_stats = dict(b2.get("hybrid_sam_stats") or {})
+        phase1_dets_by_frame = dict(b2.get("phase1_dets_by_frame") or {})
+        _pc2 = b2.get("phase1_pre_classical_by_frame")
+        phase1_pre_classical_by_frame = dict(_pc2) if isinstance(_pc2, dict) else {}
+        dt_track = 0.0
+        dt_stitch = 0.0
+        print(
+            "\n[3/11] Phase 3 — Post-track stitching (resuming from after_phase_2 checkpoint)…",
+            flush=True,
+        )
+        _run_phase3_stitch()
+        phase_dbg.log(
+            "3",
+            dt_stitch,
+            {"track_count": len(raw_tracks), "resume": "after_phase_2"},
+        )
+        if _stop_b == "after_phase_3":
+            save_after_phase_3(
+                _ck_dir("after_phase_3"),
+                raw_tracks,
+                total_frames=total_frames,
+                native_fps=native_fps,
+                output_fps=output_fps,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                ystride=ystride,
+                hybrid_sam_stats=hybrid_sam_stats,
+                video_path=video_path,
+                params_path=params_path,
+            )
+            print(f"Checkpoint written: {_ck_dir('after_phase_3')}", flush=True)
+            phase3_checkpoint_stop_pending = True
     elif start_marker == 2:
         yolo_map, meta = load_phase1_yolo_dets(resume_dir)
         total_frames = int(meta["total_frames"])
@@ -1280,7 +1486,589 @@ def main():
             print(f"Checkpoint written: {_ck_dir('after_phase_3')}", flush=True)
             phase3_checkpoint_stop_pending = True
     else:
-        if _stop_b == "after_phase_1":
+        # ── Future Pipeline Path (SAM2MOT / MeMoSORT / RT-DETR) ─────────
+        if _use_future_tracker() or _use_future_detector():
+            print("\n[1/11] Phase 1 — Detection (future pipeline: %s)" %
+                  os.environ.get("SWAY_DETECTOR_PRIMARY", "yolo"))
+            _ft_engine = os.environ.get("SWAY_TRACKER_ENGINE", "sam2mot").strip().lower() or "sam2mot"
+            print("[2/11] Phase 2 — Tracking (future pipeline: %s)" % _ft_engine)
+            t0 = time.time()
+
+            _ft_device = str(device)
+            _ft_detector = create_detector(device=_ft_device)
+            _ft_tracker = create_tracker_engine(engine=_ft_engine, device=_ft_device)
+            _reid_signals = create_reid_ensemble(device=_ft_device)
+            _ft_detector_source_counts = {"yolo": 0, "detr": 0, "unknown": 0}
+
+            def _ft_detect_frame(_frame: np.ndarray, _frame_idx: int) -> list:
+                """Detector adapter: hybrid returns list + _last_detect_source; legacy tuple still supported."""
+                try:
+                    _det_out = _ft_detector.detect(_frame, frame_idx=_frame_idx)
+                except TypeError:
+                    _det_out = _ft_detector.detect(_frame)
+                if isinstance(_det_out, tuple) and len(_det_out) == 2:
+                    _dets, _source = _det_out
+                else:
+                    _dets = _det_out
+                    _source = getattr(_ft_detector, "_last_detect_source", "unknown")
+                if _source not in _ft_detector_source_counts:
+                    _source = "unknown"
+                _ft_detector_source_counts[_source] += 1
+                return _dets or []
+
+            # Optional enrollment (PLAN_07)
+            enrollment_galleries = []
+            if is_enrollment_enabled() and os.environ.get("SWAY_ENROLLMENT_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+                print("  [enrollment] Scanning for best enrollment frame…", flush=True)
+                _enroll_auto = int(os.environ.get("SWAY_ENROLLMENT_AUTO_FRAME", "0") or 0)
+                if _enroll_auto > 0:
+                    _enroll_frame_idx = max(0, _enroll_auto)
+                else:
+                    _enroll_frame_idx = auto_select_enrollment_frame(str(video_path), detector=_ft_detector)
+                cap_enroll = cv2.VideoCapture(str(video_path))
+                cap_enroll.set(cv2.CAP_PROP_POS_FRAMES, _enroll_frame_idx)
+                ret_e, frame_e = cap_enroll.read()
+                cap_enroll.release()
+                if ret_e:
+                    _enroll_dets = _ft_detect_frame(frame_e, _enroll_frame_idx)
+                    _signals = enrollment_gallery_signals()
+                    _enroll_models: Dict[str, Any] = {}
+                    try:
+                        if "part" in _signals:
+                            _reid_part_model = enrollment_part_model()
+                            _part_reid = _reid_signals.get("part")
+                            if _part_reid is not None and _reid_part_model:
+                                _enroll_models["part_reid"] = _part_reid
+                        if "color" in _signals:
+                            _color_hist = _reid_signals.get("color")
+                            if _color_hist is not None:
+                                _enroll_models["color_hist"] = _color_hist
+                        if "face" in _signals:
+                            _face_reid = _reid_signals.get("face")
+                            if _face_reid is not None:
+                                _enroll_models["face_reid"] = _face_reid
+                    except Exception:
+                        _enroll_models = {}
+                    enrollment_galleries = enroll_dancers(
+                        frame_e,
+                        _enroll_dets,
+                        models=_enroll_models or None,
+                        frame_idx=_enroll_frame_idx,
+                    )
+                    gallery_path = output_dir / "gallery.json"
+                    save_gallery(enrollment_galleries, gallery_path)
+                    print("  [enrollment] Enrolled %d dancers at frame %d → %s" %
+                          (len(enrollment_galleries), _enroll_frame_idx, gallery_path), flush=True)
+            _fusion_engine = ReIDFusionEngine(
+                gallery=enrollment_galleries,
+                signal_modules=_reid_signals,
+            )
+
+            # Optional COI module (PLAN_05)
+            _ft_coi = CrossObjectInteraction() if os.environ.get("SWAY_COI_ENABLED", "1").strip().lower() in ("1", "true", "yes") else None
+
+            def _log_feature_state(
+                name: str,
+                requested: bool,
+                active: bool,
+                *,
+                wired: Optional[bool] = None,
+                details: str = "",
+            ) -> None:
+                """Standardized runtime feature status logging."""
+                req_s = "on" if requested else "off"
+                act_s = "active" if active else "inactive"
+                if wired is None:
+                    wire_s = "n/a"
+                else:
+                    wire_s = "wired" if wired else "unwired"
+                msg = f"  [feature] {name}: requested={req_s}, runtime={act_s}, wiring={wire_s}"
+                if details:
+                    msg += f" ({details})"
+                print(msg, flush=True)
+
+            # Optional advanced modules (PLAN_21): MOTE / Sentinel / UMOT
+            # Runtime wiring: these hooks now execute inside the per-frame future loop.
+            _adv_extras: Dict[str, Any] = {}
+            _mote_requested = is_mote_enabled()
+            _sentinel_requested = is_sentinel_enabled()
+            _umot_requested = is_umot_enabled()
+
+            _mote: Optional[MOTEDisocclusion] = None
+            _sentinel: Optional[SentinelSBM] = None
+            _umot: Optional[UMOTBacktracker] = None
+
+            _mote_reemergence_hits = 0
+            _mote_reemergence_boost_sum = 0.0
+            _mote_predictions: Dict[int, Tuple[float, float]] = {}
+
+            _sentinel_grace_entries = 0
+            _sentinel_weak_accepts = 0
+
+            _umot_query_hits = 0
+            _umot_pruned = 0
+
+            _sentinel_normal_conf = float(os.environ.get("SWAY_YOLO_CONF", "0.35") or 0.35)
+            _prev_result_ids: set[int] = set()
+            _prev_track_states: Dict[int, TrackState] = {}
+            _prev_track_centers: Dict[int, Tuple[float, float]] = {}
+            _ema_manager = PoseGatedEMA()
+            _ema_samples = 0
+            _ema_nonzero = 0
+            _uncertain_conf = float(os.environ.get("SWAY_DETECTION_UNCERTAIN_CONF", "0.50") or 0.50)
+            _collision_solver = os.environ.get("SWAY_COLLISION_SOLVER", "greedy").strip().lower()
+            _coalescence_detector = CoalescenceDetector()
+            _collision_events = 0
+            _collision_exits = 0
+            _collision_assignments = 0
+            _temp_scaler = get_temperature_scaler()
+
+            if _mote_requested:
+                _flow_model = os.environ.get("SWAY_MOTE_FLOW_MODEL", "raft_small").strip()
+                _mote = MOTEDisocclusion(flow_model=_flow_model, device=str(device))
+                _adv_extras["mote_status"] = "active_when_requested"
+                _adv_extras["mote_flow_model"] = _flow_model
+            if _sentinel_requested:
+                _grace = float(os.environ.get("SWAY_SENTINEL_GRACE_MULTIPLIER", "3.0"))
+                _weak_conf = float(os.environ.get("SWAY_SENTINEL_WEAK_DET_CONF", "0.08"))
+                _sentinel = SentinelSBM(grace_multiplier=_grace, weak_det_conf=_weak_conf)
+                _adv_extras["sentinel_status"] = "active_when_requested"
+                _adv_extras["sentinel_grace_multiplier"] = _grace
+                _adv_extras["sentinel_weak_conf"] = _weak_conf
+            if _umot_requested:
+                _hist_len = int(os.environ.get("SWAY_UMOT_HISTORY_LENGTH", "500"))
+                _umot = UMOTBacktracker(history_length=_hist_len)
+                _adv_extras["umot_status"] = "active_when_requested"
+                _adv_extras["umot_history_length"] = _hist_len
+
+            # Run tracking loop
+            _ft_results_by_frame: dict = {}
+            cap = cv2.VideoCapture(str(video_path))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            native_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            output_fps = native_fps
+            ystride = 1
+
+            _ft_det_stride = int(os.environ.get("SWAY_SAM2_REINVOKE_STRIDE", "30") or 30)
+            _ft_progress_every = max(
+                1, int(os.environ.get("SWAY_PROGRESS_LOG_EVERY", "25") or 25)
+            )
+            _dbg_enabled = os.environ.get("SWAY_DEBUG_STALL_LOG", "1").strip().lower() in ("1", "true", "yes")
+            _dbg_run_id = os.environ.get("SWAY_DEBUG_RUN_ID", "stall-check-1").strip() or "stall-check-1"
+            _dbg_interval = max(1, int(os.environ.get("SWAY_DEBUG_STALL_INTERVAL", "10") or 10))
+            _dbg_slow_frame_ms = float(os.environ.get("SWAY_DEBUG_SLOW_FRAME_MS", "8000") or 8000)
+            _dbg_log_path = Path("/Users/arnavchokshi/Desktop/sway_test/.cursor/debug-e27782.log")
+
+            def _dbg_emit(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+                if not _dbg_enabled:
+                    return
+                try:
+                    _dbg_payload = {
+                        "sessionId": "e27782",
+                        "runId": _dbg_run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                    with _dbg_log_path.open("a", encoding="utf-8") as _dbg_f:
+                        _dbg_f.write(json.dumps(_dbg_payload, separators=(",", ":")) + "\n")
+                except Exception:
+                    pass
+
+            # #region agent log
+            _dbg_emit(
+                "H1",
+                "main.py:1490",
+                "phase2_loop_start",
+                {
+                    "totalFrames": int(total_frames),
+                    "detStride": int(_ft_det_stride),
+                    "progressEvery": int(_ft_progress_every),
+                    "debugInterval": int(_dbg_interval),
+                    "moteEnabled": bool(_mote is not None),
+                    "sentinelEnabled": bool(_sentinel is not None),
+                    "umotEnabled": bool(_umot is not None),
+                    "coiEnabled": bool(_ft_coi is not None),
+                    "trackerEngine": str(_ft_engine),
+                },
+            )
+            # #endregion
+            _ft_t0 = time.time()
+            fidx = 0
+            while True:
+                _frame_t0 = time.time()
+                _emit_frame_debug = fidx == 0 or (fidx % _dbg_interval == 0)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if total_frames > 0 and (fidx == 0 or fidx % _ft_progress_every == 0):
+                    _elapsed = max(1e-6, time.time() - _ft_t0)
+                    _fps_eff = (fidx + 1) / _elapsed
+                    _eta_s = max(0.0, (total_frames - (fidx + 1)) / max(_fps_eff, 1e-6))
+                    _pct = (100.0 * (fidx + 1)) / total_frames
+                    print(
+                        f"  [progress] Phase 2 frame {fidx + 1}/{total_frames} "
+                        f"({_pct:.1f}%) | { _fps_eff:.2f} fps | ETA ~{_eta_s/60.0:.1f} min",
+                        flush=True,
+                    )
+                # Detect on every Nth frame or first frame
+                dets = None
+                _det_ms = 0.0
+                if fidx == 0 or fidx % _ft_det_stride == 0:
+                    _det_t0 = time.time()
+                    dets = _ft_detect_frame(frame, fidx)
+                    _det_ms = (time.time() - _det_t0) * 1000.0
+                    if _emit_frame_debug or _det_ms >= _dbg_slow_frame_ms:
+                        # #region agent log
+                        _dbg_emit(
+                            "H2",
+                            "main.py:1549",
+                            "detector_timing",
+                            {
+                                "frameIdx": int(fidx),
+                                "detMs": round(_det_ms, 2),
+                                "detections": int(len(dets) if dets is not None else 0),
+                            },
+                        )
+                        # #endregion
+                _trk_t0 = time.time()
+                results = _ft_tracker.process_frame(frame, fidx, detections=dets)
+                _trk_ms = (time.time() - _trk_t0) * 1000.0
+                if _emit_frame_debug or _trk_ms >= _dbg_slow_frame_ms:
+                    # #region agent log
+                    _dbg_emit(
+                        "H3",
+                        "main.py:1563",
+                        "tracker_timing",
+                        {
+                            "frameIdx": int(fidx),
+                            "trackerMs": round(_trk_ms, 2),
+                            "resultCount": int(len(results)),
+                            "hadDetectionsInput": bool(dets is not None),
+                        },
+                    )
+                    # #endregion
+
+                _curr_track_states: Dict[int, TrackState] = {}
+                _curr_track_centers: Dict[int, Tuple[float, float]] = {}
+                _curr_result_ids = {r.track_id for r in results}
+
+                _mods_t0 = time.time()
+                # MOTE wiring: compute flow + predict dormant re-emergence + boost confidence on match.
+                if _mote is not None:
+                    flow = _mote.compute_flow(frame)
+                    if flow is not None:
+                        dormant_prev = {
+                            tid: _prev_track_centers[tid]
+                            for tid, st in _prev_track_states.items()
+                            if st == TrackState.DORMANT and tid in _prev_track_centers
+                        }
+                        if dormant_prev:
+                            _mote_predictions = _mote.predict_reemergence(flow, dormant_prev)
+                    for r in results:
+                        x1, y1, x2, y2 = [float(v) for v in r.bbox_xyxy.tolist()]
+                        cx = 0.5 * (x1 + x2)
+                        cy = 0.5 * (y1 + y2)
+                        if r.track_id in _mote_predictions:
+                            boost = _mote.match_prediction(_mote_predictions[r.track_id], (cx, cy))
+                            if boost > 0:
+                                r.confidence = float(min(1.0, r.confidence + boost))
+                                _mote_reemergence_hits += 1
+                                _mote_reemergence_boost_sum += float(boost)
+                            _mote_predictions.pop(r.track_id, None)
+
+                # Sentinel wiring: maintain survival records and grace handling.
+                if _sentinel is not None:
+                    for tid in _prev_result_ids - _curr_result_ids:
+                        _sentinel.tick_grace(tid)
+                    weak_floor = _sentinel.get_weak_det_threshold()
+                    for r in results:
+                        _sentinel.update_confidence(r.track_id, float(r.confidence))
+                        if _sentinel.should_grant_grace(r.track_id, float(r.confidence), _sentinel_normal_conf):
+                            if not _sentinel.is_in_grace(r.track_id):
+                                _sentinel.enter_grace(r.track_id, fidx)
+                                _sentinel_grace_entries += 1
+                            if r.confidence < _sentinel_normal_conf:
+                                r.confidence = float(max(r.confidence, weak_floor))
+                                _sentinel_weak_accepts += 1
+                        elif _sentinel.is_in_grace(r.track_id) and r.confidence >= _sentinel_normal_conf:
+                            _sentinel.exit_grace(r.track_id)
+
+                # UMOT wiring: record trajectory history and query dormant bank on fresh tracks.
+                if _umot is not None:
+                    for tid in _prev_result_ids - _curr_result_ids:
+                        _umot.mark_lost(tid)
+                    for r in results:
+                        x1, y1, x2, y2 = [float(v) for v in r.bbox_xyxy.tolist()]
+                        cx = 0.5 * (x1 + x2)
+                        cy = 0.5 * (y1 + y2)
+                        bw = max(1.0, x2 - x1)
+                        bh = max(1.0, y2 - y1)
+                        emb = np.array(
+                            [
+                                cx / max(1.0, float(frame_width)),
+                                cy / max(1.0, float(frame_height)),
+                                bw / max(1.0, float(frame_width)),
+                                bh / max(1.0, float(frame_height)),
+                            ],
+                            dtype=np.float32,
+                        )
+                        emb_norm = float(np.linalg.norm(emb))
+                        if emb_norm > 1e-6:
+                            emb = emb / emb_norm
+                        if r.track_id not in _prev_result_ids:
+                            _hit = _umot.query(emb, (cx, cy), fidx)
+                            if _hit is not None and _hit != r.track_id:
+                                _umot_query_hits += 1
+                        _umot.record(r.track_id, fidx, cx, cy, embedding=emb)
+                    if fidx % 60 == 0:
+                        _umot_pruned += int(_umot.prune(fidx))
+
+                # COI: check for collisions
+                if _ft_coi is not None and results:
+                    masks_dict = {r.track_id: r.mask for r in results if r.mask is not None}
+                    logits_dict = _ft_tracker.get_logit_scores()
+                    for tid, logit in logits_dict.items():
+                        _ft_coi.update_logits(tid, logit)
+                    actions = _ft_coi.check_collisions(masks_dict, logits_dict, fidx)
+                    for action in actions:
+                        if action.mode == "delete":
+                            _ft_tracker.remove_memory_entries(action.track_id, action.start_frame, fidx)
+                        elif action.mode == "freeze":
+                            _ft_tracker.freeze_memory(action.track_id)
+                        if hasattr(_ft_detector, "request_detr_next_frame"):
+                            try:
+                                _ft_detector.request_detr_next_frame()
+                            except Exception:
+                                pass
+                _mods_ms = (time.time() - _mods_t0) * 1000.0
+
+                for r in results:
+                    r.confidence = scale_probability(float(r.confidence), _temp_scaler)
+                    x1, y1, x2, y2 = [float(v) for v in r.bbox_xyxy.tolist()]
+                    _curr_track_states[r.track_id] = r.state
+                    _curr_track_centers[r.track_id] = (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+
+                # Pose-gated EMA wiring (uses track state + isolation geometry to compute update alpha).
+                if results:
+                    _all_bboxes = [r.bbox_xyxy.astype(np.float32) for r in results]
+                    for r in results:
+                        _kp_conf = np.array([float(r.confidence)] * 17, dtype=np.float32)
+                        _alpha = _ema_manager.compute_alpha(
+                            dancer_bbox=r.bbox_xyxy.astype(np.float32),
+                            all_bboxes=_all_bboxes,
+                            keypoint_confidences=_kp_conf,
+                            track_state=r.state,
+                        )
+                        if float(r.confidence) < _uncertain_conf:
+                            _alpha *= 0.5
+                        _ema_samples += 1
+                        if _alpha > 0.0:
+                            _ema_nonzero += 1
+
+                # Collision solver wiring (coalescence detect + exit assignment solving).
+                if results:
+                    _bbox_map = {
+                        r.track_id: r.bbox_xyxy.astype(np.float32)
+                        for r in results
+                    }
+                    _new_events = _coalescence_detector.check(_bbox_map, fidx, galleries=None)
+                    _collision_events += int(len(_new_events))
+                    _exit_events = _coalescence_detector.check_exits(_bbox_map, fidx)
+                    _collision_exits += int(len(_exit_events))
+                    for _ev in _exit_events:
+                        _exit_ids = [tid for tid in _ev.track_ids if tid in _bbox_map]
+                        if not _exit_ids:
+                            _exit_ids = list(_bbox_map.keys())
+                        _exit_queries: List[ReIDQuery] = []
+                        for _tid in _exit_ids:
+                            _bb = _bbox_map[_tid]
+                            _exit_queries.append(
+                                ReIDQuery(
+                                    track_id=int(_tid),
+                                    spatial_position=(
+                                        float((_bb[0] + _bb[2]) * 0.5),
+                                        float((_bb[1] + _bb[3]) * 0.5),
+                                    ),
+                                )
+                            )
+                        _pairs = solve_collision(
+                            _ev,
+                            exit_embeddings=_exit_queries,
+                            exit_track_ids=_exit_ids,
+                            fusion_engine=_fusion_engine,
+                            solver=_collision_solver,
+                        )
+                        _collision_assignments += int(len(_pairs))
+
+                _ft_results_by_frame[fidx] = results
+                _prev_result_ids = _curr_result_ids
+                _prev_track_states = _curr_track_states
+                _prev_track_centers = _curr_track_centers
+
+                if _track_lab_cb and fidx % 10 == 0:
+                    _track_lab_cb(fidx, fidx + 1, len(results))
+
+                _frame_ms = (time.time() - _frame_t0) * 1000.0
+                if _emit_frame_debug or _frame_ms >= _dbg_slow_frame_ms:
+                    # #region agent log
+                    _dbg_emit(
+                        "H4",
+                        "main.py:1678",
+                        "frame_pipeline_timing",
+                        {
+                            "frameIdx": int(fidx),
+                            "frameMs": round(_frame_ms, 2),
+                            "detMs": round(_det_ms, 2),
+                            "trackerMs": round(_trk_ms, 2),
+                            "optionalModsMs": round(_mods_ms, 2),
+                            "resultCount": int(len(results)),
+                            "prevResultCount": int(len(_prev_result_ids)),
+                        },
+                    )
+                    # #endregion
+
+                fidx += 1
+
+            cap.release()
+            total_frames = fidx
+
+            # Convert to raw_tracks format
+            raw_pre = _future_tracker_to_raw_tracks(_ft_results_by_frame, total_frames)
+            dt_track = time.time() - t0
+            print("  └─ Phases 1–2 (future pipeline): %.1fs (%d raw tracks)" % (dt_track, len(raw_pre)), flush=True)
+            log_resource_usage("1-2-detection-tracking-future")
+            phase_dbg.log("1-2", dt_track, {"raw_track_count": len(raw_pre), "tracker_engine": _ft_engine})
+            _mote_details = ""
+            if _mote_requested:
+                _mote_details = "flow_model=%s, matches=%d, boost_sum=%.3f" % (
+                    _adv_extras.get("mote_flow_model", "raft_small"),
+                    _mote_reemergence_hits,
+                    _mote_reemergence_boost_sum,
+                )
+            _log_feature_state("MOTE", requested=_mote_requested, active=_mote_requested, wired=True, details=_mote_details)
+
+            _sentinel_details = ""
+            if _sentinel_requested:
+                _sentinel_details = "grace_entries=%d, weak_accepts=%d" % (
+                    _sentinel_grace_entries,
+                    _sentinel_weak_accepts,
+                )
+            _log_feature_state("SentinelSBM", requested=_sentinel_requested, active=_sentinel_requested, wired=True, details=_sentinel_details)
+
+            _umot_details = ""
+            if _umot_requested:
+                _umot_details = "query_hits=%d, pruned=%d" % (_umot_query_hits, _umot_pruned)
+            _log_feature_state("UMOTBacktracker", requested=_umot_requested, active=_umot_requested, wired=True, details=_umot_details)
+
+            _hybrid_requested = os.environ.get("SWAY_DETECTOR_HYBRID", "0").strip().lower() in ("1", "true", "yes", "on")
+            _hybrid_active = _hybrid_requested and (
+                _ft_detector_source_counts.get("detr", 0) > 0 or hasattr(_ft_detector, "request_detr_next_frame")
+            )
+            _hybrid_details = "source_counts=%s" % _ft_detector_source_counts
+            _log_feature_state("HybridDetector", requested=_hybrid_requested, active=_hybrid_active, wired=True, details=_hybrid_details)
+
+            _ema_requested = True
+            _ema_active = _ema_samples > 0
+            _ema_details = "samples=%d, nonzero_alpha=%d" % (_ema_samples, _ema_nonzero)
+            _log_feature_state("PoseGatedEMA", requested=_ema_requested, active=_ema_active, wired=True, details=_ema_details)
+
+            _collision_requested = _collision_solver in ("greedy", "hungarian", "dp")
+            _collision_active = (_collision_events + _collision_exits) > 0
+            _collision_details = "solver=%s, events=%d, exits=%d, assignments=%d" % (
+                _collision_solver,
+                _collision_events,
+                _collision_exits,
+                _collision_assignments,
+            )
+            _log_feature_state("CollisionSolver", requested=_collision_requested, active=_collision_active, wired=True, details=_collision_details)
+
+            # Optional backward pass (PLAN_16)
+            _backward_enabled = (
+                is_future_backward_enabled()
+                and os.environ.get("SWAY_BACKWARD_PASS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+            )
+            _log_feature_state("BackwardPass", requested=_backward_enabled, active=_backward_enabled, wired=True)
+            if _backward_enabled:
+                t0_bwd = time.time()
+                print("  [backward] Running reverse-video tracking pass…", flush=True)
+                _fwd_tracks = [
+                    ForwardTrack(
+                        track_id=tid,
+                        dancer_id=tid,
+                        start_frame=min(obs.frame_idx for obs in observations),
+                        end_frame=max(obs.frame_idx for obs in observations),
+                        embeddings=ReIDQuery(track_id=tid),
+                        is_dormant=(max(obs.frame_idx for obs in observations) < total_frames - 30),
+                    )
+                    for tid, observations in raw_pre.items()
+                ]
+                _rev_tracks = run_backward_pass(
+                    str(video_path),
+                    _fwd_tracks,
+                    tracker_factory=create_tracker_engine,
+                    detector=_ft_detector,
+                    device=_ft_device,
+                )
+                _merged = stitch_forward_reverse(_fwd_tracks, _rev_tracks, fusion_engine=_fusion_engine)
+                dt_bwd = time.time() - t0_bwd
+                _n_stitched = sum(1 for m in _merged if m.reverse_track_id is not None)
+                print("  [backward] %.1fs — %d merged tracks (%d with gap fill)" % (dt_bwd, len(_merged), _n_stitched), flush=True)
+                phase_dbg.log("backward_pass", dt_bwd, {"merged": len(_merged), "stitched": _n_stitched})
+
+            # Optional collision solver (PLAN_15)
+            if _collision_solver != "greedy":
+                print("  [collision] Solver: %s" % _collision_solver, flush=True)
+
+            # Per-frame boxes for phase preview MP4 (future pipeline path)
+            phase1_dets_by_frame = _phase1_dets_from_future_frame_results(_ft_results_by_frame)
+
+            if _stop_b == "after_phase_2":
+                raw_tracks = raw_pre
+                dt_stitch = 0.0
+                save_after_phase_2(
+                    _ck_dir("after_phase_2"),
+                    raw_pre,
+                    total_frames=total_frames,
+                    native_fps=native_fps,
+                    output_fps=output_fps,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    ystride=ystride,
+                    hybrid_sam_stats=hybrid_sam_stats,
+                    video_path=video_path,
+                    params_path=params_path,
+                    phase1_dets_by_frame=phase1_dets_by_frame,
+                )
+                print(f"Checkpoint written: {_ck_dir('after_phase_2')}", flush=True)
+                phase2_checkpoint_stop_pending = True
+            else:
+                # Phase 3: Post-track stitching (same as old pipeline)
+                _run_phase3_stitch()
+                phase_dbg.log("3", dt_stitch, {"track_count": len(raw_tracks)})
+
+                if _stop_b == "after_phase_3":
+                    save_after_phase_3(
+                        _ck_dir("after_phase_3"),
+                        raw_tracks,
+                        total_frames=total_frames,
+                        native_fps=native_fps,
+                        output_fps=output_fps,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        ystride=ystride,
+                        hybrid_sam_stats=hybrid_sam_stats,
+                        video_path=video_path,
+                        params_path=params_path,
+                    )
+                    print("Checkpoint written: %s" % _ck_dir("after_phase_3"), flush=True)
+                    phase3_checkpoint_stop_pending = True
+
+        elif _stop_b == "after_phase_1":
             if not _use_boxmot():
                 raise SystemExit(
                     "--stop-after-boundary after_phase_1 requires the BoxMOT path (default). "
@@ -1370,104 +2158,127 @@ def main():
                 )
             return
 
-        print("\n[1/11] Phase 1 — Detection (YOLO)")
-        _p2_track_msg = (
-            "[2/11] Phase 2 — Tracking (BoxMOT ByteTrack; hybrid SAM off — fast preview path)"
-            if boxmot_tracker_kind_from_env() == "bytetrack"
-            else "[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT, optional track-time OSNet; hybrid SAM when enabled)"
-        )
-        print(_p2_track_msg)
-        print("  (Single pass over the video: detection and association per frame.)")
-        t0 = time.time()
-        (
-            raw_pre,
-            total_frames,
-            output_fps,
-            _frames_list,
-            native_fps,
-            frame_width,
-            frame_height,
-            ystride,
-            hybrid_sam_stats,
-            phase1_dets_by_frame,
-            phase1_pre_classical_by_frame,
-        ) = run_tracking_before_post_stitch(str(video_path), lab_on_infer=_track_lab_cb)
-        if bidirectional_track_pass_enabled():
-            t_bi = time.time()
-            print(
-                "  Optional bidirectional pass: SWAY_BIDIRECTIONAL_TRACK_PASS=1 "
-                "(reverse video + second track, then merge; ~2× Phase 1–2 time)…",
-                flush=True,
+        else:
+            print("\n[1/11] Phase 1 — Detection (YOLO)")
+            _p2_track_msg = (
+                "[2/11] Phase 2 — Tracking (BoxMOT ByteTrack; hybrid SAM off — fast preview path)"
+                if boxmot_tracker_kind_from_env() == "bytetrack"
+                else "[2/11] Phase 2 — Tracking (BoxMOT Deep OC-SORT, optional track-time OSNet; hybrid SAM when enabled)"
             )
-            rev_path = output_dir / ".sway_bidirectional_rev_input.mp4"
-            try:
-                reverse_video_via_ffmpeg(video_path.resolve(), rev_path)
-                (
-                    raw_rev,
-                    tf_rev,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    ys_rev,
-                    hybrid_rev,
-                    _phase1_rev,
-                    _phase1_pre_rev,
-                ) = run_tracking_before_post_stitch(str(rev_path), lab_on_infer=_track_lab_cb)
-                hybrid_sam_stats = _merge_hybrid_sam_stats(hybrid_sam_stats, hybrid_rev)
-                if tf_rev != total_frames or int(ys_rev) != int(ystride):
-                    print(
-                        f"  Warning: reverse tracking shape mismatch "
-                        f"(frames {tf_rev} vs {total_frames}, stride {ys_rev} vs {ystride}); skipping merge.",
-                        flush=True,
-                    )
-                else:
-                    rev_mapped = remap_reverse_pass_timeline(raw_rev, total_frames)
-                    iou_t = bidirectional_iou_threshold()
-                    min_m = bidirectional_min_match_frames()
-                    n_before = len(raw_pre)
-                    raw_pre = merge_forward_backward_tracks(
-                        raw_pre,
-                        rev_mapped,
-                        iou_threshold=iou_t,
-                        min_match_frames=min_m,
-                    )
-                    print(
-                        f"  └─ Bidirectional merge: {n_before} → {len(raw_pre)} raw tracks "
-                        f"(IoU≥{iou_t}, ≥{min_m} matched frames); +{time.time() - t_bi:.1f}s",
-                        flush=True,
-                    )
-            except Exception as ex:
-                print(f"  Warning: bidirectional pass skipped ({ex})", flush=True)
-            finally:
+            print(_p2_track_msg)
+            print("  (Single pass over the video: detection and association per frame.)")
+            t0 = time.time()
+            (
+                raw_pre,
+                total_frames,
+                output_fps,
+                _frames_list,
+                native_fps,
+                frame_width,
+                frame_height,
+                ystride,
+                hybrid_sam_stats,
+                phase1_dets_by_frame,
+                phase1_pre_classical_by_frame,
+            ) = run_tracking_before_post_stitch(str(video_path), lab_on_infer=_track_lab_cb)
+            if bidirectional_track_pass_enabled():
+                t_bi = time.time()
+                print(
+                    "  Optional bidirectional pass: SWAY_BIDIRECTIONAL_TRACK_PASS=1 "
+                    "(reverse video + second track, then merge; ~2× Phase 1–2 time)…",
+                    flush=True,
+                )
+                rev_path = output_dir / ".sway_bidirectional_rev_input.mp4"
                 try:
-                    rev_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        dt_track = time.time() - t0
-        print(f"  └─ Phases 1–2: {dt_track:.1f}s")
-        log_resource_usage("1-2-detection-tracking")
-        phase_dbg.log("1-2", dt_track, {"raw_track_count": len(raw_pre)})
-        _run_phase3_stitch()
-        phase_dbg.log("3", dt_stitch, {"track_count": len(raw_tracks)})
-        if _stop_b == "after_phase_3":
-            save_after_phase_3(
-                _ck_dir("after_phase_3"),
-                raw_tracks,
-                total_frames=total_frames,
-                native_fps=native_fps,
-                output_fps=output_fps,
-                frame_width=frame_width,
-                frame_height=frame_height,
-                ystride=ystride,
-                hybrid_sam_stats=hybrid_sam_stats,
-                video_path=video_path,
-                params_path=params_path,
-            )
-            print(f"Checkpoint written: {_ck_dir('after_phase_3')}", flush=True)
-            phase3_checkpoint_stop_pending = True
+                    reverse_video_via_ffmpeg(video_path.resolve(), rev_path)
+                    (
+                        raw_rev,
+                        tf_rev,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        ys_rev,
+                        hybrid_rev,
+                        _phase1_rev,
+                        _phase1_pre_rev,
+                    ) = run_tracking_before_post_stitch(str(rev_path), lab_on_infer=_track_lab_cb)
+                    hybrid_sam_stats = _merge_hybrid_sam_stats(hybrid_sam_stats, hybrid_rev)
+                    if tf_rev != total_frames or int(ys_rev) != int(ystride):
+                        print(
+                            f"  Warning: reverse tracking shape mismatch "
+                            f"(frames {tf_rev} vs {total_frames}, stride {ys_rev} vs {ystride}); skipping merge.",
+                            flush=True,
+                        )
+                    else:
+                        rev_mapped = remap_reverse_pass_timeline(raw_rev, total_frames)
+                        iou_t = bidirectional_iou_threshold()
+                        min_m = bidirectional_min_match_frames()
+                        n_before = len(raw_pre)
+                        raw_pre = merge_forward_backward_tracks(
+                            raw_pre,
+                            rev_mapped,
+                            iou_threshold=iou_t,
+                            min_match_frames=min_m,
+                        )
+                        print(
+                            f"  └─ Bidirectional merge: {n_before} → {len(raw_pre)} raw tracks "
+                            f"(IoU≥{iou_t}, ≥{min_m} matched frames); +{time.time() - t_bi:.1f}s",
+                            flush=True,
+                        )
+                except Exception as ex:
+                    print(f"  Warning: bidirectional pass skipped ({ex})", flush=True)
+                finally:
+                    try:
+                        rev_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            dt_track = time.time() - t0
+            print(f"  └─ Phases 1–2: {dt_track:.1f}s")
+            log_resource_usage("1-2-detection-tracking")
+            phase_dbg.log("1-2", dt_track, {"raw_track_count": len(raw_pre)})
+            if _stop_b == "after_phase_2":
+                raw_tracks = raw_pre
+                dt_stitch = 0.0
+                save_after_phase_2(
+                    _ck_dir("after_phase_2"),
+                    raw_pre,
+                    total_frames=total_frames,
+                    native_fps=native_fps,
+                    output_fps=output_fps,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    ystride=ystride,
+                    hybrid_sam_stats=hybrid_sam_stats,
+                    video_path=video_path,
+                    params_path=params_path,
+                    phase1_dets_by_frame=phase1_dets_by_frame,
+                    phase1_pre_classical_by_frame=phase1_pre_classical_by_frame,
+                )
+                print(f"Checkpoint written: {_ck_dir('after_phase_2')}", flush=True)
+                phase2_checkpoint_stop_pending = True
+            else:
+                _run_phase3_stitch()
+                phase_dbg.log("3", dt_stitch, {"track_count": len(raw_tracks)})
+                if _stop_b == "after_phase_3":
+                    save_after_phase_3(
+                        _ck_dir("after_phase_3"),
+                        raw_tracks,
+                        total_frames=total_frames,
+                        native_fps=native_fps,
+                        output_fps=output_fps,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        ystride=ystride,
+                        hybrid_sam_stats=hybrid_sam_stats,
+                        video_path=video_path,
+                        params_path=params_path,
+                    )
+                    print(f"Checkpoint written: {_ck_dir('after_phase_3')}", flush=True)
+                    phase3_checkpoint_stop_pending = True
 
+    phase2_ck_preview_relpath: Optional[str] = None
     phase3_ck_preview_relpath: Optional[str] = None
     if start_marker not in (5, 6, 9):
         _lab_update_context(
@@ -1545,6 +2356,11 @@ def main():
                 for i, t in enumerate(all_tracking)
             ]
             p1 = clip_dir / "01_tracks_post_stitch.mp4"
+            _tracks_caption = (
+                "After detection & tracking only (post-track stitch skipped — after_phase_2)"
+                if phase2_checkpoint_stop_pending
+                else "After detection, tracking, and post-track stitching"
+            )
             montage_clips.append(render_phase_clip(
                 video_path, all_fd, "Phases 1–3: Tracks",
                 lambda f, d: draw_tracks_post_stitch_preview(
@@ -1556,7 +2372,7 @@ def main():
                     segmentation_masks=d.get("segmentation_masks"),
                 ),
                 native_fps, output_fps, p1,
-                caption="After detection, tracking, and post-track stitching",
+                caption=_tracks_caption,
                 full_length=True,
                 show_title_card=False,
             ))
@@ -1566,10 +2382,15 @@ def main():
                 "track_count": len(raw_tracks),
             }
             _lab_progress(1, "phases_1_2", "Phases 1–2: Detection & tracking", elapsed_s=dt_track, extra=_lab_extra_early)
+            _ph3_lab_msg = (
+                "Phase 3: skipped (after_phase_2 boundary)"
+                if phase2_checkpoint_stop_pending
+                else "Phase 3: Post-track stitching"
+            )
             _lab_progress(
                 2,
                 "phase3_post_stitch",
-                "Phase 3: Post-track stitching",
+                _ph3_lab_msg,
                 elapsed_s=dt_stitch,
                 preview_relpath=prv,
                 extra={**_lab_extra_early, "phase": "post_track_stitch"},
@@ -1578,6 +2399,8 @@ def main():
                 _lab_register_preview("tracks_post_stitch", prv)
             if phase3_checkpoint_stop_pending and prv:
                 phase3_ck_preview_relpath = prv
+            elif phase2_checkpoint_stop_pending and prv0:
+                phase2_ck_preview_relpath = prv0
         else:
             _lab_progress(1, "phases_1_2", "Phases 1–2: Detection & tracking", elapsed_s=dt_track)
             _lab_progress(2, "phase3_post_stitch", "Phase 3: Post-track stitching", elapsed_s=dt_stitch)
@@ -1596,6 +2419,35 @@ def main():
         write_track_stats_json(ts_path, stats)
         print(f"  Track stats written: {ts_path}", flush=True)
         _lab_update_context(track_stats_path=str(ts_path.name))
+
+    if phase2_checkpoint_stop_pending:
+        dj = build_phase3_tracking_data_json(
+            video_path=str(video_path),
+            raw_tracks=raw_tracks,
+            total_frames=int(total_frames),
+            native_fps=float(native_fps),
+            output_fps=float(output_fps),
+        )
+        data_path = output_dir / "data.json"
+        data_path.write_text(json.dumps(dj, separators=(",", ":")), encoding="utf-8")
+        print(f"  Tracking-only data.json written: {data_path}", flush=True)
+        _lab_update_context(
+            checkpoint_boundary="after_phase_2",
+            vitpose_model_id="(not loaded — stopped before post-track stitch)",
+            pipeline_diagnostics=_build_pipeline_diagnostics(hybrid_sam_stats, args, params),
+        )
+        rel2 = phase2_ck_preview_relpath or ""
+        _lab_write_manifest(
+            video_path=video_path,
+            output_dir=output_dir,
+            args=args,
+            params=params,
+            model_id="checkpoint_after_phase_2",
+            total_elapsed=time.time() - total_start,
+            final_video_relpath=rel2,
+            view_variants={"full": rel2} if rel2 else {},
+        )
+        return
 
     if phase3_checkpoint_stop_pending:
         dj = build_phase3_tracking_data_json(
@@ -1855,6 +2707,16 @@ def main():
                 "and each ViTPose processor/model/post step.",
                 flush=True,
             )
+
+        # Optional mask-guided pose wrapper (PLAN_17)
+        _mask_guided_raw = os.environ.get("SWAY_POSE_MASK_GUIDED", "").strip().lower()
+        _sam2_mask_pose_raw = os.environ.get("SWAY_SAM2_MASK_POSE", "").strip().lower()
+        _mask_guided = _mask_guided_raw in ("1", "true", "yes")
+        if not _mask_guided and _sam2_mask_pose_raw in ("1", "true", "yes"):
+            _mask_guided = True
+        _mask_guided_estimator = MaskGuidedPoseEstimator(pose_estimator=pose_estimator) if _mask_guided else None
+        if _mask_guided:
+            print("  [mask_guided_pose] Mask-guided pose estimation enabled (PLAN_17)", flush=True)
 
         raw_poses_by_frame = [{} for _ in range(total_frames)]
         embeddings_by_frame = [{} for _ in range(total_frames)]  # V3.8: Appearance for Re-ID
@@ -2876,6 +3738,11 @@ def main():
         try:
             from sway.depth_stage import collect_strided_depth_series, get_depth_array
             from sway.pose_lift_3d import export_3d_for_viewer, lift_poses_to_3d
+            # Check for MotionBERT backend (PLAN_18)
+            _lift_backend = os.environ.get("SWAY_LIFT_BACKEND", "motionagformer").strip().lower()
+            if _lift_backend == "motionbert":
+                from sway.motionbert_lifter import MotionBERTLifter
+                print("  [3D Lift] Using MotionBERT backend (PLAN_18)", flush=True)
             from sway.video_camera_probe import probe_intrinsics_from_video
 
             video_camera = probe_intrinsics_from_video(
@@ -2985,6 +3852,39 @@ def main():
             fd["deviations"] = scoring_data["deviations"][i]
             fd["shape_errors"] = scoring_data.get("shape_errors", [{} for _ in all_frame_data])[i]
             fd["timing_errors"] = scoring_data.get("timing_errors", [{} for _ in all_frame_data])[i]
+
+    # Optional critique engine (PLAN_19)
+    critique_results = []
+    _critique_dims = os.environ.get("SWAY_CRITIQUE_DIMENSIONS", "").strip()
+    if _critique_dims:
+        try:
+            critique = CritiqueEngine(fps=float(output_fps))
+            _crit_kp2d = {}
+            _crit_kp3d = {}
+            _crit_states = {}
+            for fd in all_frame_data:
+                for tid, pose in fd.get("poses", {}).items():
+                    if tid not in _crit_kp2d:
+                        _crit_kp2d[tid] = []
+                        _crit_kp3d[tid] = []
+                        _crit_states[tid] = []
+                    _crit_kp2d[tid].append(_keypoints_to_critique17x3(pose.get("keypoints")))
+                    _kp3d = pose.get("keypoints_3d")
+                    _crit_kp3d[tid].append(_keypoints_to_critique17x3(_kp3d) if _kp3d is not None else np.zeros((17, 3), dtype=np.float32))
+                    _crit_states[tid].append(int(TrackState.ACTIVE))
+            _crit_kp2d_arr = {tid: np.stack(frames) for tid, frames in _crit_kp2d.items() if frames}
+            _crit_kp3d_arr = {tid: np.stack(frames) for tid, frames in _crit_kp3d.items() if frames}
+            _crit_states_arr = {tid: np.asarray(frames, dtype=np.int32) for tid, frames in _crit_states.items() if frames}
+            critique_results = critique.analyze(
+                keypoints_2d=_crit_kp2d_arr,
+                keypoints_3d=_crit_kp3d_arr,
+                track_states=_crit_states_arr,
+                audio_path=str(video_path),
+            )
+            print("  [critique] Analyzed %d dancers across %d dimensions" %
+                  (len(critique_results), len(critique.dimensions)), flush=True)
+        except Exception as _crit_ex:
+            print("  [critique] Skipped: %s" % _crit_ex, flush=True)
 
     dt_score = time.time() - t0
     print(f"  └─ {dt_score:.1f}s")

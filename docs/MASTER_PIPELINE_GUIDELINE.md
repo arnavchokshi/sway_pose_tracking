@@ -1042,4 +1042,31 @@ Not exposed as YAML today: `CONFIDENCE_THRESHOLD`, `RIPPLE_STD_THRESHOLD`, `CONS
 
 ---
 
+---
+
+## 28. Future Pipeline Keys (cross-reference)
+
+The following `SWAY_*` keys are defined in `docs/Future_Plans/FUTURE_PIPELINE.md` and
+are now fully wired in runtime code, `pipeline_config_schema.py`, and the sweep system.
+They are **not part of the current production pipeline** but are available for testing
+and sweep exploration. See `FUTURE_PIPELINE.md` §14 for the full supported/optional model table.
+
+| Key | Default | Runtime module | Schema | Notes |
+|-----|---------|----------------|--------|-------|
+| `SWAY_TRACK_PARTIAL_MASK_FRAC` | `0.30` | `track_state.py` | ✓ | Alias for `SWAY_STATE_PARTIAL_MASK_FRAC` |
+| `SWAY_TRACK_DORMANT_MASK_FRAC` | `0.05` | `track_state.py` | ✓ | Alias for `SWAY_STATE_DORMANT_MASK_FRAC` |
+| `SWAY_TRACK_MAX_AGE` | `200` | `tracker.py` | ✓ | Alias for `SWAY_BOXMOT_MAX_AGE` |
+| `SWAY_BACKWARD_COI_ENABLED` | `1` | `backward_pass.py` | ✓ | LOCKED ON |
+| `SWAY_COLLISION_DP_MAX_PERMUTATIONS` | `120` | `collision_solver.py` | ✓ | Cap DP at 5! |
+| `SWAY_DETECTION_UNCERTAIN_CONF` | `0.50` | `hybrid_detector.py` | ✓ | |
+| `SWAY_ENROLLMENT_GALLERY_SIGNALS` | `part,color,spatial` | `enrollment.py` | ✓ | |
+| `SWAY_ENROLLMENT_PART_MODEL` | `bpbreid` | `enrollment.py` | ✓ | |
+| `SWAY_POSE_KEYPOINT_SET` | `coco17` | `mask_guided_pose.py` | ✓ | |
+| `SWAY_POSE_SMART_PAD` | `1` | `mask_guided_pose.py` | ✓ | LOCKED ON |
+| `SWAY_POSE_VISIBILITY_THRESHOLD` | `0.30` | `mask_guided_pose.py` | ✓ | |
+
+Automated parity enforcement: `python -m pytest tests/test_MASTER_suite.py -k "DocCodeParity or SchemaContainsFutureKeys or RuntimeEnvResolution or ModelFactoryGracefulFallback or SweepWiring" -v`.
+
+---
+
 *After large refactors, reconcile §1–§20 against `main.py` and cited modules. Section §21 must stay aligned with `PIPELINE_PARAM_FIELDS` and with `CONFIG_STAGE_SCHEMA_PHASES` in `pipeline_lab/web/src/lib/configPageUi.ts` (intent-stage ↔ schema `phase` map).*

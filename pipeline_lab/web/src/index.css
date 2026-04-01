@@ -2505,8 +2505,11 @@ p.sub {
     font-size: 0.76rem;
   }
 
-  .optuna-table th,
   .optuna-table td {
+    padding: 0.4rem 0.45rem;
+  }
+
+  .optuna-table-sort-btn {
     padding: 0.4rem 0.45rem;
   }
 }
@@ -2517,13 +2520,43 @@ p.sub {
 }
 .optuna-table th {
   text-align: left;
-  padding: 0.5rem 0.65rem;
+  padding: 0;
   color: var(--text-muted);
   font-weight: 600;
   border-bottom: 1px solid var(--glass-border);
   position: sticky;
   top: 0;
   background: rgba(24, 24, 27, 0.92);
+}
+.optuna-table-th--sortable {
+  vertical-align: bottom;
+}
+.optuna-table-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.5rem 0.65rem;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-sm, 4px);
+}
+.optuna-table-sort-btn:hover {
+  color: var(--text, #e4e4e7);
+  background: rgba(255, 255, 255, 0.04);
+}
+.optuna-table-th--sorted .optuna-table-sort-btn {
+  color: var(--text, #e4e4e7);
+}
+.optuna-table-sort-icon {
+  font-size: 0.75em;
+  opacity: 0.85;
 }
 .optuna-table td {
   padding: 0.45rem 0.65rem;
@@ -3387,6 +3420,33 @@ p.sub {
   flex-wrap: wrap;
   justify-content: flex-end;
 }
+.optuna-chart-toolbar-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #64748b;
+  user-select: none;
+}
+.optuna-chart-toolbar--duration-param {
+  gap: 0.45rem;
+}
+.optuna-chart-toggle-btn--labeled {
+  gap: 0.35rem;
+  padding: 0.35rem 0.65rem;
+}
+.optuna-chart-toggle-text {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+@media (max-width: 520px) {
+  .optuna-chart-toggle-text {
+    display: none;
+  }
+  .optuna-chart-toggle-btn--labeled {
+    padding: 0.35rem 0.5rem;
+  }
+}
 .optuna-chart-check {
   display: inline-flex;
   align-items: center;
@@ -3432,6 +3492,45 @@ p.sub {
   margin-bottom: 0;
 }
 
+.optuna-chart-section--duration-param {
+  margin-bottom: 1.25rem;
+}
+.optuna-chart-section-head--scatter-param {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.65rem;
+  color: var(--halo-cyan);
+}
+.optuna-chart-section-head--scatter-param .optuna-chart-toolbar--duration-param {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.optuna-chart-section-subhead--scatter-param {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.85rem;
+}
+.optuna-chart-section-subhead--scatter-param .optuna-chart-hint {
+  margin-left: 0;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.optuna-chart-section-subhead--scatter-param .optuna-select--chart {
+  margin-left: auto;
+  max-width: min(480px, 100%);
+}
+@media (max-width: 640px) {
+  .optuna-chart-section-subhead--scatter-param .optuna-select--chart {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
 .optuna-chart-section-head--wrap {
   flex-wrap: wrap;
   align-items: center;
@@ -3456,26 +3555,35 @@ p.sub {
 }
 
 .optuna-chart-wrap--scatter {
-  min-height: min(380px, 62vh);
+  min-height: min(380px, 58vh);
 }
 .optuna-chart-wrap--scatter .optuna-chart-svg {
   display: block;
   width: 100%;
   height: auto;
+  aspect-ratio: 960 / 360;
+  max-height: min(520px, 62vh);
 }
-.optuna-scatter-caption {
-  margin: 0.65rem 0 0;
-  font-size: 0.8rem;
+.optuna-chart-wrap--duration {
+  min-height: min(280px, 45vh);
+}
+.optuna-chart-wrap--duration .optuna-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 920 / 340;
+  max-height: min(520px, 62vh);
+}
+.optuna-duration-foot {
+  margin: 0.55rem 0.4rem 0.1rem;
+  font-size: 0.8125rem;
   line-height: 1.5;
-  color: #94a3b8;
-  padding: 0.5rem 0.65rem;
-  border-radius: var(--radius-sm);
-  background: rgba(15, 23, 42, 0.45);
-  border: 1px solid rgba(148, 163, 184, 0.12);
+  color: #a8b4c8;
+  text-align: center;
 }
-.optuna-scatter-caption strong {
-  color: #e2e8f0;
-  font-weight: 600;
+.optuna-duration-foot code {
+  font-size: 0.78em;
+  color: #cbd5e1;
 }
 @media (max-width: 520px) {
   .optuna-chart-section-head--wrap .optuna-select--chart {

@@ -22,6 +22,7 @@ CHECKPOINT_SCHEMA_VERSION = 1
 
 CHECKPOINT_BOUNDARIES = (
     "after_phase_1",
+    "after_phase_2",
     "after_phase_3",
     "after_phase_4",
     "after_phase_5",
@@ -312,6 +313,53 @@ def save_pickle_state(checkpoint_dir: Path, name: str, obj: Any) -> None:
 
 def load_pickle_state(checkpoint_dir: Path, name: str) -> Any:
     return _gzip_unpickle(checkpoint_dir / f"{name}.pkl.gz")
+
+
+def save_after_phase_2(
+    checkpoint_dir: Path,
+    raw_pre: Any,
+    *,
+    total_frames: int,
+    native_fps: float,
+    output_fps: float,
+    frame_width: int,
+    frame_height: int,
+    ystride: int,
+    hybrid_sam_stats: Dict[str, Any],
+    video_path: Path,
+    params_path: Optional[Path],
+    phase1_dets_by_frame: Optional[Dict[int, Any]] = None,
+    phase1_pre_classical_by_frame: Optional[Dict[int, Any]] = None,
+) -> None:
+    """Checkpoint after Phase 1–2 (detection + tracking) before post-track stitch."""
+    write_manifest(
+        checkpoint_dir,
+        boundary_id="after_phase_2",
+        video_fp=video_fingerprint(video_path),
+        params_fp=params_fingerprint(params_path),
+        extra={"note": "raw_pre is pre-stitch tracks; optional phase1 dets for preview on resume"},
+    )
+    save_pickle_state(
+        checkpoint_dir,
+        "phase2_pre_stitch",
+        {
+            "raw_pre": raw_pre,
+            "total_frames": total_frames,
+            "native_fps": native_fps,
+            "output_fps": output_fps,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
+            "ystride": ystride,
+            "hybrid_sam_stats": hybrid_sam_stats,
+            "phase1_dets_by_frame": dict(phase1_dets_by_frame or {}),
+            "phase1_pre_classical_by_frame": dict(phase1_pre_classical_by_frame or {}),
+        },
+    )
+
+
+def load_after_phase_2(checkpoint_dir: Path) -> Dict[str, Any]:
+    read_manifest(checkpoint_dir)
+    return load_pickle_state(checkpoint_dir, "phase2_pre_stitch")
 
 
 def save_after_phase_3(

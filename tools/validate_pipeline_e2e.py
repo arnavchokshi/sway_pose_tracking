@@ -41,6 +41,18 @@ from typing import Any, Dict, List, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY = REPO_ROOT / "main.py"
 
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sway.technology_contracts import validate_run_against_contracts  # noqa: E402
+
+
+def _extract_stop_boundary(extra_args: List[str]) -> str:
+    for i, a in enumerate(extra_args):
+        if a == "--stop-after-boundary" and i + 1 < len(extra_args):
+            return str(extra_args[i + 1]).strip()
+    return "final"
+
 PHASE_MARKERS: Tuple[int, ...] = tuple(range(1, 12))
 
 # Preset: fast smoke for CI / short synthetic clip
@@ -472,6 +484,7 @@ def run_one(
     timeout_sec: Optional[int],
     deep: bool,
     write_report: bool,
+    strict_guardrails: bool = False,
 ) -> RunResult:
     import time
 
@@ -510,6 +523,12 @@ def run_one(
         errs.append(f"main.py exit code {proc.returncode}")
 
     errs.extend(validate_phase_markers(combined))
+
+    if strict_guardrails:
+        boundary = _extract_stop_boundary(extra_args)
+        env_map = {str(k): str(v) for k, v in extra_env.items()}
+        for v in validate_run_against_contracts(combined, env_map, output_dir, boundary):
+            errs.append(f"[guardrails] {v.contract_name}/{v.clause}: {v.detail}")
 
     phase_timings = parse_phase_timings_s(combined)
     hints.extend(optimization_hints(phase_timings, elapsed))
@@ -585,6 +604,11 @@ def main() -> int:
     ap.add_argument("--write-reports", action="store_true", help="Write pipeline_validate_report.json per output dir")
     ap.add_argument("--timeout", type=int, default=0, help="Subprocess timeout seconds (0 = none)")
     ap.add_argument("--keep-temp", action="store_true", help="Keep synthetic video / temp dirs")
+    ap.add_argument(
+        "--strict-guardrails",
+        action="store_true",
+        help="After each run, enforce sway/technology_contracts (phase fallthrough, branch rules, etc.).",
+    )
     args = ap.parse_args()
 
     if not MAIN_PY.is_file():
@@ -672,6 +696,7 @@ def main() -> int:
             timeout_sec=timeout,
             deep=deep,
             write_report=args.write_reports,
+            strict_guardrails=bool(args.strict_guardrails),
         )
         results.append(res)
         print(f"    {'OK' if res.ok else 'FAIL'} in {res.duration_s:.1f}s", flush=True)

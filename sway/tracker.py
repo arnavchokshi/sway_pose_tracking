@@ -279,7 +279,14 @@ def _deepocsort_extra_from_env() -> Dict[str, Any]:
     """BoxMOT DeepOcSort knobs from env (Pipeline Lab + CLI experiments)."""
     max_age = 150
     try:
-        max_age = int(os.environ.get("SWAY_BOXMOT_MAX_AGE", "").strip() or "150")
+        # Keep backward compatibility with the future-pipeline naming:
+        # SWAY_TRACK_MAX_AGE (future docs / sweeps) and SWAY_BOXMOT_MAX_AGE (current runtime).
+        max_age_raw = (
+            os.environ.get("SWAY_TRACK_MAX_AGE", "").strip()
+            or os.environ.get("SWAY_BOXMOT_MAX_AGE", "").strip()
+            or "150"
+        )
+        max_age = int(max_age_raw)
     except ValueError:
         pass
     iou_thr = 0.3
@@ -294,20 +301,39 @@ def _deepocsort_extra_from_env() -> Dict[str, Any]:
     elif raw_asso in ("diou", "ciou"):
         asso = raw_asso
     elif raw_asso in ("eiou",):
-        # BoxMOT has no EIoU; CIoU is the closest built-in (center distance + aspect ratio terms).
         asso = "ciou"
     else:
         asso = "iou"
+
+    def _env_float(key: str, default: float) -> float:
+        try:
+            return float(os.environ.get(key, "").strip() or str(default))
+        except ValueError:
+            return default
+
+    def _env_bool(key: str, default: bool = False) -> bool:
+        return os.environ.get(key, "0" if not default else "1").strip().lower() in ("1", "true", "yes")
+
     return {
         "max_age": max_age,
         "iou_threshold": iou_thr,
         "embedding_off": not reid_on,
         "asso_func": asso,
+        "alpha_fixed_emb": _env_float("SWAY_DOC_ALPHA_EMB", 0.95),
+        "aw_param": _env_float("SWAY_DOC_AW_PARAM", 0.5),
+        "aw_off": _env_bool("SWAY_DOC_AW_OFF"),
+        "cmc_off": _env_bool("SWAY_DOC_CMC_OFF"),
+        "delta_t": int(_env_float("SWAY_DOC_DELTA_T", 3)),
+        "inertia": _env_float("SWAY_DOC_INERTIA", 0.2),
+        "w_association_emb": _env_float("SWAY_DOC_W_EMB", 0.5),
+        "Q_xy_scaling": _env_float("SWAY_DOC_Q_XY", 0.01),
+        "Q_s_scaling": _env_float("SWAY_DOC_Q_S", 0.0001),
+        "nsa_kf_on": _env_bool("SWAY_DOC_NSA_KF_ON"),
     }
 
 
 def _normalize_boxmot_tracker_kind(raw: Optional[str]) -> str:
-    """Map SWAY_BOXMOT_TRACKER / aliases to deepocsort | bytetrack | ocsort | strongsort."""
+    """Map SWAY_BOXMOT_TRACKER / aliases to canonical tracker name."""
     s = (raw or "deepocsort").strip().lower().replace("-", "").replace("_", "")
     if s in ("deepocsort", "deepoc", "doc", "boxmot"):
         return "deepocsort"
@@ -317,6 +343,14 @@ def _normalize_boxmot_tracker_kind(raw: Optional[str]) -> str:
         return "ocsort"
     if s in ("strongsort", "strong"):
         return "strongsort"
+    if s in ("boosttrack", "boost", "boosttrackpp", "boosttrack++"):
+        return "boosttrack"
+    if s in ("botsort", "bot"):
+        return "botsort"
+    if s in ("solidtrack", "solid"):
+        return "solidtrack"
+    if s in ("fasttracker", "fast", "fastrack"):
+        return "fasttracker"
     return "deepocsort"
 
 
@@ -346,6 +380,17 @@ def probe_video_fps(video_path: str) -> float:
         cap.release()
 
 
+def probe_video_frame_count(video_path: str) -> int:
+    """Read container frame count without decoding frames."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return 0
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        cap.release()
+
+
 def _create_boxmot_tracker(
     kind: str,
     yconf: float,
@@ -356,13 +401,33 @@ def _create_boxmot_tracker(
     tracker_frame_rate: int = 30,
 ) -> Any:
     """Instantiate a BoxMOT tracker; ``kind`` from ``boxmot_tracker_kind_from_env()``."""
-    from boxmot import ByteTrack, DeepOcSort, OcSort, StrongSort
+    from boxmot import ByteTrack, DeepOcSort, OcSort, StrongSort, BoostTrack, BotSort
 
     half_cuda = bool(dev.type == "cuda")
     tr_fps = max(1, int(tracker_frame_rate))
+    reid_path = Path(reid_w)
+
+    # StrongSORT expects a concrete local ReID checkpoint path. Guard here so
+    # callers get a deterministic Python exception instead of BoxMOT exiting.
+    if kind == "strongsort" and not reid_path.exists():
+        raise FileNotFoundError(f"StrongSORT ReID weights not found: {reid_path}")
+
+    if doc_kw.get("nsa_kf_on") and kind == "deepocsort":
+        try:
+            from sway.nsa_kalman_patch import apply_nsa_kf_patch
+            apply_nsa_kf_patch()
+        except ImportError:
+            pass
+        # NOTE: after the tracker is created below we wrap its update to inject
+        # per-frame mean confidence into the thread-local that the patched
+        # KalmanFilterXYSR.update reads.  The wrapping happens at the end of
+        # the deepocsort branch so the tracker object exists.
+
+    from sway.boxmot_compat import apply_boxmot_kf_unfreeze_guard
+    apply_boxmot_kf_unfreeze_guard()
 
     if kind == "deepocsort":
-        return DeepOcSort(
+        _doc = DeepOcSort(
             reid_weights=reid_w,
             device=dev,
             half=half_cuda,
@@ -372,7 +437,23 @@ def _create_boxmot_tracker(
             iou_threshold=float(doc_kw["iou_threshold"]),
             asso_func=str(doc_kw["asso_func"]),
             embedding_off=bool(doc_kw["embedding_off"]),
+            alpha_fixed_emb=float(doc_kw.get("alpha_fixed_emb", 0.95)),
+            aw_param=float(doc_kw.get("aw_param", 0.5)),
+            aw_off=bool(doc_kw.get("aw_off", False)),
+            cmc_off=bool(doc_kw.get("cmc_off", False)),
+            delta_t=int(doc_kw.get("delta_t", 3)),
+            inertia=float(doc_kw.get("inertia", 0.2)),
+            w_association_emb=float(doc_kw.get("w_association_emb", 0.5)),
+            Q_xy_scaling=float(doc_kw.get("Q_xy_scaling", 0.01)),
+            Q_s_scaling=float(doc_kw.get("Q_s_scaling", 0.0001)),
         )
+        if doc_kw.get("nsa_kf_on"):
+            try:
+                from sway.nsa_kalman_patch import wrap_deepocsort_for_nsa
+                _doc.update = wrap_deepocsort_for_nsa(_doc.update)
+            except ImportError:
+                pass
+        return _doc
     if kind == "bytetrack":
         bt_match = float(os.environ.get("SWAY_BYTETRACK_MATCH_THRESH", "").strip() or "0.8")
         bt_buffer = int(os.environ.get("SWAY_BYTETRACK_TRACK_BUFFER", "").strip() or "25")
@@ -405,6 +486,75 @@ def _create_boxmot_tracker(
             n_init=ss_ninit,
             nn_budget=ss_budget,
         )
+    if kind == "boosttrack":
+        boost_reid = os.environ.get("SWAY_BOOST_REID", "0").strip() in ("1", "true")
+        global_reid_on = os.environ.get("SWAY_BOXMOT_REID_ON", "0").strip().lower() in ("1", "true", "yes")
+        # Enforce consistency: if BoostTrack wants ReID but global flag disagrees, align them.
+        # SWAY_BOOST_REID is the authoritative flag for this tracker type.
+        if boost_reid and not global_reid_on:
+            print(
+                "  [boosttrack] SWAY_BOOST_REID=1 but SWAY_BOXMOT_REID_ON=0 — "
+                "forcing ReID on so BoostTrack can use embeddings.",
+                flush=True,
+            )
+        return BoostTrack(
+            reid_weights=reid_w,
+            device=dev,
+            half=half_cuda,
+            det_thresh=yconf,
+            max_age=int(doc_kw["max_age"]),
+            cmc_method=os.environ.get("SWAY_BOOST_CMC_METHOD", "ecc").strip(),
+            lambda_iou=float(os.environ.get("SWAY_BOOST_LAMBDA_IOU", "0.5") or "0.5"),
+            lambda_mhd=float(os.environ.get("SWAY_BOOST_LAMBDA_MHD", "0.25") or "0.25"),
+            lambda_shape=float(os.environ.get("SWAY_BOOST_LAMBDA_SHP", "0.25") or "0.25"),
+            use_dlo_boost=os.environ.get("SWAY_BOOST_DLO", "1").strip() in ("1", "true"),
+            use_duo_boost=os.environ.get("SWAY_BOOST_DUO", "1").strip() in ("1", "true"),
+            dlo_boost_coef=float(os.environ.get("SWAY_BOOST_DLO_COEF", "0.65") or "0.65"),
+            use_rich_s=os.environ.get("SWAY_BOOST_RICH_S", "0").strip() in ("1", "true"),
+            use_sb=os.environ.get("SWAY_BOOST_SB", "0").strip() in ("1", "true"),
+            use_vt=os.environ.get("SWAY_BOOST_VT", "0").strip() in ("1", "true"),
+            with_reid=boost_reid,
+        )
+    if kind == "botsort":
+        return BotSort(
+            reid_weights=reid_w,
+            device=dev,
+            half=half_cuda,
+            det_thresh=yconf,
+            max_age=int(doc_kw["max_age"]),
+            iou_threshold=float(doc_kw["iou_threshold"]),
+            cmc_method=os.environ.get("SWAY_BOTSORT_CMC", "ecc").strip(),
+        )
+    if kind == "solidtrack":
+        tracker = BotSort(
+            reid_weights=reid_w,
+            device=dev,
+            half=half_cuda,
+            det_thresh=yconf,
+            max_age=int(doc_kw["max_age"]),
+            iou_threshold=float(doc_kw["iou_threshold"]),
+            cmc_method="ecc",
+        )
+        try:
+            from sway.solidtrack_compat import patch_solidtrack_cost, apply_ema_to_tracker
+            theta_iou = float(os.environ.get("SWAY_ST_THETA_IOU", "0.5") or "0.5")
+            theta_emb = float(os.environ.get("SWAY_ST_THETA_EMB", "0.25") or "0.25")
+            # Patch BotSort's matching module to use SolidTrack gated cost
+            patch_solidtrack_cost(tracker, theta_iou=theta_iou, theta_emb=theta_emb)
+            # Apply EMA smoothing to per-track embeddings
+            ema_alpha = float(os.environ.get("SWAY_ST_EMA_ALPHA", "0.9") or "0.9")
+            apply_ema_to_tracker(tracker, alpha=ema_alpha)
+        except ImportError:
+            pass
+        return tracker
+    if kind == "fasttracker":
+        try:
+            from sway.fasttracker_compat import create_fasttracker
+            return create_fasttracker(yconf, dev, doc_kw)
+        except ImportError:
+            return _create_boxmot_tracker(
+                "deepocsort", yconf, dev, reid_w, doc_kw, tracker_frame_rate=tracker_frame_rate
+            )
     return _create_boxmot_tracker(
         "deepocsort", yconf, dev, reid_w, doc_kw, tracker_frame_rate=tracker_frame_rate
     )
@@ -1299,6 +1449,7 @@ def _run_tracking_boxmot_diou(
     max_dancers_last_chunk = 0
     current_detect_size = base_detect
     yolo_infer_count = 0
+    total_video_frames = probe_video_frame_count(video_path)
     if dev.type == "cpu":
         print(
             f"  Note: CUDA not available — Phases 1–2 (YOLO + BoxMOT {bmk}) on CPU can take "
@@ -1362,8 +1513,12 @@ def _run_tracking_boxmot_diou(
                         flush=True,
                     )
                 elif yolo_infer_count % 25 == 0:
+                    prog = ""
+                    if total_video_frames > 0:
+                        pct = (100.0 * (frame_idx + 1)) / total_video_frames
+                        prog = f" ({frame_idx + 1}/{total_video_frames}, {pct:.1f}%)"
                     print(
-                        f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}…",
+                        f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}{prog}…",
                         flush=True,
                     )
 
@@ -1427,7 +1582,15 @@ def _run_tracking_boxmot_diou(
                 if per_det_masks is None:
                     per_det_masks = [None] * int(len(dets))
 
-                out = tracker.update(dets, frame)
+                try:
+                    out = tracker.update(dets, frame)
+                except np.linalg.LinAlgError as ex:
+                    # Rare DeepOcSort Kalman failure on ill-conditioned covariance; skip frame to keep run alive.
+                    print(
+                        f"  [tracker warning] DeepOcSort update failed at frame {frame_idx}: {ex}",
+                        flush=True,
+                    )
+                    continue
                 valid_dancers_this_frame = 0
                 if handshake_state is not None and out is not None and len(out) > 0:
                     handshake_state.set_prev_tracker_out(np.atleast_2d(out))
@@ -1557,6 +1720,7 @@ def run_phase1_yolo_only_boxmot(
     max_dancers_last_chunk = 0
     current_detect_size = base_detect
     yolo_infer_count = 0
+    total_video_frames = probe_video_frame_count(video_path)
 
     chunk_idx = -1
     for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
@@ -1600,6 +1764,15 @@ def run_phase1_yolo_only_boxmot(
                 )
             for (frame_idx, frame, scale_x, scale_y, _rgb), r0 in zip(batch, res_list):
                 yolo_infer_count += 1
+                if yolo_infer_count == 1 or yolo_infer_count % 25 == 0:
+                    prog = ""
+                    if total_video_frames > 0:
+                        pct = (100.0 * (frame_idx + 1)) / total_video_frames
+                        prog = f" ({frame_idx + 1}/{total_video_frames}, {pct:.1f}%)"
+                    print(
+                        f"  [phase1-only] YOLO progress: {yolo_infer_count} det frames, video frame {frame_idx}{prog}",
+                        flush=True,
+                    )
                 if r0.boxes is None or len(r0.boxes) == 0:
                     dets = np.empty((0, 6), dtype=np.float32)
                     phase1_pre_classical_by_frame[frame_idx] = []
@@ -1800,7 +1973,14 @@ def run_boxmot_tracking_from_yolo_dets(
                 if per_det_masks is None:
                     per_det_masks = [None] * int(len(dets))
 
-                out = tracker.update(dets, frame)
+                try:
+                    out = tracker.update(dets, frame)
+                except np.linalg.LinAlgError as ex:
+                    print(
+                        f"  [tracker warning] DeepOcSort update failed at frame {frame_idx}: {ex}",
+                        flush=True,
+                    )
+                    continue
                 valid_dancers_this_frame = 0
                 if handshake_state is not None and out is not None and len(out) > 0:
                     handshake_state.set_prev_tracker_out(np.atleast_2d(out))
@@ -1917,6 +2097,7 @@ def _run_tracking_botsort_pre_stitch(
     max_dancers_last_chunk = 0
     current_detect_size = base_detect
     yolo_infer_count = 0
+    total_video_frames = probe_video_frame_count(video_path)
 
     for chunk_frames, _chunk_start, nfps, w_f, h_f in _iter_video_chunks(video_path, tr["chunk_size"]):
         native_fps = nfps
@@ -1936,6 +2117,15 @@ def _run_tracking_botsort_pre_stitch(
             if frame_idx % ystride != 0:
                 continue
             yolo_infer_count += 1
+            if yolo_infer_count == 1 or yolo_infer_count % 25 == 0:
+                prog = ""
+                if total_video_frames > 0:
+                    pct = (100.0 * (frame_idx + 1)) / total_video_frames
+                    prog = f" ({frame_idx + 1}/{total_video_frames}, {pct:.1f}%)"
+                print(
+                    f"  YOLO+track progress: {yolo_infer_count} det frames, video frame {frame_idx}{prog}",
+                    flush=True,
+                )
             h_fr, w_fr = frame.shape[:2]
             frame_low = cv2.resize(frame, (current_detect_size, current_detect_size))
             frame_low_rgb = frame_low[:, :, ::-1]

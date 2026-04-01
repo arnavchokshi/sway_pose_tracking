@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 import { useRef } from 'react'
 import { useLab } from '../context/LabContext'
 import { isProbableVideoFile, VIDEO_ACCEPT_ATTR } from '../lib/videoFile'
@@ -6,6 +6,9 @@ import { isProbableVideoFile, VIDEO_ACCEPT_ATTR } from '../lib/videoFile'
 export function NavBar() {
   const { videoFile, videoLabel, setVideo } = useLab()
   const fileRef = useRef<HTMLInputElement>(null)
+  const location = useLocation()
+
+  if (location.pathname === '/') return null
 
   const onPickFile = (file?: File) => {
     if (!file) return
@@ -30,7 +33,7 @@ export function NavBar() {
           <div className="nav-brand">Sway Studio</div>
 
           <nav className="nav-links" aria-label="Primary">
-            <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
+            <NavLink to="/lab" end className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>
               Lab
             </NavLink>
             <NavLink to="/config" className={({ isActive }) => (isActive ? 'nav-link nav-link--active' : 'nav-link')}>

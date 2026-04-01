@@ -69,6 +69,12 @@ def build_phase3_tracking_data_json(
     total_frames: int,
     native_fps: float,
     output_fps: float,
+    # Future pipeline extensions (PLAN modules)
+    track_states: dict | None = None,
+    confidence_levels: dict | None = None,
+    critique_results: list | None = None,
+    gallery_metadata: list | None = None,
+    collision_events: list | None = None,
 ) -> Dict[str, Any]:
     """
     Minimal ``data.json`` for runs that stop at ``after_phase_3`` (no pose / full export).
@@ -102,7 +108,7 @@ def build_phase3_tracking_data_json(
             }
         frames.append({"frame_idx": fi, "tracks": tracks})
 
-    return {
+    result = {
         "metadata": {
             "video_path": video_path,
             "fps": float(output_fps),
@@ -113,6 +119,23 @@ def build_phase3_tracking_data_json(
         "track_summaries": {},
         "frames": frames,
     }
+
+    # Future pipeline extensions (PLAN modules)
+    if track_states:
+        result["track_states"] = track_states
+    if confidence_levels:
+        result["confidence_levels"] = confidence_levels
+    if critique_results:
+        result["critique_results"] = [
+            cr.to_dict() if hasattr(cr, "to_dict") else cr
+            for cr in critique_results
+        ]
+    if gallery_metadata:
+        result["gallery"] = gallery_metadata
+    if collision_events:
+        result["collision_events"] = collision_events
+
+    return result
 
 
 def data_json_to_mot_lines(data: Dict[str, Any]) -> List[str]:

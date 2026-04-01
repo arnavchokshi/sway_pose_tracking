@@ -28,3 +28,20 @@ class TemperatureScaler:
 def get_temperature_scaler() -> TemperatureScaler:
     T = float(os.environ.get("SWAY_CONF_TEMPERATURE", "1.0"))
     return TemperatureScaler(T)
+
+
+def scale_probability(prob: float, scaler: TemperatureScaler | None = None) -> float:
+    """Temperature-scale an already-sigmoid confidence probability.
+
+    Args:
+        prob: probability in [0,1]
+        scaler: optional prebuilt scaler; env-based scaler is used when None.
+    """
+    p = float(np.clip(prob, 1e-6, 1.0 - 1e-6))
+    if scaler is None:
+        scaler = get_temperature_scaler()
+    logit = np.log(p / (1.0 - p))
+    out = scaler.scale_probs_from_logits(logit)
+    if isinstance(out, torch.Tensor):
+        out = float(out.detach().cpu().item())
+    return float(np.clip(out, 0.0, 1.0))

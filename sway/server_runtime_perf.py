@@ -69,7 +69,19 @@ def apply_server_runtime_perf() -> None:
 
 
 def subprocess_env_overlay() -> Dict[str, str]:
-    """Env pairs to merge into ``subprocess.run(..., env=...)`` when sweeps spawn ``main.py``."""
+    """Env pairs to merge into ``subprocess.run(..., env=...)`` when sweeps spawn ``main.py``.
+
+    Passes infrastructure speed-ups to each child process:
+      - CPU thread limits (PyTorch, OpenCV, BLAS) to avoid over-subscription when
+        multiple videos run back-to-back in the same sweep trial.
+      - YOLO FP16 (CUDA only): ~40% faster YOLO inference on A10/A100 with
+        negligible accuracy difference.
+      - YOLO infer batch size 4: amortises GPU call overhead when YOLO runs on
+        consecutive frames (tracker.update still steps per-frame in order).
+
+    All of these are infrastructure knobs, not tuning parameters — they are NOT
+    added to Optuna's parameter space.
+    """
     if not _truthy("SWAY_SERVER_PERF"):
         return {}
     n = str(recommended_cpu_thread_count())
@@ -80,4 +92,22 @@ def subprocess_env_overlay() -> Dict[str, str]:
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         if not os.environ.get(key):
             out[key] = n
+
+    # GPU speed-ups: only inject when CUDA is reachable and caller hasn't
+    # already set a preference (respect explicit overrides).
+    _cuda_available: bool = False
+    try:
+        import torch
+        _cuda_available = torch.cuda.is_available()
+    except ImportError:
+        pass
+
+    if _cuda_available:
+        if not os.environ.get("SWAY_YOLO_HALF"):
+            out["SWAY_YOLO_HALF"] = "1"
+        if not os.environ.get("SWAY_YOLO_INFER_BATCH"):
+            # batch=4 amortises overhead; large enough to matter, small enough to
+            # keep VRAM headroom on A10 (24 GB) alongside the ReID model.
+            out["SWAY_YOLO_INFER_BATCH"] = "4"
+
     return out

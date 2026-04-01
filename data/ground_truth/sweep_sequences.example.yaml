@@ -1,9 +1,16 @@
 # Copy to sweep_sequences.yaml (gitignored). Paths relative to sway_pose_mvp/.
+#
+# weight: optional; used by Optuna weighted harmonic mean (default 1.0).
+#   Example: bigtest: 2.0 makes BigTest count double vs other clips.
+#
+# For videos outside the repo, use absolute paths for video / gt_mot.
 
 sequence_order:
   - bigtest
   - mirrortest
   - gymtest
+  - aditest
+  - easytest
 
 sequences:
   bigtest:
@@ -11,13 +18,28 @@ sequences:
     gt_mot: data/ground_truth/bigtest/gt/gt.txt
     im_width: 1280
     im_height: 720
+    weight: 2.0
   mirrortest:
     video: data/ground_truth/mirrortest/IMG_2946.MP4
     gt_mot: data/ground_truth/mirrortest/gt/gt.txt
     im_width: 1280
     im_height: 720
+    weight: 1.0
   gymtest:
     video: data/ground_truth/gymtest/IMG_8309.mov
     gt_mot: data/ground_truth/gymtest/gt/gt.txt
     im_width: 1280
     im_height: 720
+    weight: 1.0
+  aditest:
+    video: /path/to/adiTest/your_video.mov
+    gt_mot: /path/to/adiTest/gt/gt.txt
+    im_width: 1280
+    im_height: 720
+    weight: 1.0
+  easytest:
+    video: /path/to/easyTest/your_video.mov
+    gt_mot: /path/to/easyTest/gt/gt.txt
+    im_width: 1280
+    im_height: 720
+    weight: 1.0

@@ -26,13 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_TESTS: List[str] = [
-    "tests/test_hybrid_sam_roi.py",
-    "tests/test_infer_batch_env.py",
-    "tests/test_bidirectional_track_merge.py",
-    "tests/test_yolo_runtime_env.py",
-    "tests/test_track_stats_export.py",
-    "tests/test_golden_bench_config.py",
-    "tests/test_validate_pipeline_e2e_helpers.py",
+    "tests/test_MASTER_suite.py",
 ]
 
 

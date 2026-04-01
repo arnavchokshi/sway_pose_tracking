@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react'
 import { Link } from 'react-router-dom'
 import {
   ArrowLeft,
@@ -109,6 +118,81 @@ function formatValue(v: number | null | undefined) {
   return v.toFixed(4)
 }
 
+/** Column id for the All trials table: built-ins or a video name (per-clip score). */
+type TrialTableSortCol = 'trial' | 'state' | 'score' | string
+
+function compareTrialTableRows(
+  a: OptunaTrialRow,
+  b: OptunaTrialRow,
+  col: TrialTableSortCol,
+  dir: 'asc' | 'desc',
+): number {
+  const mult = dir === 'asc' ? 1 : -1
+  if (col === 'state') {
+    const c = a.state.localeCompare(b.state)
+    if (c !== 0) return mult * c
+  } else if (col === 'trial') {
+    if (a.number !== b.number) return mult * (a.number - b.number)
+  } else if (col === 'score') {
+    const na = typeof a.value === 'number' ? a.value : null
+    const nb = typeof b.value === 'number' ? b.value : null
+    if (na === null && nb === null) {
+      /* tie-break below */
+    } else if (na === null) return 1
+    else if (nb === null) return -1
+    else if (na !== nb) return mult * (na - nb)
+  } else {
+    const ra = a.user_attrs[`score_${col}`]
+    const rb = b.user_attrs[`score_${col}`]
+    const va = typeof ra === 'number' ? ra : null
+    const vb = typeof rb === 'number' ? rb : null
+    if (va === null && vb === null) {
+      /* tie-break below */
+    } else if (va === null) return 1
+    else if (vb === null) return -1
+    else if (va !== vb) return mult * (va - vb)
+  }
+  return b.number - a.number
+}
+
+function SortableTrialTh({
+  col,
+  label,
+  active,
+  dir,
+  onSort,
+  style,
+}: {
+  col: TrialTableSortCol
+  label: ReactNode
+  active: boolean
+  dir: 'asc' | 'desc'
+  onSort: (c: TrialTableSortCol) => void
+  style?: CSSProperties
+}) {
+  return (
+    <th
+      scope="col"
+      aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+      style={style}
+      className={active ? 'optuna-table-th--sortable optuna-table-th--sorted' : 'optuna-table-th--sortable'}
+    >
+      <button
+        type="button"
+        className="optuna-table-sort-btn"
+        onClick={() => onSort(col)}
+      >
+        <span>{label}</span>
+        {active ? (
+          <span className="optuna-table-sort-icon" aria-hidden>
+            {dir === 'asc' ? '↑' : '↓'}
+          </span>
+        ) : null}
+      </button>
+    </th>
+  )
+}
+
 function valuesEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true
   if (typeof a === 'number' && typeof b === 'number' && Number.isFinite(a) && Number.isFinite(b)) {
@@ -165,6 +249,15 @@ function formatDurationSec(s: number): string {
   const m = Math.floor(s / 60)
   const sec = Math.round(s % 60)
   return sec ? `${m}m ${sec}s` : `${m}m`
+}
+
+/** Short labels for Y-axis ticks (may be large spans). */
+function formatDurationAxisTick(sec: number, spanSec: number): string {
+  if (!Number.isFinite(sec)) return '—'
+  if (spanSec < 120) return sec < 10 ? sec.toFixed(1) : `${Math.round(sec)}s`
+  if (spanSec < 3600) return `${(sec / 60).toFixed(sec < 600 ? 1 : 0)}m`
+  const h = sec / 3600
+  return `${h < 10 ? h.toFixed(1) : Math.round(h)}h`
 }
 
 /** JSON sometimes stringifies floats; Optuna categoricals stay strings — only treat as numeric when coercible */
@@ -232,6 +325,8 @@ const VIDEO_COLORS: Record<string, string> = {
   bigtest: '#38bdf8',    // sky blue
   gymtest: '#a78bfa',   // violet
   mirrortest: '#34d399', // emerald
+  aditest: '#f97316',    // orange
+  easytest: '#f472b6',   // pink (distinct from violet gymtest)
 }
 
 // ─── Chart: Score Progress Chart (bar per trial) ─────────────────────────────
@@ -942,6 +1037,40 @@ function VideoTrendChart({
 
 // ─── Trial duration (wall time from Optuna) ───────────────────────────────────
 
+function DurationParamViewToggle({
+  view,
+  onViewChange,
+}: {
+  view: 'duration' | 'scatter'
+  onViewChange: (v: 'duration' | 'scatter') => void
+}) {
+  return (
+    <div className="optuna-chart-toolbar optuna-chart-toolbar--duration-param">
+      <span className="optuna-chart-toolbar-label">View</span>
+      <div className="optuna-chart-toggle">
+        <button
+          type="button"
+          className={`optuna-chart-toggle-btn optuna-chart-toggle-btn--labeled${view === 'duration' ? ' active' : ''}`}
+          onClick={() => onViewChange('duration')}
+          title="Wall time per trial"
+        >
+          <Timer size={14} />
+          <span className="optuna-chart-toggle-text">Duration</span>
+        </button>
+        <button
+          type="button"
+          className={`optuna-chart-toggle-btn optuna-chart-toggle-btn--labeled${view === 'scatter' ? ' active' : ''}`}
+          onClick={() => onViewChange('scatter')}
+          title="Parameter vs objective"
+        >
+          <ScatterChart size={14} />
+          <span className="optuna-chart-toggle-text">Param vs score</span>
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function TrialDurationChart({
   trials,
   onSelectTrial,
@@ -963,8 +1092,9 @@ function TrialDurationChart({
   }, [trials])
 
   const W = 920
-  const H = 220
-  const PAD = { top: 18, right: 22, bottom: 44, left: 44 }
+  /** Taller plot area so the chart fills the card when shown full-width (matches param scatter ~aspect). */
+  const H = 340
+  const PAD = { top: 20, right: 22, bottom: 34, left: 58 }
   const innerW = W - PAD.left - PAD.right
   const innerH = H - PAD.top - PAD.bottom
 
@@ -981,21 +1111,43 @@ function TrialDurationChart({
 
   const maxD = Math.max(...rows.map((r) => r.duration))
   const barW = Math.max(5, Math.min(40, innerW / rows.length - 4))
+  const yTicks = [0, 0.25, 0.5, 0.75, 1]
+  const durSpan = maxD
 
   return (
-    <div className="optuna-chart-wrap optuna-chart-wrap--framed" style={{ position: 'relative' }}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="optuna-chart-svg" onMouseLeave={() => setTooltip(null)}>
+    <div className="optuna-chart-wrap optuna-chart-wrap--framed optuna-chart-wrap--duration" style={{ position: 'relative' }}>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="optuna-chart-svg"
+        preserveAspectRatio="xMidYMid meet"
+        onMouseLeave={() => setTooltip(null)}
+        role="img"
+        aria-label={`Wall time per trial, max ${formatDurationSec(maxD)}`}
+      >
         <defs>
           <linearGradient id="optunaDurGrad" x1="0" y1="1" x2="0" y2="0">
             <stop offset="0%" stopColor="#6366f1" stopOpacity={0.85} />
             <stop offset="100%" stopColor="#a78bfa" stopOpacity={0.95} />
           </linearGradient>
         </defs>
+        {yTicks.map((fr) => {
+          const val = fr * maxD
+          const y = PAD.top + innerH - fr * innerH * 0.92
+          return (
+            <g key={`dur-y-${fr}`}>
+              <line x1={PAD.left} x2={PAD.left + innerW} y1={y} y2={y} stroke="rgba(148,163,184,0.1)" />
+              <text x={PAD.left - 8} y={y + 4} textAnchor="end" fontSize={11} fill="#cbd5e1" fontWeight={500}>
+                {formatDurationAxisTick(val, durSpan)}
+              </text>
+            </g>
+          )
+        })}
         {rows.map(({ t, duration: d }, i) => {
           const h = (d / maxD) * innerH * 0.92
           const x = PAD.left + (i / rows.length) * innerW + (innerW / rows.length - barW) / 2
           const y = PAD.top + innerH - h
           const isSel = t.number === selectedTrial
+          const showDurOnBar = h >= 22
           return (
             <g
               key={t.number}
@@ -1014,11 +1166,24 @@ function TrialDurationChart({
                 stroke={isSel ? '#c4b5fd' : 'none'}
                 strokeWidth={1.5}
               />
+              {showDurOnBar ? (
+                <text
+                  x={x + barW / 2}
+                  y={y + 13}
+                  textAnchor="middle"
+                  fontSize={10}
+                  fill="rgba(248,250,252,0.92)"
+                  fontWeight={600}
+                  style={{ pointerEvents: 'none' }}
+                >
+                  {formatDurationSec(d)}
+                </text>
+              ) : null}
               <text
                 x={x + barW / 2}
-                y={H - 8}
+                y={H - 6}
                 textAnchor="middle"
-                fontSize={10}
+                fontSize={11}
                 fill={isSel ? '#e2e8f0' : '#94a3b8'}
                 fontWeight={isSel ? 700 : 500}
               >
@@ -1032,12 +1197,24 @@ function TrialDurationChart({
           x2={PAD.left + innerW}
           y1={PAD.top + innerH}
           y2={PAD.top + innerH}
-          stroke="rgba(148,163,184,0.2)"
+          stroke="rgba(148,163,184,0.28)"
         />
-        <text x={PAD.left + innerW / 2} y={H - 2} textAnchor="middle" fontSize={9} fill="#64748b">
-          Wall time per trial — longer bars = more compute
+        <line x1={PAD.left} x2={PAD.left} y1={PAD.top + innerH * 0.08} y2={PAD.top + innerH} stroke="rgba(148,163,184,0.28)" />
+        <text
+          x={10}
+          y={PAD.top + innerH / 2}
+          textAnchor="middle"
+          fontSize={12}
+          fill="#e2e8f0"
+          fontWeight={600}
+          transform={`rotate(-90, 10, ${PAD.top + innerH / 2})`}
+        >
+          Wall time
         </text>
       </svg>
+      <p className="optuna-duration-foot" role="note">
+        Taller bars = more compute per trial. Values from Optuna timing or sweep <code className="mono">trial_duration_s</code>.
+      </p>
       {tooltip && (
         <div className="optuna-chart-tooltip" style={{ left: `${(tooltip.x / W) * 100}%`, top: `${(tooltip.y / H) * 100}%` }}>
           <span className="optuna-chart-tooltip-value">{tooltip.label}</span>
@@ -1128,14 +1305,21 @@ function ParamVsScoreScatter({
 
   return (
     <div className="optuna-chart-wrap optuna-chart-wrap--framed optuna-chart-wrap--scatter" style={{ position: 'relative' }}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="optuna-chart-svg" onMouseLeave={() => setTooltip(null)} role="img" aria-label={`${paramKey} versus objective score for ${pts.length} trials`}>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="optuna-chart-svg"
+        preserveAspectRatio="xMidYMid meet"
+        onMouseLeave={() => setTooltip(null)}
+        role="img"
+        aria-label={`${paramKey} versus objective score for ${pts.length} trials`}
+      >
         {yTicks.map((fr) => {
           const val = yDom.lo + fr * spanY
           const y = PAD.top + innerH - ((val - yDom.lo) / spanY) * innerH * 0.92 - innerH * 0.04
           return (
             <g key={`y-${fr}`}>
               <line x1={PAD.left} x2={PAD.left + innerW} y1={y} y2={y} stroke="rgba(148,163,184,0.11)" />
-              <text x={PAD.left - 10} y={y + 4} textAnchor="end" fontSize={11} fill="#cbd5e1" fontWeight={500}>
+              <text x={PAD.left - 10} y={y + 4} textAnchor="end" fontSize={12} fill="#cbd5e1" fontWeight={500}>
                 {formatScatterTick(val, spanY)}
               </text>
             </g>
@@ -1147,7 +1331,7 @@ function ParamVsScoreScatter({
           return (
             <g key={`x-${fr}`}>
               <line x1={x} x2={x} y1={PAD.top} y2={PAD.top + innerH} stroke="rgba(148,163,184,0.08)" />
-              <text x={x} y={H - 44} textAnchor="middle" fontSize={11} fill="#cbd5e1" fontWeight={500}>
+              <text x={x} y={H - 44} textAnchor="middle" fontSize={12} fill="#cbd5e1" fontWeight={500}>
                 {formatScatterTick(vx, spanX)}
               </text>
             </g>
@@ -1193,28 +1377,23 @@ function ParamVsScoreScatter({
           stroke="rgba(148,163,184,0.28)"
         />
         <line x1={PAD.left} x2={PAD.left} y1={PAD.top} y2={PAD.top + innerH} stroke="rgba(148,163,184,0.28)" />
-        <text x={PAD.left + innerW / 2} y={H - 22} textAnchor="middle" fontSize={xLabFs} fill="#e2e8f0" fontWeight={600}>
+        <text x={PAD.left + innerW / 2} y={H - 14} textAnchor="middle" fontSize={xLabFs} fill="#e2e8f0" fontWeight={600}>
           {paramKey}
         </text>
-        <text x={PAD.left + innerW / 2} y={H - 6} textAnchor="middle" fontSize={10} fill="#94a3b8" fontWeight={500}>
-          {goalHint} · horizontal = parameter value per trial
-        </text>
         <text
-          x={12}
+          x={14}
           y={PAD.top + innerH / 2}
           textAnchor="middle"
-          fontSize={12}
-          fill="#e2e8f0"
-          fontWeight={600}
-          transform={`rotate(-90, 12, ${PAD.top + innerH / 2})`}
+          transform={`rotate(-90, 14, ${PAD.top + innerH / 2})`}
         >
-          Objective score
+          <tspan x={14} dy="-0.45em" fontSize={12} fill="#e2e8f0" fontWeight={600}>
+            Objective score
+          </tspan>
+          <tspan x={14} dy="1.25em" fontSize={11} fill="#94a3b8" fontWeight={500}>
+            {goalHint}
+          </tspan>
         </text>
       </svg>
-      <p className="optuna-scatter-caption">
-        Each point is one completed trial. Horizontal position = <strong>{paramKey}</strong> value; vertical = objective
-        score ({goalHint}). Click a point to select that trial for comparison and video proof.
-      </p>
       {tooltip && (
         <div
           className="optuna-chart-tooltip optuna-chart-tooltip--multiline"
@@ -2132,9 +2311,14 @@ export function OptunaSweepPage() {
   const [chartMode, setChartMode] = useState<'bar' | 'scatter'>('bar')
   const [showRollingAvg, setShowRollingAvg] = useState(true)
   const [perVideoMode, setPerVideoMode] = useState<'bars' | 'lines'>('bars')
+  const [durationVsParamView, setDurationVsParamView] = useState<'duration' | 'scatter'>('duration')
   const [scatterParam, setScatterParam] = useState<string>('')
   const analyticsBestColRef = useRef<HTMLDivElement>(null)
   const [analyticsBestColHeight, setAnalyticsBestColHeight] = useState<number | null>(null)
+  const [trialTableSort, setTrialTableSort] = useState<{ col: TrialTableSortCol; dir: 'asc' | 'desc' }>({
+    col: 'trial',
+    dir: 'desc',
+  })
 
   const sync = useCallback(async (opts?: { syncTrialArtifacts?: boolean }) => {
     const syncTrialArtifacts = opts?.syncTrialArtifacts ?? false
@@ -2209,10 +2393,20 @@ export function OptunaSweepPage() {
 
   const sequences = data?.meta?.sequence_order ?? []
 
+  const cycleTrialTableSort = useCallback((col: TrialTableSortCol) => {
+    setTrialTableSort((prev) => {
+      if (prev.col === col) {
+        return { col, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+      }
+      return { col, dir: 'asc' }
+    })
+  }, [])
+
   const sortedTrials = useMemo(() => {
     const t = data?.trials ?? []
-    return [...t].sort((a, b) => b.number - a.number)
-  }, [data])
+    const { col, dir } = trialTableSort
+    return [...t].sort((a, b) => compareTrialTableRows(a, b, col, dir))
+  }, [data?.trials, trialTableSort])
 
   const runningHint = useMemo(() => {
     const incomplete = sortedTrials.filter((x) => x.state === 'RUNNING')
@@ -2474,42 +2668,54 @@ export function OptunaSweepPage() {
             </section>
           )}
 
-          {/* ── Duration + parameter scatter (grid) ── */}
-          <div className="optuna-chart-grid">
-            <section className="optuna-chart-section optuna-chart-section--half">
+          {/* ── Trial duration ↔ Parameter vs score (full width, toggle) ── */}
+          <section className="optuna-chart-section optuna-chart-section--duration-param">
+            {durationVsParamView === 'duration' ? (
               <div className="optuna-chart-section-head">
                 <Timer size={16} />
                 <h2 className="optuna-h2" style={{ margin: 0 }}>Trial duration</h2>
-                <span className="optuna-chart-hint">Wall time (Optuna or sweep trial_duration_s / per-video)</span>
+                <span className="optuna-chart-hint">Click a bar to select that trial · source details below the chart</span>
+                <DurationParamViewToggle view={durationVsParamView} onViewChange={setDurationVsParamView} />
               </div>
+            ) : (
+              <>
+                <div className="optuna-chart-section-head optuna-chart-section-head--scatter-param">
+                  <div className="optuna-chart-section-head-row">
+                    <Sparkles size={16} />
+                    <h2 className="optuna-h2" style={{ margin: 0 }}>Parameter vs score</h2>
+                  </div>
+                  <DurationParamViewToggle view={durationVsParamView} onViewChange={setDurationVsParamView} />
+                </div>
+                <div className="optuna-chart-section-subhead optuna-chart-section-subhead--scatter-param">
+                  <span className="optuna-chart-hint">
+                    {isMaximizeStudy(data.direction) ? 'Higher score is better' : 'Lower score is better'}
+                    {' · '}
+                    pick a param, then click a point to compare trials and open video proof
+                  </span>
+                  {numericParamKeys.length > 0 ? (
+                    <select
+                      className="optuna-select optuna-select--chart"
+                      value={scatterParam}
+                      onChange={(e) => setScatterParam(e.target.value)}
+                      aria-label="Parameter for scatter plot"
+                    >
+                      {numericParamKeys.map((k) => (
+                        <option key={k} value={k}>
+                          {k}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                </div>
+              </>
+            )}
+            {durationVsParamView === 'duration' ? (
               <TrialDurationChart
                 trials={data.trials}
                 onSelectTrial={setSelectedTrial}
                 selectedTrial={selectedTrial}
               />
-            </section>
-            <section className="optuna-chart-section optuna-chart-section--half">
-              <div className="optuna-chart-section-head optuna-chart-section-head--wrap">
-                <div className="optuna-chart-section-head-row">
-                  <Sparkles size={16} />
-                  <h2 className="optuna-h2" style={{ margin: 0 }}>Parameter vs score</h2>
-                </div>
-                <span className="optuna-chart-hint">Choose a numeric param — each dot is one completed trial</span>
-                {numericParamKeys.length > 0 ? (
-                  <select
-                    className="optuna-select optuna-select--chart"
-                    value={scatterParam}
-                    onChange={(e) => setScatterParam(e.target.value)}
-                    aria-label="Parameter for scatter plot"
-                  >
-                    {numericParamKeys.map((k) => (
-                      <option key={k} value={k}>
-                        {k}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
-              </div>
+            ) : (
               <ParamVsScoreScatter
                 trials={data.trials}
                 paramKey={scatterParam}
@@ -2518,8 +2724,8 @@ export function OptunaSweepPage() {
                 onSelectTrial={setSelectedTrial}
                 selectedTrial={selectedTrial}
               />
-            </section>
-          </div>
+            )}
+          </section>
 
           {/* ── Optuna direction panel (full width) ── */}
           {data.trials.filter(isChartTrial).length >= 2 && (
@@ -2590,11 +2796,37 @@ export function OptunaSweepPage() {
                 <table className="optuna-table">
                   <thead>
                     <tr>
-                      <th>#</th>
-                      <th>State</th>
-                      <th>Score</th>
+                      <SortableTrialTh
+                        col="trial"
+                        label="#"
+                        active={trialTableSort.col === 'trial'}
+                        dir={trialTableSort.dir}
+                        onSort={cycleTrialTableSort}
+                      />
+                      <SortableTrialTh
+                        col="state"
+                        label="State"
+                        active={trialTableSort.col === 'state'}
+                        dir={trialTableSort.dir}
+                        onSort={cycleTrialTableSort}
+                      />
+                      <SortableTrialTh
+                        col="score"
+                        label="Score"
+                        active={trialTableSort.col === 'score'}
+                        dir={trialTableSort.dir}
+                        onSort={cycleTrialTableSort}
+                      />
                       {videoNames.map((vn) => (
-                        <th key={vn} style={{ color: VIDEO_COLORS[vn] ?? undefined }}>{vn}</th>
+                        <SortableTrialTh
+                          key={vn}
+                          col={vn}
+                          label={vn}
+                          style={{ color: VIDEO_COLORS[vn] ?? undefined }}
+                          active={trialTableSort.col === vn}
+                          dir={trialTableSort.dir}
+                          onSort={cycleTrialTableSort}
+                        />
                       ))}
                     </tr>
                   </thead>

@@ -25,6 +25,10 @@ datasets/dancetrack_yolo/
 datasets/crowdhuman/
 datasets/crowdhuman_yolo/
 
+# Local sweep / experiment run trees (large; do not commit)
+runs/
+_runs/
+
 # Output
 output/
 *.mp4
