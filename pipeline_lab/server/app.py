@@ -60,10 +60,22 @@ def _optuna_sweep_root() -> Path:
     return (REPO_ROOT / "output" / "sweeps" / "optuna").resolve()
 
 
+def _v4_sweep_root() -> Path:
+    """Directory with v4 sweep_status + stage artifacts. Override: SWAY_V4_SWEEP_DIR."""
+    raw = os.environ.get("SWAY_V4_SWEEP_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (REPO_ROOT / "output" / "sweeps" / "v4_lambda_sweep").resolve()
+
+
 _DEFAULT_LAMBDA_REMOTE = "~/sway_test/sway_pose_mvp/output/sweeps/optuna/sweep_status.json"
+_DEFAULT_V4_LAMBDA_REMOTE = "~/sway_test/sway_pose_mvp/output/sweeps/v4_lambda_sweep/sweep_status.json"
+_DEFAULT_V4_LAMBDA_REMOTE_FALLBACKS = (
+    "~/sway_test/sway_pose_mvp/plan_workspaces/plan-23-closed-set-identity-pipeline-v2/output/sweeps/v4_lambda_sweep/sweep_status.json",
+)
 # Primary sweep GPU instance (gpu_1x_a10, us-west-1). Override with SWAY_LAMBDA_SWEEP_*; set SWAY_LAMBDA_SWEEP_HOST=
 # to empty string to skip scp and only read local sweep_status.json.
-_SWAY_OPTUNA_LAMBDA_DEFAULT_IP = "146.235.225.0"
+_SWAY_OPTUNA_LAMBDA_DEFAULT_IP = "192.222.58.106"
 _SWAY_OPTUNA_LAMBDA_DEFAULT_USER = "ubuntu"
 _SWAY_OPTUNA_LAMBDA_DEFAULT_PEM_CANDIDATES = (
     Path.home() / "Downloads" / "pose-tracking.pem",
@@ -236,8 +248,48 @@ class OptunaLambdaPullBody(BaseModel):
     )
 
 
+class V4LambdaPullBody(BaseModel):
+    """Optional overrides for pulling v4 sweep status + artifacts from Lambda."""
+
+    host: Optional[str] = None
+    user: Optional[str] = None
+    pem: Optional[str] = None
+    remote_path: Optional[str] = None
+    sync_trial_artifacts: bool = Field(
+        False,
+        description="When True, rsync remote v4 sweep directory after scp.",
+    )
+    remote_v4_dir: Optional[str] = Field(
+        None,
+        description="Override remote v4 sweep directory (default ~/sway_test/sway_pose_mvp/output/sweeps/v4_lambda_sweep/).",
+    )
+
+
 def _safe_optuna_sequence_segment(name: str) -> bool:
     return bool(name) and re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$", name) is not None
+
+
+def _locate_v4_trial_dir(trial_number: int, sequence_name: str) -> Optional[Path]:
+    """Find a v4 trial dir under stage_a/stage_b/stage_c by trial + sequence."""
+    root = _v4_sweep_root().resolve()
+    target_name = f"trial_{trial_number:05d}_{sequence_name}"
+    # Prefer direct child for future-proofing.
+    direct = (root / target_name).resolve()
+    if direct.is_dir():
+        try:
+            direct.relative_to(root)
+        except ValueError:
+            return None
+        return direct
+    for stage in ("stage_a", "stage_b", "stage_c"):
+        cand = (root / stage / target_name).resolve()
+        if cand.is_dir():
+            try:
+                cand.relative_to(root)
+            except ValueError:
+                continue
+            return cand
+    return None
 
 
 def _merge_lab_request_into_manifest(run_dir: Path) -> None:
@@ -1002,6 +1054,9 @@ def optuna_trial_media(trial_number: int, sequence_name: str) -> Dict[str, Any]:
             "note": "No trial output directory yet (or wrong sequence name).",
         }
     items: List[Dict[str, str]] = []
+    # Root phase outputs (phase*.mp4) for sweeps that write directly in trial dir.
+    for fp in sorted(trial_dir.glob("phase*.mp4")):
+        items.append({"kind": "phase_output", "filename": fp.name, "path": fp.name})
     for sub, kind in (("phase_previews", "phase_preview"), ("output", "output")):
         d = trial_dir / sub
         if not d.is_dir():
@@ -1026,6 +1081,201 @@ def optuna_trial_file(trial_number: int, sequence_name: str, path: str):
         trial_dir.relative_to(root)
     except ValueError:
         raise HTTPException(403, "invalid trial path") from None
+    target = (trial_dir / path).resolve()
+    try:
+        target.relative_to(trial_dir)
+    except ValueError:
+        raise HTTPException(403, "path escapes trial dir") from None
+    if not target.is_file():
+        raise HTTPException(404, "not found")
+    media_type = None
+    suf = target.suffix.lower()
+    if suf == ".mp4":
+        media_type = "video/mp4"
+    elif suf == ".webm":
+        media_type = "video/webm"
+    elif suf == ".mov":
+        media_type = "video/quicktime"
+    elif suf == ".json":
+        media_type = "application/json"
+    return FileResponse(target, filename=target.name, media_type=media_type)
+
+
+@app.post("/api/v4-sweep/pull-lambda")
+def v4_pull_lambda(body: V4LambdaPullBody = Body(default_factory=V4LambdaPullBody)) -> Dict[str, Any]:
+    env_host = os.environ.get("SWAY_LAMBDA_SWEEP_HOST")
+    if env_host is not None and not env_host.strip():
+        return {"ok": True, "pulled": False, "reason": "no_lambda_target"}
+
+    raw_host = (body.host or env_host or _SWAY_OPTUNA_LAMBDA_DEFAULT_IP).strip()
+    if not raw_host:
+        return {"ok": True, "pulled": False, "reason": "no_lambda_target"}
+
+    env_user = os.environ.get("SWAY_LAMBDA_SWEEP_USER")
+    user_default = (
+        (body.user or (env_user if env_user is not None else "") or _SWAY_OPTUNA_LAMBDA_DEFAULT_USER).strip() or "ubuntu"
+    )
+    if "@" in raw_host:
+        user, host = _parse_user_host(raw_host)
+    else:
+        user, host = user_default, raw_host
+    _validate_lambda_host(host)
+
+    pem: Optional[str] = None
+    if "SWAY_LAMBDA_SWEEP_PEM" in os.environ:
+        pem_raw = os.environ["SWAY_LAMBDA_SWEEP_PEM"].strip()
+        if pem_raw:
+            pem_path = Path(pem_raw).expanduser().resolve()
+            if not pem_path.is_file():
+                raise HTTPException(status_code=400, detail=f"PEM file not found: {pem_path}")
+            pem = str(pem_path)
+    elif body.pem and str(body.pem).strip():
+        pem_path = Path(str(body.pem).strip()).expanduser().resolve()
+        if not pem_path.is_file():
+            raise HTTPException(status_code=400, detail=f"PEM file not found: {pem_path}")
+        pem = str(pem_path)
+    else:
+        pem = _default_lambda_pem_path()
+
+    dest_root = _v4_sweep_root()
+    dest = dest_root / "sweep_status.json"
+    remote_override = (body.remote_path or os.environ.get("SWAY_LAMBDA_V4_REMOTE_PATH", "") or "").strip()
+    candidate_remotes: List[str] = []
+    if remote_override:
+        candidate_remotes.append(remote_override)
+    else:
+        candidate_remotes.append(_DEFAULT_V4_LAMBDA_REMOTE)
+        candidate_remotes.extend(_DEFAULT_V4_LAMBDA_REMOTE_FALLBACKS)
+
+    last_err: Optional[HTTPException] = None
+    pulled_remote: Optional[str] = None
+    for remote in candidate_remotes:
+        _validate_lambda_remote_path(remote)
+        try:
+            _scp_pull_remote_file(host=host, user=user, pem=pem, remote_path=remote, dest=dest)
+            pulled_remote = remote
+            last_err = None
+            break
+        except HTTPException as exc:
+            last_err = exc
+            detail = str(exc.detail or "")
+            if "No such file or directory" in detail and not remote_override:
+                continue
+            raise
+    if pulled_remote is None:
+        if last_err is not None:
+            raise last_err
+        raise HTTPException(status_code=502, detail="failed to pull v4 sweep_status.json")
+    out: Dict[str, Any] = {
+        "ok": True,
+        "pulled": True,
+        "wrote": str(dest),
+        "remote_path_used": pulled_remote,
+        "synced_trial_artifacts": False,
+    }
+    if body.sync_trial_artifacts:
+        remote_v4_override = (body.remote_v4_dir or os.environ.get("SWAY_LAMBDA_SWEEP_REMOTE_V4_DIR") or "").strip()
+        candidate_dirs: List[str] = []
+        if remote_v4_override:
+            candidate_dirs.append(remote_v4_override)
+        else:
+            candidate_dirs.append("~/sway_test/sway_pose_mvp/output/sweeps/v4_lambda_sweep/")
+            candidate_dirs.append("~/sway_test/sway_pose_mvp/plan_workspaces/plan-23-closed-set-identity-pipeline-v2/output/sweeps/v4_lambda_sweep/")
+
+        sync_dir_used: Optional[str] = None
+        sync_last_err: Optional[HTTPException] = None
+        for ro in candidate_dirs:
+            _validate_lambda_remote_path(ro)
+            try:
+                _rsync_optuna_dir_from_remote(
+                    host=host,
+                    user=user,
+                    pem=pem,
+                    remote_optuna_dir=ro,
+                    dest_root=dest_root,
+                )
+                sync_dir_used = ro
+                sync_last_err = None
+                break
+            except HTTPException as exc:
+                sync_last_err = exc
+                detail = str(exc.detail or "")
+                if "No such file or directory" in detail and not remote_v4_override:
+                    continue
+                raise
+        if sync_dir_used is None:
+            if sync_last_err is not None:
+                raise sync_last_err
+            raise HTTPException(status_code=502, detail="failed to sync v4 trial artifacts")
+        out["synced_trial_artifacts"] = True
+        out["dest_root"] = str(dest_root)
+        out["remote_v4_dir_used"] = sync_dir_used
+    return out
+
+
+@app.get("/api/v4-sweep/status")
+def v4_sweep_status() -> Dict[str, Any]:
+    p = _v4_sweep_root() / "sweep_status.json"
+    if not p.is_file():
+        return {
+            "schema": "sway_optuna_sweep_status_v1",
+            "empty_state": True,
+            "updated_unix": time.time(),
+            "study_name": "v4_lambda_sweep",
+            "direction": "maximize",
+            "n_trials_total": 0,
+            "n_complete": 0,
+            "n_pruned": 0,
+            "n_other": 0,
+            "best": None,
+            "trials": [],
+            "meta": {
+                "v4": True,
+                "hint": "v4 sweep_status.json not found — run run_v4_lambda_sweep.py",
+            },
+        }
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"invalid v4 sweep_status.json: {e}") from e
+
+
+@app.get("/api/v4-sweep/trial/{trial_number}/sequence/{sequence_name}/media")
+def v4_trial_media(trial_number: int, sequence_name: str) -> Dict[str, Any]:
+    if not _safe_optuna_sequence_segment(sequence_name):
+        raise HTTPException(400, "invalid sequence name")
+    trial_dir = _locate_v4_trial_dir(trial_number, sequence_name)
+    if trial_dir is None:
+        return {
+            "trial": trial_number,
+            "sequence": sequence_name,
+            "items": [],
+            "note": "No v4 trial output directory yet (or wrong sequence name).",
+        }
+    items: List[Dict[str, str]] = []
+    # Root phase outputs (phase*.mp4) for full-grid MAX-accuracy runs.
+    for fp in sorted(trial_dir.glob("phase*.mp4")):
+        items.append({"kind": "phase_output", "filename": fp.name, "path": fp.name})
+    for sub, kind in (("phase_previews", "phase_preview"), ("output", "output")):
+        d = trial_dir / sub
+        if not d.is_dir():
+            continue
+        for fp in sorted(d.glob("*.mp4")):
+            rel = f"{sub}/{fp.name}"
+            items.append({"kind": kind, "filename": fp.name, "path": rel})
+    return {"trial": trial_number, "sequence": sequence_name, "items": items}
+
+
+@app.get("/api/v4-sweep/trial/{trial_number}/sequence/{sequence_name}/file")
+def v4_trial_file(trial_number: int, sequence_name: str, path: str):
+    if not _safe_optuna_sequence_segment(sequence_name):
+        raise HTTPException(400, "invalid sequence name")
+    pnorm = Path(path)
+    if not path or pnorm.is_absolute() or ".." in pnorm.parts:
+        raise HTTPException(400, "invalid path")
+    trial_dir = _locate_v4_trial_dir(trial_number, sequence_name)
+    if trial_dir is None:
+        raise HTTPException(404, "trial output directory not found")
     target = (trial_dir / path).resolve()
     try:
         target.relative_to(trial_dir)

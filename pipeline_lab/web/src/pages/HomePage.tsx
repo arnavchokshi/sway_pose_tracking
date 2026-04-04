@@ -1,121 +1,74 @@
-import { useState, useEffect } from 'react'
-import './HomePage.css'
 import { Link } from 'react-router-dom'
+import './HomePage.css'
 import { SwayPhysicsCanvas } from '../components/SwayPhysicsBackground/SwayPhysicsCanvas'
 
 export function HomePage() {
-  const [color1, setColor1] = useState('#6366f1')
-  const [color2, setColor2] = useState('#22d3ee')
-  
-  const [activeColor1, setActiveColor1] = useState('#6366f1')
-  const [activeColor2, setActiveColor2] = useState('#22d3ee')
-
-
-  // Use a debounced effect to safely commit logic without freezing UI
-  useEffect(() => {
-    const handler = setTimeout(() => {
-      setActiveColor1(color1)
-      setActiveColor2(color2)
-    }, 150)
-    return () => clearTimeout(handler)
-  }, [color1, color2])
-
   return (
     <div className="home-container">
-      {/* 3D WebGPU Background */}
-      <SwayPhysicsCanvas 
-        key={`${activeColor1}-${activeColor2}`} 
-        color1={activeColor1} 
-        color2={activeColor2} 
-      />
+      <SwayPhysicsCanvas color1="#1144ff" color2="#ffffff" noiseAmplitude={25} attractorStrength={40} cohesion={30} />
+      <div className="overlay"></div>
 
-      {/* Stage lighting overlays */}
-      <div className="stage-glow stage-glow--left"></div>
-      <div className="stage-glow stage-glow--right"></div>
-      <div className="stage-glow stage-glow--top"></div>
-      <div className="home-overlay"></div>
+      <div className="corner corner--tl"></div>
+      <div className="corner corner--tr"></div>
+      <div className="corner corner--bl"></div>
+      <div className="corner corner--br"></div>
 
-      {/* Top navigation */}
-      <header className="home-top-bar">
-        <div className="home-logo">
-          <span className="logo-icon">✦</span>
-          <span className="logo-text">SWAY</span>
-        </div>
-        <nav className="home-nav">
-          <Link to="/lab">How It Works</Link>
-          <Link to="/lab">Features</Link>
-          <Link to="/compare">Compare</Link>
-          <Link to="/optuna-sweep">Sweep</Link>
-        </nav>
-        <Link to="/lab" className="login-btn">Log In</Link>
+      <header className="top-bar">
+        <div className="logo">Nexus Lab</div>
+        <ul className="nav">
+          <li><Link to="/lab">Research</Link></li>
+          <li><Link to="/compare">Protocol</Link></li>
+          <li><Link to="/optuna-sweep">Deploy</Link></li>
+        </ul>
       </header>
 
-      {/* Center hero */}
-      <div className="home-hero">
-        <div className="hero-badge">
-          <span className="badge-sparkle">✦</span>
-          Smarter formations, clearer rehearsals
+      <div className="status-badge">
+        <div className="status-dot"></div>
+        <span className="status-text">System Active</span>
+      </div>
+
+      <div className="hero">
+        <div className="hero-label">Introducing the next frontier</div>
+        <div className="hero-word">Singularity</div>
+        <div className="hero-sub">
+          Where intelligence converges.
+          <br />
+          Beyond the threshold.
         </div>
-
-        <h1 className="hero-headline">
-          Design. <span className="gradient-word">Teach.</span> <span className="gradient-word-alt">Perfect.</span>
-        </h1>
-
-        <p className="hero-sub">
-          The formation tool that syncs instantly between captains and dancers.<br />
-          Create complex choreography, teach it effortlessly.
-        </p>
-
-        <Link to="/lab" className="hero-cta">
-          <span>Get Started</span>
-          <span className="cta-arrow">→</span>
-        </Link>
+        <div className="hero-line"></div>
       </div>
 
-      {/* Floating confetti / particles */}
-      <div className="confetti-field">
-        {Array.from({ length: 18 }).map((_, i) => (
-          <div
-            key={i}
-            className={`confetti confetti--${i % 4 === 0 ? 'square' : i % 4 === 1 ? 'diamond' : i % 4 === 2 ? 'rect' : 'circle'}`}
-            style={{
-              left: `${5 + Math.random() * 90}%`,
-              top: `${5 + Math.random() * 70}%`,
-              animationDelay: `${Math.random() * 6}s`,
-              animationDuration: `${4 + Math.random() * 5}s`,
-              opacity: 0.15 + Math.random() * 0.35,
-            }}
-          />
-        ))}
+      <div className="panel-left">
+        <div className="vertical-label">Cohesion Protocol - Nexus Lab</div>
+        <div className="coords">
+          <span className="accent">NET.ONLINE</span>
+          <span>NODE 0x7F3A</span>
+          <span>EPOCH 2891</span>
+          <span>DRIFT 0.002</span>
+          <span className="accent">V.4.0.1</span>
+        </div>
       </div>
 
-      {/* Bottom gradient fade */}
-      <div className="bottom-fade"></div>
+      <div className="panel-right">
+        <div className="stat">
+          <div className="stat-value">49K</div>
+          <div className="stat-label">Active nodes</div>
+        </div>
+        <div className="stat">
+          <div className="stat-value">0.7ms</div>
+          <div className="stat-label">Latency</div>
+        </div>
+        <div className="stat">
+          <div className="stat-value">99.97</div>
+          <div className="stat-label">Uptime %</div>
+        </div>
+      </div>
 
-      {/* Aesthetics UI */}
-      <div className="perf-controls">
-        <label>
-          <span className="perf-label">Primary Glow</span>
-          <div className="color-picker-wrap">
-            <input 
-              type="color" 
-              value={color1} 
-              onChange={(e) => setColor1(e.target.value)}
-            />
-            <span className="color-hex">{color1.toUpperCase()}</span>
-          </div>
-        </label>
-        <label>
-          <span className="perf-label">Secondary Glow</span>
-          <div className="color-picker-wrap">
-            <input 
-              type="color" 
-              value={color2} 
-              onChange={(e) => setColor2(e.target.value)}
-            />
-            <span className="color-hex">{color2.toUpperCase()}</span>
-          </div>
-        </label>
+      <div className="bottom-bar">
+        <span className="tag">Neural mesh</span>
+        <span className="tag">Swarm intelligence</span>
+        <span className="tag">Quantum bridge</span>
+        <span className="tag">Singularity</span>
       </div>
     </div>
   )

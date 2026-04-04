@@ -160,6 +160,15 @@ CONTRACTS: List[TechnologyContract] = [
         trigger_env_keys=("SWAY_GNN_TRACK_REFINE",),
         trigger_values={"SWAY_GNN_TRACK_REFINE": "1|true|yes|on"},
     ),
+    TechnologyContract(
+        name="NOOUGAT graph stitch",
+        phase="3",
+        trigger_env_keys=("SWAY_NOOUGAT_ENABLED",),
+        trigger_values={"SWAY_NOOUGAT_ENABLED": "1|true|yes|on"},
+        required_feature_signals=("NOOUGATGraphStitch",),
+        allowed_branch="future",
+        forbidden_branch="boxmot",
+    ),
 
     # Phase 4–11 contracts are validated only on full pipeline runs
     # (see full_pipeline_required + stop_boundary gating below).

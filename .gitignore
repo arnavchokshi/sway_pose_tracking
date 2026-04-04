@@ -64,6 +64,11 @@ __pycache__/
 venv/
 .venv/
 env/
+.venv_shared/
+
+# Isolated plan workspaces / shared cache assets
+plan_workspaces/
+.cache/
 
 # Node (Pipeline Lab web)
 node_modules/

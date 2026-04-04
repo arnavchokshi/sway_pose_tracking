@@ -48,7 +48,7 @@ class DETRDetector:
     Implements the same detect() -> List[Detection] interface as the YOLO detector.
     """
 
-    SUPPORTED_MODELS = {"co_detr_swinl", "co_dino_swinl", "rt_detr_l", "rt_detr_x"}
+    SUPPORTED_MODELS = {"co_detr_swinl", "co_dino_swinl", "rt_detr_l", "rt_detr_x", "deimv2_x"}
 
     def __init__(
         self,
@@ -66,14 +66,52 @@ class DETRDetector:
             os.environ.get("SWAY_DETECT_SIZE", "800")
         )
         self._model = None
-        self._is_ultralytics = model_name.startswith("rt_detr")
+        self._is_deimv2 = model_name.startswith("deimv2")
+        self._is_ultralytics = model_name.startswith("rt_detr") or self._is_deimv2
         self._load_model()
 
     def _load_model(self) -> None:
-        if self._is_ultralytics:
+        if self._is_deimv2:
+            self._load_deimv2()
+        elif self._is_ultralytics:
             self._load_ultralytics_rtdetr()
         else:
             self._load_codetr()
+
+    def _load_deimv2(self) -> None:
+        """Load DEIMv2-X from HuggingFace (safetensors via PytorchModelHubMixin).
+
+        DEIMv2 uses model.safetensors format. Requires the DEIMv2 model architecture
+        (pip install deimv2) to instantiate. Falls back to RT-DETR-L if unavailable.
+        """
+        models_dir = Path(__file__).resolve().parent.parent / "models"
+        local_ckpt = models_dir / "deimv2_dinov3_x_coco.pth"
+
+        if local_ckpt.exists():
+            logger.info("DEIMv2-X local checkpoint found: %s", local_ckpt)
+
+        hf_repo = "Intellindust/DEIMv2_DINOv3_X_COCO"
+        logger.info("DEIMv2-X checkpoint not found locally; attempting HuggingFace download...")
+        try:
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download(repo_id=hf_repo, filename="model.safetensors")
+            logger.info("DEIMv2-X safetensors downloaded: %s", ckpt_path)
+            logger.warning(
+                "DEIMv2-X requires the DEIMv2 model architecture (pip install deimv2) "
+                "to instantiate from safetensors. Falling back to RT-DETR-L."
+            )
+        except Exception as exc:
+            logger.warning(
+                "DEIMv2-X download failed (%s). Please download from "
+                "https://huggingface.co/Intellindust/DEIMv2_DINOv3_X_COCO and place "
+                "model.pth as %s", exc, local_ckpt
+            )
+
+        logger.warning("DEIMv2-X not available; falling back to RT-DETR-L")
+        self.model_name = "rt_detr_l"
+        self._is_deimv2 = False
+        self._is_ultralytics = True
+        self._load_ultralytics_rtdetr()
 
     def _load_ultralytics_rtdetr(self) -> None:
         """Load RT-DETR via ultralytics (already a project dependency)."""

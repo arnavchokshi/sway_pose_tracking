@@ -44,22 +44,20 @@ export class BallPhysicsGPU {
     this.count = count
     this.radius = radius
     this.diameter = radius * 2
-    this.cohesionRange = radius * 4 // attraction range = 2× diameter
+    this.cohesionRange = radius * 4
     this.bounds = bounds
     this.maxPerCell = maxPerCell
 
-    // Spatial grid — cell size = sphere diameter, resolution derived from bounds
     this.gridResX = Math.ceil(bounds.x / this.diameter)
     this.gridResY = Math.ceil(bounds.y / this.diameter)
     this.gridResZ = Math.ceil(bounds.z / this.diameter)
     this.gridTotal = this.gridResX * this.gridResY * this.gridResZ
 
-    // Grid world-space origin (centered on X/Z, starts at 0 on Y)
+    // Exact baseline from your shared code
     this.gridOriginX = -bounds.x / 2
     this.gridOriginY = 0
     this.gridOriginZ = -bounds.z / 2
 
-    // Storage buffers
     this.positions = instancedArray(count, 'vec3')
     this.velocities = instancedArray(count, 'vec3')
     this.#forces = instancedArray(count, 'vec3')
@@ -67,7 +65,6 @@ export class BallPhysicsGPU {
     this.gridCounters = instancedArray(this.gridTotal, 'uint').toAtomic()
     this.gridParticles = instancedArray(this.gridTotal * maxPerCell, 'uint')
 
-    // Uniforms
     this.#dtUniform = uniform(0)
     this.gravityUniform = uniform(gravity)
     this.stiffnessUniform = uniform(stiffness)
@@ -78,7 +75,6 @@ export class BallPhysicsGPU {
     this.correctionStrengthUniform = uniform(correctionStrength)
     this.correctionDampingUniform = uniform(correctionDamping)
 
-    // Build compute shaders
     this.#computeInit = this.#buildInitShader()
     this.#computeClearGrid = this.#buildClearGridShader()
     this.#computeBuildGrid = this.#buildBuildGridShader()
@@ -102,8 +98,6 @@ export class BallPhysicsGPU {
     }
   }
 
-  // ── Compute shader builders ──────────────────────────────────────────────
-
   #buildInitShader() {
     const { count, radius, diameter, bounds, positions, velocities } = this
 
@@ -115,18 +109,9 @@ export class BallPhysicsGPU {
       const spreadZ = float(bounds.z - diameter * 2)
 
       pos.x.assign(hash(instanceIndex).mul(spreadX).sub(spreadX.mul(0.5)))
-      // Distribute balls in a low volume so they pile up on the ground
       const layersNeeded = Math.ceil(count / ((bounds.x / diameter) * (bounds.z / diameter)))
-      pos.y.assign(
-        hash(instanceIndex.add(count))
-          .mul(layersNeeded * diameter)
-          .add(radius),
-      )
-      pos.z.assign(
-        hash(instanceIndex.add(count * 2))
-          .mul(spreadZ)
-          .sub(spreadZ.mul(0.5)),
-      )
+      pos.y.assign(hash(instanceIndex.add(count)).mul(layersNeeded * diameter).add(radius))
+      pos.z.assign(hash(instanceIndex.add(count * 2)).mul(spreadZ).sub(spreadZ.mul(0.5)))
 
       vel.assign(vec3(0))
     })().compute(count)
@@ -217,7 +202,6 @@ export class BallPhysicsGPU {
       const cy = myPos.y.sub(gridOriginY).div(diameter).floor().toInt()
       const cz = myPos.z.sub(gridOriginZ).div(diameter).floor().toInt()
 
-      // 27 neighbor cells (flat iteration: n=0..26 → dx/dy/dz of -1,0,+1)
       Loop(27, ({ i: n }) => {
         const dx = n.toInt().mod(3).sub(1)
         const dy = n.toInt().div(3).mod(3).sub(1)
@@ -246,8 +230,6 @@ export class BallPhysicsGPU {
                 If(otherId.notEqual(instanceIndex), () => {
                   const otherPos = positions.element(otherId)
                   const diff = myPos.sub(otherPos)
-
-                  // Squared distance early-out: skip sqrt for far-away pairs
                   const distSq = diff.dot(diff)
                   const maxRangeSq = float(cohesionRange * cohesionRange)
 
@@ -255,30 +237,20 @@ export class BallPhysicsGPU {
                     const dist = distSq.sqrt()
                     const normal = diff.div(dist)
 
-                    // DEM collision (overlapping spheres)
                     If(dist.lessThan(diameter), () => {
                       const penetration = float(diameter).sub(dist)
-
-                      // Spring repulsion
                       force.addAssign(normal.mul(stiffnessUniform.mul(penetration)))
 
-                      // Normal damping (dashpot) — read velocity only when needed
                       const otherVel = velocities.element(otherId)
                       const relVel = myVel.sub(otherVel)
                       force.subAssign(normal.mul(dampingUniform.mul(relVel.dot(normal))))
                     })
 
-                    // Cohesion — short-range attraction with smooth hermite falloff
-                    // Acts on nearby non-overlapping pairs (surface to cohesionRange)
                     If(dist.greaterThanEqual(diameter).and(dist.lessThan(cohesionRange)), () => {
-                      // t = 1 at surface contact, 0 at range boundary // OPTIMIZATION: Removed dist.lessThan(cohesionRange) check since distSq max bound already asserts it implicitly
                       const t = float(1).sub(dist.sub(diameter).div(cohesionRange - diameter))
-                      // Smooth hermite falloff: t² × (3 - 2t)
                       const falloff = t.mul(t).mul(float(3).sub(t.mul(2)))
-                      // Attract toward neighbor (negative normal direction)
                       force.subAssign(normal.mul(cohesionUniform.mul(falloff)))
 
-                      // Cohesion damping — fixed-coefficient dashpot (independent of collision damping)
                       const otherVelC = velocities.element(otherId)
                       const relVelC = myVel.sub(otherVelC)
                       force.subAssign(normal.mul(float(10).mul(relVelC.dot(normal)).mul(falloff)))
@@ -315,15 +287,11 @@ export class BallPhysicsGPU {
       const extForce = externalForces.element(instanceIndex)
       const dt = dtUniform
 
-      // Semi-implicit Euler
       vel.addAssign(force.mul(dt))
       vel.addAssign(extForce.mul(dt))
       vel.y.addAssign(gravityUniform.mul(dt))
-
-      // Air drag
       vel.mulAssign(0.999)
 
-      // Clamp velocity
       const speed = vel.length()
       If(speed.greaterThan(20), () => {
         vel.assign(vel.div(speed).mul(20))
@@ -331,7 +299,6 @@ export class BallPhysicsGPU {
 
       pos.addAssign(vel.mul(dt))
 
-      // Ground collision
       const r = float(radius)
       If(pos.y.lessThan(r), () => {
         pos.y.assign(r)
@@ -342,7 +309,6 @@ export class BallPhysicsGPU {
         })
       })
 
-      // Wall constraints (offset by radius so sphere surface touches wall edge)
       const wallMinX = float(-bounds.x / 2).add(r)
       const wallMaxX = float(bounds.x / 2).sub(r)
       const wallMinZ = float(-bounds.z / 2).add(r)
@@ -406,8 +372,6 @@ export class BallPhysicsGPU {
     return Fn(() => {
       const myPos = positions.element(instanceIndex)
       const vel = velocities.element(instanceIndex)
-
-      // Accumulate corrections using local variables (no intermediate buffers)
       const correction = vec3(0).toVar()
       const neighborCount = float(0).toVar()
 
@@ -449,7 +413,6 @@ export class BallPhysicsGPU {
                     const dist = distSq.sqrt()
                     const penetration = float(diameter).sub(dist)
                     const normal = diff.div(dist)
-
                     correction.addAssign(normal.mul(penetration.mul(correctionStrengthUniform)))
                     neighborCount.addAssign(1)
                   })
@@ -460,7 +423,6 @@ export class BallPhysicsGPU {
         )
       })
 
-      // Apply averaged correction + velocity damping + boundary re-clamp
       If(neighborCount.greaterThan(0), () => {
         const avgCorrection = correction.div(neighborCount)
         myPos.addAssign(avgCorrection)
@@ -475,7 +437,6 @@ export class BallPhysicsGPU {
         })
       })
 
-      // Re-apply boundary constraints after correction
       const r = float(radius)
       const wallMinX = float(-bounds.x / 2).add(r)
       const wallMaxX = float(bounds.x / 2).sub(r)

@@ -2635,6 +2635,10 @@ p.sub {
   background: rgba(56, 189, 248, 0.2);
   color: var(--halo-cyan);
 }
+.optuna-pill--queued {
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+}
 .optuna-pill--fail,
 .optuna-pill--failed {
   background: rgba(239, 68, 68, 0.2);
@@ -2945,6 +2949,7 @@ p.sub {
   justify-content: space-between;
   gap: 0.65rem;
   width: 100%;
+  min-width: 0;
   box-sizing: border-box;
   padding: 0.28rem 0.55rem;
   border-radius: 999px;
@@ -2963,9 +2968,25 @@ p.sub {
 .optuna-param-val {
   color: #e2e8f0;
   font-weight: 600;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 68%;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optuna-param-subval {
+  display: block;
+  width: 100%;
+  margin-top: 0.1rem;
+  color: #94a3b8;
+  font-size: 0.66rem;
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+  opacity: 0.9;
 }
 
 /* Chart sections */
@@ -3350,6 +3371,21 @@ p.sub {
   font-size: 0.76rem;
   font-family: ui-monospace, monospace;
   color: #64748b;
+}
+
+.optuna-table-config-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 240px;
+}
+
+.optuna-table-config-diff-text {
+  font-size: 0.76rem;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Video empty card (improved) */
@@ -3988,6 +4024,7 @@ p.sub {
 
   .optuna-param-val {
     text-align: left;
+    max-width: 100%;
   }
 
   .optuna-score-bar-row {

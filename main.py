@@ -230,6 +230,7 @@ from sway.reid_fusion import ReIDFusionEngine, ReIDQuery, UNKNOWN_ID
 from sway.pose_gated_ema import PoseGatedEMA
 from sway.reid_factory import create_reid_ensemble
 from sway.collision_solver import CoalescenceDetector, solve_collision
+from sway.noougat_graph_stitch import NOOUGATGraphStitcher, make_tracklet_node
 from sway.backward_pass import (
     is_backward_pass_enabled as is_future_backward_enabled,
     run_backward_pass,
@@ -1563,6 +1564,9 @@ def main():
                 gallery=enrollment_galleries,
                 signal_modules=_reid_signals,
             )
+            _part_reid = _reid_signals.get("part")
+            _color_reid = _reid_signals.get("color")
+            _face_reid = _reid_signals.get("face")
 
             # Optional COI module (PLAN_05)
             _ft_coi = CrossObjectInteraction() if os.environ.get("SWAY_COI_ENABLED", "1").strip().lower() in ("1", "true", "yes") else None
@@ -1621,7 +1625,62 @@ def main():
             _collision_events = 0
             _collision_exits = 0
             _collision_assignments = 0
+            _noougat_requested = os.environ.get("SWAY_NOOUGAT_ENABLED", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            _noougat = NOOUGATGraphStitcher() if _noougat_requested else None
+            _noougat_zones = 0
+            _noougat_stitches = 0
+            _track_id_alias: Dict[int, int] = {}
             _temp_scaler = get_temperature_scaler()
+
+            def _resolve_alias(_tid: int) -> int:
+                seen = set()
+                cur = int(_tid)
+                while cur in _track_id_alias and cur not in seen:
+                    seen.add(cur)
+                    cur = int(_track_id_alias[cur])
+                return cur
+
+            def _crop_from_bbox(_frame: np.ndarray, _bb: np.ndarray) -> np.ndarray:
+                _h, _w = _frame.shape[:2]
+                x1 = max(0, min(int(float(_bb[0])), _w - 1))
+                y1 = max(0, min(int(float(_bb[1])), _h - 1))
+                x2 = max(x1 + 1, min(int(float(_bb[2])), _w))
+                y2 = max(y1 + 1, min(int(float(_bb[3])), _h))
+                return _frame[y1:y2, x1:x2]
+
+            def _query_from_track_result(_frame: np.ndarray, _r) -> ReIDQuery:
+                _bb = _r.bbox_xyxy.astype(np.float32)
+                _crop = _crop_from_bbox(_frame, _bb)
+                _q = ReIDQuery(
+                    track_id=int(_r.track_id),
+                    spatial_position=(
+                        float((_bb[0] + _bb[2]) * 0.5),
+                        float((_bb[1] + _bb[3]) * 0.5),
+                    ),
+                )
+                if _crop.size == 0:
+                    return _q
+                try:
+                    if _part_reid is not None:
+                        _q.part_embeddings = _part_reid.extract(_crop, keypoints=None, mask=None)
+                except Exception:
+                    pass
+                try:
+                    if _color_reid is not None:
+                        _q.color_histograms = _color_reid.extract(_crop, mask=None, keypoints=None)
+                except Exception:
+                    pass
+                try:
+                    if _face_reid is not None:
+                        _q.face_embedding = _face_reid.extract(_crop)
+                except Exception:
+                    pass
+                return _q
 
             if _mote_requested:
                 _flow_model = os.environ.get("SWAY_MOTE_FLOW_MODEL", "raft_small").strip()
@@ -1878,6 +1937,31 @@ def main():
                     }
                     _new_events = _coalescence_detector.check(_bbox_map, fidx, galleries=None)
                     _collision_events += int(len(_new_events))
+                    if _noougat is not None and _new_events:
+                        for _ev in _new_events:
+                            _entry_nodes = {}
+                            for _tid in _ev.track_ids:
+                                if _tid not in _bbox_map:
+                                    continue
+                                _match = next((rr for rr in results if int(rr.track_id) == int(_tid)), None)
+                                if _match is None:
+                                    continue
+                                _q = _query_from_track_result(frame, _match)
+                                _entry_nodes[int(_tid)] = make_tracklet_node(
+                                    track_id=int(_tid),
+                                    frame_idx=int(fidx),
+                                    bbox_xyxy=_bbox_map[_tid],
+                                    query=_q,
+                                    prev_center_xy=_prev_track_centers.get(int(_tid)),
+                                    dt_frames=1,
+                                )
+                            if _entry_nodes:
+                                _noougat.start_dark_zone(
+                                    track_ids=_ev.track_ids,
+                                    entry_frame=int(fidx),
+                                    entry_nodes=_entry_nodes,
+                                )
+                                _noougat_zones += 1
                     _exit_events = _coalescence_detector.check_exits(_bbox_map, fidx)
                     _collision_exits += int(len(_exit_events))
                     for _ev in _exit_events:
@@ -1904,8 +1988,46 @@ def main():
                             solver=_collision_solver,
                         )
                         _collision_assignments += int(len(_pairs))
+                        if _noougat is not None:
+                            _exit_nodes = {}
+                            for _tid in _exit_ids:
+                                _match = next((rr for rr in results if int(rr.track_id) == int(_tid)), None)
+                                if _match is None:
+                                    continue
+                                _q = _query_from_track_result(frame, _match)
+                                _exit_nodes[int(_tid)] = make_tracklet_node(
+                                    track_id=int(_tid),
+                                    frame_idx=int(fidx),
+                                    bbox_xyxy=_bbox_map[_tid],
+                                    query=_q,
+                                    prev_center_xy=_prev_track_centers.get(int(_tid)),
+                                    dt_frames=1,
+                                )
+                            _stitch = _noougat.resolve_dark_zone(
+                                track_ids=_ev.track_ids,
+                                exit_frame=int(fidx),
+                                exit_nodes=_exit_nodes,
+                            )
+                            if _stitch is not None and _stitch.assignments:
+                                for _frozen_tid, _exit_tid in _stitch.assignments:
+                                    _frozen_canonical = _resolve_alias(int(_frozen_tid))
+                                    _track_id_alias[int(_exit_tid)] = int(_frozen_canonical)
+                                _noougat_stitches += int(len(_stitch.assignments))
 
-                _ft_results_by_frame[fidx] = results
+                _canonical_results = []
+                for _r in results:
+                    _canon_tid = _resolve_alias(int(_r.track_id))
+                    _canonical_results.append(
+                        _r.__class__(
+                            track_id=int(_canon_tid),
+                            bbox_xyxy=_r.bbox_xyxy.copy(),
+                            mask=_r.mask,
+                            confidence=float(_r.confidence),
+                            state=_r.state,
+                            mask_area=float(_r.mask_area),
+                        )
+                    )
+                _ft_results_by_frame[fidx] = _canonical_results
                 _prev_result_ids = _curr_result_ids
                 _prev_track_states = _curr_track_states
                 _prev_track_centers = _curr_track_centers
@@ -1986,6 +2108,13 @@ def main():
                 _collision_assignments,
             )
             _log_feature_state("CollisionSolver", requested=_collision_requested, active=_collision_active, wired=True, details=_collision_details)
+            _noougat_active = _noougat is not None and _noougat_stitches > 0
+            _noougat_details = "zones=%d, stitched_pairs=%d, aliases=%d" % (
+                _noougat_zones,
+                _noougat_stitches,
+                len(_track_id_alias),
+            )
+            _log_feature_state("NOOUGATGraphStitch", requested=_noougat_requested, active=_noougat_active, wired=(_noougat is not None), details=_noougat_details)
 
             # Optional backward pass (PLAN_16)
             _backward_enabled = (

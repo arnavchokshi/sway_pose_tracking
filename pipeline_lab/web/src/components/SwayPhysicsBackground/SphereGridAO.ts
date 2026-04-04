@@ -26,10 +26,12 @@ export class SphereGridAO {
       gridOriginZ,
     } = physics
 
+    // Per-instance: xyz = weighted occlusion direction, w = total occlusion weight
     const aoBuffer = instancedArray(count, 'vec4')
     this.aoBuffer = aoBuffer
     const aoRadiusU = this.aoRadiusUniform
 
+    // Compute shader: per-instance directional AO using physics grid
     this.computeAO = Fn(() => {
       const myPos = positions.element(instanceIndex)
       const occDir = vec3(0, 0, 0).toVar()
@@ -70,11 +72,11 @@ export class SphereGridAO {
                   const distSq = diff.dot(diff)
                   const aoRadSq = aoRadiusU.mul(aoRadiusU)
 
-                  // OPTIMIZATION applied here: We skip `.and(distSq.greaterThan(radiusSq))` because if they intersect significantly, it's DEM's job to handle, but for AO we can just clamp `t` below so it never goes negative or crazy. BUT to exactly match functionality requested, kept user condition to prevent dark spot clipping.
                   If(distSq.lessThan(aoRadSq).and(distSq.greaterThan(radiusSq)), () => {
                     const dist = distSq.sqrt()
-                    const t = float(1.0).sub(dist.div(aoRadiusU)).clamp(0, 1) // optimized by clamping T
+                    const t = float(1.0).sub(dist.div(aoRadiusU))
                     const occ = t.mul(t)
+                    // Accumulate direction toward neighbor, weighted by occlusion
                     occDir.addAssign(diff.negate().normalize().mul(occ))
                     occWeight.addAssign(occ)
                   })

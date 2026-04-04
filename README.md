@@ -26,6 +26,21 @@ cd sway_pose_mvp
 pip install -r requirements.txt
 ```
 
+## Isolated Plan Workspaces (Shared Models)
+
+If you want each new plan to be fully separate while reusing downloaded models/deps, use the plan workspace script:
+
+```bash
+bash scripts/new_plan_workspace.sh --plan PLAN_22
+```
+
+It creates an isolated branch + worktree for that plan, then links:
+
+- `models/` -> shared `models/`
+- `.plan_env` with shared model/cache exports (including model weight paths when present)
+
+This works without a virtual environment. Optional shared venv mode is available with `--with-shared-venv`. Full guide: `docs/Future_Plans/SEPARATE_PLAN_WORKSPACES.md`.
+
 ## Run one video
 
 ```bash

@@ -42,6 +42,17 @@ type OptunaSweepMeta = {
   storage?: string
   git_sha?: string
   hint?: string
+  v4?: boolean
+  v4_mode?: string
+  has_stages?: boolean
+  stage?: string
+  stage_expected_counts?: Record<string, number>
+  planned_trials_total?: number
+  planned_video_runs_total?: number
+  stage_planned_trials_total?: number
+  stage_planned_video_runs_total?: number
+  videos_per_trial?: number
+  objective_components?: Record<string, number>
 }
 
 type OptunaTrialRow = {
@@ -85,22 +96,28 @@ type MediaResponse = {
   note?: string
 }
 
+type SweepMode = 'optuna' | 'v4'
+
 // ─── URL helpers ─────────────────────────────────────────────────────────────
 
-function pullLambdaUrl() {
-  return `${API}/api/optuna-sweep/pull-lambda`
+function sweepApiBase(mode: SweepMode) {
+  return `${API}/api/${mode === 'v4' ? 'v4-sweep' : 'optuna-sweep'}`
 }
-function statusUrl() {
-  return `${API}/api/optuna-sweep/status`
+function pullLambdaUrl(mode: SweepMode) {
+  return `${sweepApiBase(mode)}/pull-lambda`
 }
-function mediaUrl(trial: number, sequence: string) {
-  return `${API}/api/optuna-sweep/trial/${trial}/sequence/${encodeURIComponent(sequence)}/media`
+function statusUrl(mode: SweepMode) {
+  return `${sweepApiBase(mode)}/status`
 }
-function fileUrl(trial: number, sequence: string, relPath: string) {
+function mediaUrl(mode: SweepMode, trial: number, sequence: string) {
+  return `${sweepApiBase(mode)}/trial/${trial}/sequence/${encodeURIComponent(sequence)}/media`
+}
+function fileUrl(mode: SweepMode, trial: number, sequence: string, relPath: string) {
   const q = new URLSearchParams({ path: relPath })
   const base =
     import.meta.env.DEV && typeof window !== 'undefined' ? PIPELINE_LAB_LOCAL.apiOrigin : API
-  return `${base}/api/optuna-sweep/trial/${trial}/sequence/${encodeURIComponent(sequence)}/file?${q}`
+  const ns = mode === 'v4' ? 'v4-sweep' : 'optuna-sweep'
+  return `${base}/api/${ns}/trial/${trial}/sequence/${encodeURIComponent(sequence)}/file?${q}`
 }
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
@@ -216,6 +233,82 @@ function diffParamKeys(a: Record<string, unknown>, b: Record<string, unknown>): 
   return diff
 }
 
+function compactParamValue(k: string, v: unknown): string {
+  const raw = String(v ?? '')
+  if ((k.includes('weight') || k.includes('path')) && raw.includes('/')) {
+    return raw.split('/').pop() || raw
+  }
+  if (raw.length > 42) return `${raw.slice(0, 42)}…`
+  return raw
+}
+
+function trialConfigDiffSummary(
+  trial: OptunaTrialRow,
+  best: OptunaBest | null,
+): { count: number; rows: string[] } {
+  if (!best || trial.number === best.number) return { count: 0, rows: ['baseline (best)'] }
+  const keys = [...diffParamKeys(best.params, trial.params)].sort()
+  const rows: string[] = []
+  for (const k of keys) {
+    const from = compactParamValue(k, best.params[k])
+    const to = compactParamValue(k, trial.params[k])
+    rows.push(`${k}: ${from} -> ${to}`)
+  }
+  return { count: rows.length, rows: rows.slice(0, 4) }
+}
+
+function trialProgressSummary(t: OptunaTrialRow): { label: string; detail: string; tone: 'running' | 'complete' | 'failed' | 'queued' } {
+  const ua = t.user_attrs ?? {}
+  const curVideo = String(ua.progress_current_video ?? '').trim()
+  const curPhase = String(ua.progress_current_phase ?? '').trim()
+  const idxRaw = ua.progress_video_index
+  const totalRaw = ua.progress_video_total
+  const idx = typeof idxRaw === 'number' ? idxRaw : Number(idxRaw)
+  const total = typeof totalRaw === 'number' ? totalRaw : Number(totalRaw)
+  const videoPart = Number.isFinite(idx) && Number.isFinite(total) && total > 0 ? `video ${Math.max(0, idx)}/${Math.max(1, total)}` : 'video —'
+  if (t.state === 'COMPLETE') return { label: 'done', detail: `${videoPart} · phase: final`, tone: 'complete' }
+  if (t.state === 'FAIL' || t.state === 'ERROR') return { label: 'failed', detail: `${videoPart} · video: ${curVideo || 'n/a'} · phase: ${curPhase || 'n/a'}`, tone: 'failed' }
+  if (t.state === 'RUNNING') return { label: 'running', detail: `${videoPart} · video: ${curVideo || 'pending'} · phase: ${curPhase || 'starting'}`, tone: 'running' }
+  return { label: t.state.toLowerCase(), detail: `${videoPart} · phase: queued`, tone: 'queued' }
+}
+
+function phaseLabel(raw: unknown): string {
+  const p = String(raw ?? '').trim().toLowerCase()
+  if (!p || p === 'starting') return 'phase0_enrollment'
+  return p
+}
+
+function trialProgressNumbers(t: OptunaTrialRow): {
+  videoIndex: number
+  videoTotal: number
+  phasePct: number | null
+  overallPct: number | null
+} {
+  const ua = t.user_attrs ?? {}
+  const phase = String(ua.progress_current_phase ?? '').toLowerCase()
+  const state = String(t.state ?? '').toUpperCase()
+  const idxRaw = ua.progress_video_index
+  const totalRaw = ua.progress_video_total
+  const pctRaw = ua.progress_current_phase_pct
+  const idx = typeof idxRaw === 'number' ? idxRaw : Number(idxRaw)
+  const total = typeof totalRaw === 'number' ? totalRaw : Number(totalRaw)
+  const phasePctParsed = typeof pctRaw === 'number' ? pctRaw : Number(pctRaw)
+  let phasePct = Number.isFinite(phasePctParsed) ? Math.max(0, Math.min(100, phasePctParsed)) : null
+  // Avoid sticky 100% visuals while a trial is still RUNNING and not finished.
+  if (state === 'RUNNING' && phasePct != null && phasePct >= 99.9 && !['done', 'failed', 'phase8_final'].includes(phase)) {
+    phasePct = 99.0
+  }
+  if (!(Number.isFinite(idx) && Number.isFinite(total) && total > 0)) {
+    return { videoIndex: 0, videoTotal: 0, phasePct, overallPct: null }
+  }
+  const i = Math.max(0, idx)
+  const ttot = Math.max(1, total)
+  const base = Math.max(0, Math.min(ttot, i - 1)) / ttot
+  const frac = (phasePct ?? 0) / 100.0 / ttot
+  const overall = Math.max(0, Math.min(100, (base + frac) * 100))
+  return { videoIndex: i, videoTotal: ttot, phasePct, overallPct: overall }
+}
+
 function formatHttpDetail(res: Response, body: unknown): string {
   if (body && typeof body === 'object' && 'detail' in body) {
     const d = (body as { detail: unknown }).detail
@@ -305,6 +398,12 @@ function resolveTrialWallDurationSec(t: OptunaTrialRow): number | null {
     if (n != null) sum += n
   }
   return sum > 0 ? Math.round(sum * 10) / 10 : null
+}
+
+function safeMean(values: number[]): number | null {
+  if (!values.length) return null
+  const s = values.reduce((a, b) => a + b, 0)
+  return s / values.length
 }
 
 /** Y-axis (or X) range with padding — zooms into narrow data bands instead of pinning to 0 */
@@ -1639,15 +1738,21 @@ function TrialConfigCard({
         <div className="optuna-params-grid">
           {Object.entries(model.params)
             .sort(([a], [b]) => a.localeCompare(b))
-            .map(([k, v]) => (
-              <div
-                key={k}
-                className={`optuna-param-pill${paramDiffKeys.has(k) ? ' optuna-param-pill--diff' : ''}`}
-              >
-                <span className="optuna-param-key">{k}</span>
-                <span className="optuna-param-val">{String(v)}</span>
-              </div>
-            ))}
+            .map(([k, v]) => {
+              const full = String(v)
+              const isPathLike = (k.includes('weight') || k.includes('path')) && full.includes('/')
+              const compact = isPathLike ? (full.split('/').pop() || full) : full
+              return (
+                <div
+                  key={k}
+                  className={`optuna-param-pill${paramDiffKeys.has(k) ? ' optuna-param-pill--diff' : ''}`}
+                >
+                  <span className="optuna-param-key">{k}</span>
+                  <span className="optuna-param-val" title={full}>{compact}</span>
+                  {isPathLike ? <span className="optuna-param-subval" title={full}>{full}</span> : null}
+                </div>
+              )
+            })}
         </div>
       </div>
     </section>
@@ -2300,6 +2405,7 @@ function OptunaDirectionPanel({
 // ─── Main Page ─────────────────────────────────────────────────────────────────
 
 export function OptunaSweepPage() {
+  const [sweepMode, setSweepMode] = useState<SweepMode>('v4')
   const [data, setData] = useState<OptunaSweepStatus | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -2307,6 +2413,7 @@ export function OptunaSweepPage() {
   const [sequence, setSequence] = useState<string>('')
   const [media, setMedia] = useState<MediaResponse | null>(null)
   const [mediaLoading, setMediaLoading] = useState(false)
+  const [proofMode, setProofMode] = useState<'video' | 'progress'>('video')
   const [pickedClip, setPickedClip] = useState<string | null>(null)
   const [chartMode, setChartMode] = useState<'bar' | 'scatter'>('bar')
   const [showRollingAvg, setShowRollingAvg] = useState(true)
@@ -2315,37 +2422,58 @@ export function OptunaSweepPage() {
   const [scatterParam, setScatterParam] = useState<string>('')
   const analyticsBestColRef = useRef<HTMLDivElement>(null)
   const [analyticsBestColHeight, setAnalyticsBestColHeight] = useState<number | null>(null)
+  const lastStatusRef = useRef<{ updatedUnix: number; nComplete: number } | null>(null)
   const [trialTableSort, setTrialTableSort] = useState<{ col: TrialTableSortCol; dir: 'asc' | 'desc' }>({
     col: 'trial',
     dir: 'desc',
   })
+  const [stageFilter, setStageFilter] = useState<string>('all')
 
   const sync = useCallback(async (opts?: { syncTrialArtifacts?: boolean }) => {
     const syncTrialArtifacts = opts?.syncTrialArtifacts ?? false
     setLoading(true)
     setErr(null)
-    let reachedStatusFetch = false
+    let pullWarn: string | null = null
     try {
-      const pr = await fetch(pullLambdaUrl(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sync_trial_artifacts: syncTrialArtifacts }),
-      })
-      const pj = await pr.json().catch(() => null)
-      if (!pr.ok) throw new Error(formatHttpDetail(pr, pj))
+      try {
+        const pr = await fetch(pullLambdaUrl(sweepMode), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sync_trial_artifacts: syncTrialArtifacts }),
+        })
+        const pj = await pr.json().catch(() => null)
+        if (!pr.ok) {
+          pullWarn = formatHttpDetail(pr, pj)
+        }
+      } catch (e) {
+        pullWarn = e instanceof Error ? e.message : String(e)
+      }
 
-      reachedStatusFetch = true
-      const sr = await fetch(statusUrl())
+      const sr = await fetch(statusUrl(sweepMode))
       const t = await sr.text()
       if (!sr.ok) throw new Error(t || sr.statusText)
-      setData(JSON.parse(t) as OptunaSweepStatus)
+      const parsed = JSON.parse(t) as OptunaSweepStatus
+      // #region agent log
+      fetch('http://127.0.0.1:7840/ingest/2e89ee7e-7e09-4947-9405-6f6b907db65f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'1f2ff8'},body:JSON.stringify({sessionId:'1f2ff8',runId:'slow-sweep-check',hypothesisId:'H1_H3_H4_H5',location:'OptunaSweepPage.tsx:sync',message:'status_poll_snapshot',data:{mode:sweepMode,updated_unix:parsed.updated_unix,n_trials_total:parsed.n_trials_total,n_complete:parsed.n_complete,n_other:parsed.n_other,running:(parsed.trials||[]).filter((r)=>r.state==='RUNNING').slice(0,3).map((r)=>({n:r.number,video:r.user_attrs?.progress_current_video,phase:r.user_attrs?.progress_current_phase,pct:r.user_attrs?.progress_current_phase_pct,duration_s:r.duration_s}))},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      const prev = lastStatusRef.current
+      if (prev && (parsed.n_complete < prev.nComplete || parsed.updated_unix < prev.updatedUnix)) {
+        // #region agent log
+        fetch('http://127.0.0.1:7840/ingest/2e89ee7e-7e09-4947-9405-6f6b907db65f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'1f2ff8'},body:JSON.stringify({sessionId:'1f2ff8',runId:'slow-sweep-check',hypothesisId:'H4',location:'OptunaSweepPage.tsx:sync',message:'status_counter_regression_detected',data:{prev_updated_unix:prev.updatedUnix,prev_n_complete:prev.nComplete,cur_updated_unix:parsed.updated_unix,cur_n_complete:parsed.n_complete},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+      }
+      lastStatusRef.current = { updatedUnix: parsed.updated_unix, nComplete: parsed.n_complete }
+      setData(parsed)
+      if (pullWarn) {
+        setErr(`Live pull warning (showing latest local status): ${pullWarn}`)
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
-      if (reachedStatusFetch) setData(null)
+      setData(null)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [sweepMode])
 
   useEffect(() => {
     sync({ syncTrialArtifacts: false })
@@ -2371,11 +2499,13 @@ export function OptunaSweepPage() {
     ;(async () => {
       setMediaLoading(true)
       try {
-        const r = await fetch(mediaUrl(selectedTrial, sequence))
+        const r = await fetch(mediaUrl(sweepMode, selectedTrial, sequence))
         const j = (await r.json()) as MediaResponse
         if (!cancelled) {
           setMedia(j)
           const preferred =
+            j.items.find((x) => x.filename.includes('phase8_final_optimized')) ||
+            j.items.find((x) => x.filename.includes('phase3_tracking_bidirectional')) ||
             j.items.find((x) => x.filename.includes('01_tracks_post_stitch')) ||
             j.items.find((x) => x.kind === 'phase_preview') ||
             j.items[0] ||
@@ -2389,9 +2519,121 @@ export function OptunaSweepPage() {
       }
     })()
     return () => { cancelled = true }
-  }, [selectedTrial, sequence])
+  }, [selectedTrial, sequence, sweepMode])
 
   const sequences = data?.meta?.sequence_order ?? []
+  const isV4Data = sweepMode === 'v4' || Boolean(data?.meta?.v4)
+  const stageOrder = ['stage_a', 'stage_b', 'stage_c'] as const
+  const hasV4Stages = useMemo(() => {
+    if (!isV4Data) return false
+    if (data?.meta?.has_stages === false) return false
+    const raw = data?.meta?.stage_expected_counts
+    if (!raw || typeof raw !== 'object') return false
+    return stageOrder.some((s) => {
+      const v = (raw as Record<string, unknown>)[s]
+      return typeof v === 'number' && Number.isFinite(v) && v > 0
+    })
+  }, [isV4Data, data?.meta?.has_stages, data?.meta?.stage_expected_counts])
+
+  const stageExpected = useMemo<Record<string, number>>(() => {
+    if (!hasV4Stages) return {}
+    const raw = data?.meta?.stage_expected_counts
+    if (!raw || typeof raw !== 'object') {
+      return { stage_a: 16, stage_b: 10, stage_c: 1 }
+    }
+    const out: Record<string, number> = {}
+    for (const s of stageOrder) {
+      const v = (raw as Record<string, unknown>)[s]
+      out[s] = typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
+    }
+    return out
+  }, [data?.meta?.stage_expected_counts, hasV4Stages])
+
+  const stageCounts = useMemo(() => {
+    const out: Record<string, { total: number; complete: number; fail: number }> = {}
+    for (const s of stageOrder) out[s] = { total: 0, complete: 0, fail: 0 }
+    for (const t of data?.trials ?? []) {
+      const st = String((t.user_attrs?.stage as string) || '').toLowerCase()
+      if (!out[st]) out[st] = { total: 0, complete: 0, fail: 0 }
+      out[st].total += 1
+      if (t.state === 'COMPLETE') out[st].complete += 1
+      if (t.state === 'FAIL' || t.state === 'ERROR') out[st].fail += 1
+    }
+    return out
+  }, [data?.trials])
+
+  const plannedTrialsTotal = useMemo(() => {
+    if (typeof data?.meta?.planned_trials_total === 'number') return data.meta.planned_trials_total
+    if (!hasV4Stages) return data?.n_trials_total ?? 0
+    return Object.values(stageExpected).reduce((a, b) => a + Math.max(0, b), 0)
+  }, [data?.meta?.planned_trials_total, stageExpected, hasV4Stages, data?.n_trials_total])
+
+  const plannedVideoRunsTotal = useMemo(() => {
+    if (typeof data?.meta?.planned_video_runs_total === 'number') return data.meta.planned_video_runs_total
+    const videosPerTrial = typeof data?.meta?.videos_per_trial === 'number'
+      ? data.meta.videos_per_trial
+      : (data?.meta?.sequence_order?.length ?? 0)
+    return plannedTrialsTotal * videosPerTrial
+  }, [data?.meta?.planned_video_runs_total, data?.meta?.videos_per_trial, data?.meta?.sequence_order?.length, plannedTrialsTotal])
+
+  const videosPerTrialCount = useMemo(() => {
+    if (typeof data?.meta?.videos_per_trial === 'number') return data.meta.videos_per_trial
+    return sequences.length
+  }, [data?.meta?.videos_per_trial, sequences.length])
+
+  const avgCompletedTrialDurationSec = useMemo(() => {
+    const durations = (data?.trials ?? [])
+      .filter((t) => t.state === 'COMPLETE')
+      .map((t) => resolveTrialWallDurationSec(t))
+      .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0)
+    return safeMean(durations)
+  }, [data?.trials])
+
+  const startedTrialsCount = useMemo(() => {
+    const rows = data?.trials ?? []
+    if (!rows.length) return 0
+    return rows.filter((t) => String(t.state).toUpperCase() !== 'QUEUED').length
+  }, [data?.trials])
+
+  const queuedTrialsCount = useMemo(() => {
+    const rows = data?.trials ?? []
+    if (!rows.length) return 0
+    return rows.filter((t) => String(t.state).toUpperCase() === 'QUEUED').length
+  }, [data?.trials])
+
+  const remainingTrials = useMemo(() => {
+    if (!data) return null
+    return Math.max(0, plannedTrialsTotal - startedTrialsCount)
+  }, [data, plannedTrialsTotal, startedTrialsCount])
+
+  const etaSec = useMemo(() => {
+    if (remainingTrials == null || avgCompletedTrialDurationSec == null) return null
+    return Math.max(0, remainingTrials * avgCompletedTrialDurationSec)
+  }, [remainingTrials, avgCompletedTrialDurationSec])
+
+  const failureReasonRollup = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const t of data?.trials ?? []) {
+      if (!(t.state === 'FAIL' || t.state === 'ERROR')) continue
+      const sd = t.user_attrs?.sequence_details
+      if (!sd || typeof sd !== 'object') {
+        counts.set('unknown_failure', (counts.get('unknown_failure') ?? 0) + 1)
+        continue
+      }
+      let had = false
+      for (const row of Object.values(sd as Record<string, unknown>)) {
+        if (!row || typeof row !== 'object') continue
+        const err = String((row as Record<string, unknown>).error ?? '').trim()
+        if (!err) continue
+        counts.set(err, (counts.get(err) ?? 0) + 1)
+        had = true
+      }
+      if (!had) counts.set('unknown_failure', (counts.get('unknown_failure') ?? 0) + 1)
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+  }, [data?.trials])
 
   const cycleTrialTableSort = useCallback((col: TrialTableSortCol) => {
     setTrialTableSort((prev) => {
@@ -2402,17 +2644,25 @@ export function OptunaSweepPage() {
     })
   }, [])
 
-  const sortedTrials = useMemo(() => {
+  const stageFilteredTrials = useMemo(() => {
     const t = data?.trials ?? []
+    if (!isV4Data || !hasV4Stages || stageFilter === 'all') return t
+    return t.filter((row) => String((row.user_attrs?.stage as string) || '').toLowerCase() === stageFilter)
+  }, [data?.trials, isV4Data, hasV4Stages, stageFilter])
+
+  const sortedTrials = useMemo(() => {
+    const t = stageFilteredTrials
     const { col, dir } = trialTableSort
     return [...t].sort((a, b) => compareTrialTableRows(a, b, col, dir))
-  }, [data?.trials, trialTableSort])
+  }, [stageFilteredTrials, trialTableSort])
 
   const runningHint = useMemo(() => {
     const incomplete = sortedTrials.filter((x) => x.state === 'RUNNING')
     if (incomplete.length) return `Trial ${incomplete[0].number} in progress…`
+    if (isV4Data && hasV4Stages && data?.meta?.stage) return `Active stage: ${String(data.meta.stage).replace('_', ' ').toUpperCase()}`
+    if (isV4Data && !hasV4Stages && data?.meta?.v4_mode) return `Mode: ${String(data.meta.v4_mode)}`
     return null
-  }, [sortedTrials])
+  }, [sortedTrials, isV4Data, hasV4Stages, data?.meta?.stage, data?.meta?.v4_mode])
 
   // Infer video names from best trial user_attrs
   const videoNames = useMemo(() => {
@@ -2438,6 +2688,10 @@ export function OptunaSweepPage() {
   useEffect(() => {
     if (!scatterParam && numericParamKeys.length) setScatterParam(numericParamKeys[0])
   }, [scatterParam, numericParamKeys])
+
+  useEffect(() => {
+    setStageFilter('all')
+  }, [sweepMode])
 
   const bestTrial = data?.best ?? null
 
@@ -2487,10 +2741,19 @@ export function OptunaSweepPage() {
         <div className="optuna-sweep-titleblock">
           <h1 className="optuna-sweep-title">
             <BarChart3 size={26} className="optuna-sweep-title-ico" aria-hidden />
-            Optuna sweep
+            {sweepMode === 'v4' ? 'V4 sweep' : 'Optuna sweep'}
           </h1>
         </div>
         <div className="optuna-sweep-actions">
+          <select
+            value={sweepMode}
+            onChange={(e) => setSweepMode((e.target.value as SweepMode) || 'v4')}
+            title="Sweep source"
+            style={{ marginRight: 8 }}
+          >
+            <option value="v4">V4</option>
+            <option value="optuna">Optuna</option>
+          </select>
           <button
             type="button"
             className="btn primary optuna-refresh"
@@ -2521,7 +2784,8 @@ export function OptunaSweepPage() {
           <p className="optuna-muted">
             If <strong>scp</strong> failed, check that <code>pose-tracking.pem</code> exists under{' '}
             <code>~/Downloads</code> or <code>~/.ssh</code>, PEM permissions, and that the instance is running. If the
-            file is not on the server yet, run the sweep on Lambda with <code>python -m tools.auto_sweep</code>. To read
+            file is not on the server yet, run the sweep on Lambda with{' '}
+            <code>{sweepMode === 'v4' ? 'python -m tools.run_v4_lambda_sweep' : 'python -m tools.auto_sweep'}</code>. To read
             only a local JSON, set <code>SWAY_LAMBDA_SWEEP_HOST=</code> when starting the Lab API.
           </p>
         </div>
@@ -2534,8 +2798,9 @@ export function OptunaSweepPage() {
           {data.meta?.hint ? <p>{data.meta.hint}</p> : null}
           <p className="optuna-muted">
             Hit <strong>Refresh</strong> for <code>sweep_status.json</code>, or <strong>Full sync (MP4s)</strong> to also
-            rsync <code>trial_*</code> from Lambda. You can also place files under <code>output/sweeps/optuna/</code> or
-            set <code>SWAY_OPTUNA_SWEEP_DIR</code> on the API process.
+            rsync <code>trial_*</code> from Lambda. You can also place files under{' '}
+            <code>{sweepMode === 'v4' ? 'output/sweeps/v4_lambda_sweep/' : 'output/sweeps/optuna/'}</code> or set{' '}
+            <code>{sweepMode === 'v4' ? 'SWAY_V4_SWEEP_DIR' : 'SWAY_OPTUNA_SWEEP_DIR'}</code> on the API process.
           </p>
         </div>
       ) : null}
@@ -2559,7 +2824,9 @@ export function OptunaSweepPage() {
             <div className="optuna-stat-card">
               <span className="optuna-stat-label">Progress</span>
               <span className="optuna-stat-value">
-                {data.n_complete} done · {data.n_pruned} pruned · {data.n_trials_total} total
+                {isV4Data && !hasV4Stages
+                  ? `${data.n_complete} done · ${startedTrialsCount} started · ${queuedTrialsCount} queued`
+                  : `${data.n_complete} done · ${data.n_pruned} pruned · ${data.n_trials_total} total`}
               </span>
               {runningHint ? <span className="optuna-stat-hint optuna-pulse">{runningHint}</span> : null}
             </div>
@@ -2573,6 +2840,153 @@ export function OptunaSweepPage() {
               </div>
             ) : null}
           </section>
+
+          {isV4Data && hasV4Stages ? (
+            <section className="optuna-info-card" style={{ marginBottom: '1rem' }}>
+              <h2 style={{ marginTop: 0 }}>V4 stage progress</h2>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.75rem' }}>
+                {stageOrder.map((st) => {
+                  const c = stageCounts[st] ?? { total: 0, complete: 0, fail: 0 }
+                  const exp = stageExpected[st] ?? Math.max(1, c.total)
+                  const pct = Math.min(100, Math.round((c.total / Math.max(1, exp)) * 100))
+                  return (
+                    <div key={st} className="optuna-stat-card">
+                      <span className="optuna-stat-label">{st.replace('_', ' ').toUpperCase()}</span>
+                      <span className="optuna-stat-value">{c.complete} complete · {c.fail} failed</span>
+                      <span className="optuna-stat-hint">{c.total}/{exp} trials</span>
+                      <div className="optuna-table-score" style={{ marginTop: 6 }}>
+                        <div className="optuna-table-score-bar" style={{ width: `${pct}%`, background: '#38bdf8' }} />
+                        <span>{pct}%</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </section>
+          ) : null}
+
+          {isV4Data && hasV4Stages ? (
+            <section className="optuna-info-card" style={{ marginBottom: '1rem' }}>
+              <h2 style={{ marginTop: 0 }}>Execution roadmap</h2>
+              <p className="optuna-muted" style={{ marginTop: 0 }}>
+                Shows what is done, what is running, and what happens next across Stage A/B/C.
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">Planned trials</span>
+                  <span className="optuna-stat-value">{startedTrialsCount}/{plannedTrialsTotal}</span>
+                  <span className="optuna-stat-hint">{remainingTrials ?? 0} remaining · {queuedTrialsCount} queued</span>
+                </div>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">Planned video-runs</span>
+                  <span className="optuna-stat-value">
+                    {(startedTrialsCount * videosPerTrialCount).toLocaleString()} / {plannedVideoRunsTotal.toLocaleString()}
+                  </span>
+                  <span className="optuna-stat-hint">{videosPerTrialCount} videos per trial</span>
+                </div>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">ETA</span>
+                  <span className="optuna-stat-value">
+                    {etaSec != null ? formatDurationSec(etaSec) : '—'}
+                  </span>
+                  <span className="optuna-stat-hint">
+                    {avgCompletedTrialDurationSec != null
+                      ? `avg ${formatDurationSec(avgCompletedTrialDurationSec)} / completed trial`
+                      : 'need completed trials first'}
+                  </span>
+                </div>
+              </div>
+              <div style={{ display: 'grid', gap: '0.5rem' }}>
+                {stageOrder.map((st) => {
+                  const c = stageCounts[st] ?? { total: 0, complete: 0, fail: 0 }
+                  const exp = Math.max(0, stageExpected[st] ?? 0)
+                  const active = String(data.meta?.stage || '').toLowerCase() === st
+                  const done = exp > 0 && c.total >= exp
+                  const state = done ? 'completed' : active ? 'running' : c.total > 0 ? 'partial' : 'pending'
+                  return (
+                    <div key={st} className="optuna-table-wrap" style={{ padding: '0.5rem 0.75rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', alignItems: 'center' }}>
+                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                          <span className={`optuna-pill optuna-pill--${state === 'completed' ? 'complete' : state === 'running' ? 'running' : 'queued'}`}>
+                            {state}
+                          </span>
+                          <strong>{st.replace('_', ' ').toUpperCase()}</strong>
+                        </div>
+                        <span className="optuna-muted mono">{c.total}/{exp} trials</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              {failureReasonRollup.length ? (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <strong style={{ fontSize: '0.9rem' }}>Top failure reasons</strong>
+                  <ul style={{ margin: '0.4rem 0 0 1rem' }}>
+                    {failureReasonRollup.map(([reason, count]) => (
+                      <li key={reason} className="optuna-muted" style={{ fontSize: '0.82rem' }}>
+                        {reason} ({count})
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+
+          {isV4Data && !hasV4Stages ? (
+            <section className="optuna-info-card" style={{ marginBottom: '1rem' }}>
+              <h2 style={{ marginTop: 0 }}>V4 full-grid progress</h2>
+              <p className="optuna-muted" style={{ marginTop: 0 }}>
+                All configurations run fully through the pipeline with no stage split.
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">Planned trials</span>
+                  <span className="optuna-stat-value">{startedTrialsCount}/{plannedTrialsTotal}</span>
+                  <span className="optuna-stat-hint">{remainingTrials ?? 0} remaining · {queuedTrialsCount} queued</span>
+                </div>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">Planned video-runs</span>
+                  <span className="optuna-stat-value">
+                    {(startedTrialsCount * videosPerTrialCount).toLocaleString()} / {plannedVideoRunsTotal.toLocaleString()}
+                  </span>
+                  <span className="optuna-stat-hint">{videosPerTrialCount} videos per trial</span>
+                </div>
+                <div className="optuna-stat-card">
+                  <span className="optuna-stat-label">ETA</span>
+                  <span className="optuna-stat-value">
+                    {etaSec != null ? formatDurationSec(etaSec) : '—'}
+                  </span>
+                  <span className="optuna-stat-hint">
+                    {avgCompletedTrialDurationSec != null
+                      ? `avg ${formatDurationSec(avgCompletedTrialDurationSec)} / completed trial`
+                      : 'need completed trials first'}
+                  </span>
+                </div>
+              </div>
+              {failureReasonRollup.length ? (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <strong style={{ fontSize: '0.9rem' }}>Top failure reasons</strong>
+                  <ul style={{ margin: '0.4rem 0 0 1rem' }}>
+                    {failureReasonRollup.map(([reason, count]) => (
+                      <li key={reason} className="optuna-muted" style={{ fontSize: '0.82rem' }}>
+                        {reason} ({count})
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {data.meta?.objective_components ? (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <strong style={{ fontSize: '0.9rem' }}>Scoring objective</strong>
+                  <p className="optuna-muted" style={{ margin: '0.4rem 0 0' }}>
+                    MOT identity/detection: {((Number(data.meta.objective_components.mot_identity_detection_weight) || 0) * 100).toFixed(0)}% ·
+                    joint tracking quality: {((Number(data.meta.objective_components.joint_tracking_weight) || 0) * 100).toFixed(0)}%
+                  </p>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
 
           {/* ── Score progress chart ── */}
           <section className="optuna-chart-section">
@@ -2789,6 +3203,19 @@ export function OptunaSweepPage() {
           <section className="optuna-split">
             <div className="optuna-table-panel">
               <h2 className="optuna-h2">All trials</h2>
+              {isV4Data && hasV4Stages ? (
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <label className="optuna-field">
+                    <span>Stage filter</span>
+                    <select className="optuna-select" value={stageFilter} onChange={(e) => setStageFilter(e.target.value)}>
+                      <option value="all">all stages</option>
+                      {stageOrder.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              ) : null}
               <p className="optuna-table-scroll-hint" role="note">
                 On a narrow screen, swipe the table horizontally to see every column (trial # stays pinned).
               </p>
@@ -2810,6 +3237,7 @@ export function OptunaSweepPage() {
                         dir={trialTableSort.dir}
                         onSort={cycleTrialTableSort}
                       />
+                      {isV4Data && hasV4Stages ? <th scope="col">Stage</th> : null}
                       <SortableTrialTh
                         col="score"
                         label="Score"
@@ -2817,6 +3245,8 @@ export function OptunaSweepPage() {
                         dir={trialTableSort.dir}
                         onSort={cycleTrialTableSort}
                       />
+                      <th scope="col">Progress</th>
+                      <th scope="col">Config diff vs best</th>
                       {videoNames.map((vn) => (
                         <SortableTrialTh
                           key={vn}
@@ -2833,6 +3263,8 @@ export function OptunaSweepPage() {
                   <tbody>
                     {sortedTrials.map((t) => {
                       const isBest = t.number === (bestTrial?.number ?? -1)
+                      const cfgDiff = trialConfigDiffSummary(t, bestTrial)
+                      const progress = trialProgressSummary(t)
                       return (
                         <tr
                           key={t.number}
@@ -2864,6 +3296,9 @@ export function OptunaSweepPage() {
                               })()}
                             </div>
                           </td>
+                          {isV4Data && hasV4Stages ? (
+                            <td className="mono">{String((t.user_attrs?.stage as string) || '—')}</td>
+                          ) : null}
                           <td>
                             <div className="optuna-table-score">
                               {typeof t.value === 'number' ? (
@@ -2878,6 +3313,28 @@ export function OptunaSweepPage() {
                                   <span>{formatValue(t.value)}</span>
                                 </>
                               ) : '—'}
+                            </div>
+                          </td>
+                          <td>
+                            <div className="optuna-table-config-diff">
+                              <span className={`optuna-pill optuna-pill--${progress.tone}`}>
+                                {progress.label}
+                              </span>
+                              <span className="optuna-muted optuna-table-config-diff-text" title={progress.detail}>
+                                {progress.detail}
+                              </span>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="optuna-table-config-diff">
+                              <span className={`optuna-pill ${cfgDiff.count === 0 ? 'optuna-pill--complete' : 'optuna-pill--running'}`}>
+                                {cfgDiff.count === 0 ? 'baseline' : `${cfgDiff.count} change${cfgDiff.count === 1 ? '' : 's'}`}
+                              </span>
+                              {cfgDiff.count > 0 ? (
+                                <span className="optuna-muted optuna-table-config-diff-text" title={cfgDiff.rows.join(' | ')}>
+                                  {cfgDiff.rows.join(' • ')}
+                                </span>
+                              ) : null}
                             </div>
                           </td>
                           {videoNames.map((vn) => {
@@ -2912,14 +3369,28 @@ export function OptunaSweepPage() {
             <div className="optuna-video-panel">
               <h2 className="optuna-h2">
                 <Film size={20} aria-hidden style={{ verticalAlign: 'middle', marginRight: 8 }} />
-                Video proof
+                {proofMode === 'video' ? 'Video proof' : 'Progress check'}
               </h2>
-              <p className="optuna-muted optuna-video-help">
-                Select a trial row or click a chart bar, then pick a benchmark sequence. Clips are read from{' '}
-                <strong>this Mac&apos;s</strong> sweep tree (same as JSON path). Remote-only previews require
-                rsync/scp of <code>trial_*</code> dirs, or run previews locally. Requires{' '}
-                <code>--phase-previews</code> on the sweep that produced the trial.
-              </p>
+              <div className="optuna-video-controls" style={{ marginBottom: '0.5rem' }}>
+                <label className="optuna-field">
+                  <span>Panel mode</span>
+                  <select className="optuna-select" value={proofMode} onChange={(e) => setProofMode((e.target.value as 'video' | 'progress') || 'video')}>
+                    <option value="video">Video proof</option>
+                    <option value="progress">Progress check</option>
+                  </select>
+                </label>
+              </div>
+              {proofMode === 'video' ? (
+                <p className="optuna-muted optuna-video-help">
+                  Select a trial row or click a chart bar, then pick a benchmark sequence. Clips are read from{' '}
+                  <strong>this Mac&apos;s</strong> sweep tree (same as JSON path). Remote-only previews require
+                  rsync/scp of <code>trial_*</code> dirs.
+                </p>
+              ) : (
+                <p className="optuna-muted optuna-video-help">
+                  Live trial monitor showing active video, active phase, and phase/overall percent progress.
+                </p>
+              )}
 
               <div className="optuna-video-controls">
                 <label className="optuna-field">
@@ -2966,13 +3437,18 @@ export function OptunaSweepPage() {
               </div>
 
               {/* Per-video scores for selected trial */}
-              {selectedTrial !== null && (() => {
+              {proofMode === 'video' && selectedTrial !== null && (() => {
                 const t = data.trials.find((x) => x.number === selectedTrial)
                 if (!t || !videoNames.length) return null
                 return (
                   <div className="optuna-selected-trial-scores">
                     <span className="optuna-h3" style={{ marginBottom: '0.5rem', display: 'block' }}>
                       Trial #{selectedTrial} scores
+                      {isV4Data && hasV4Stages ? (
+                        <span className="optuna-pill optuna-pill--complete" style={{ marginLeft: 8 }}>
+                          {String((t.user_attrs?.stage as string) || 'n/a')}
+                        </span>
+                      ) : null}
                     </span>
                     {videoNames.map((vn) => {
                       const val = t.user_attrs[`score_${vn}`]
@@ -2986,14 +3462,14 @@ export function OptunaSweepPage() {
                 )
               })()}
 
-              {mediaLoading ? (
+              {proofMode === 'video' && mediaLoading ? (
                 <div className="optuna-video-loading">
                   <Loader2 className="optuna-spin" size={28} />
                   <span>Loading clips…</span>
                 </div>
               ) : null}
 
-              {selectedTrial !== null && media && !media.items.length ? (
+              {proofMode === 'video' && selectedTrial !== null && media && !media.items.length ? (
                 <div className="optuna-video-empty-card">
                   <div className="optuna-video-empty-icon">
                     <VideoOff size={28} aria-hidden />
@@ -3024,7 +3500,7 @@ export function OptunaSweepPage() {
                 </div>
               ) : null}
 
-              {selectedTrial !== null && media && media.items.length > 0 ? (
+              {proofMode === 'video' && selectedTrial !== null && media && media.items.length > 0 ? (
                 <>
                   <label className="optuna-field optuna-field--full">
                     <span>Clip</span>
@@ -3047,15 +3523,85 @@ export function OptunaSweepPage() {
                       controls
                       playsInline
                       preload="metadata"
-                      src={fileUrl(selectedTrial, sequence, pickedClip)}
+                      src={fileUrl(sweepMode, selectedTrial, sequence, pickedClip)}
                     />
                   ) : null}
                 </>
               ) : null}
 
-              {selectedTrial === null ? (
+              {proofMode === 'video' && selectedTrial === null ? (
                 <div className="optuna-video-placeholder">
                   <p className="optuna-muted">Click a trial in the table or a chart bar to load previews.</p>
+                </div>
+              ) : null}
+
+              {proofMode === 'progress' ? (
+                <div className="optuna-selected-trial-scores">
+                  {selectedTrial === null ? (
+                    <p className="optuna-muted" style={{ margin: 0 }}>Select a trial to monitor progress.</p>
+                  ) : (() => {
+                    const t = data.trials.find((x) => x.number === selectedTrial)
+                    if (!t) return <p className="optuna-muted" style={{ margin: 0 }}>Selected trial not found.</p>
+                    const ua = t.user_attrs ?? {}
+                    const curVideo = String(ua.progress_current_video ?? '').trim() || 'pending'
+                    const curPhase = phaseLabel(ua.progress_current_phase)
+                    const nums = trialProgressNumbers(t)
+                    const transitionLikely =
+                      t.state === 'RUNNING' &&
+                      nums.phasePct != null &&
+                      nums.phasePct >= 99 &&
+                      !['done', 'failed', 'phase8_final'].includes(curPhase.toLowerCase())
+                    return (
+                      <div>
+                        <span className="optuna-h3" style={{ marginBottom: '0.5rem', display: 'block' }}>
+                          Trial #{selectedTrial} live status
+                        </span>
+                        <p className="optuna-muted" style={{ margin: '0 0 0.5rem' }}>
+                          Selected trial: <strong>#{selectedTrial}</strong> · State: <strong>{t.state}</strong>
+                        </p>
+                        <p className="optuna-muted" style={{ margin: '0 0 0.5rem' }}>
+                          Current video: <strong>{curVideo}</strong> ({nums.videoIndex}/{nums.videoTotal || 0})
+                        </p>
+                        <p className="optuna-muted" style={{ margin: '0 0 0.6rem' }}>
+                          Current pipeline phase: <strong>{curPhase}</strong>
+                        </p>
+                        <div className="optuna-table-score" style={{ marginBottom: '0.35rem' }}>
+                          <div className="optuna-table-score-bar" style={{ width: `${nums.phasePct ?? 0}%`, background: '#22c55e' }} />
+                          <span>
+                            Pipeline phase progress: {nums.phasePct != null ? `${nums.phasePct.toFixed(1)}%` : '—'}
+                            {transitionLikely ? ' (transitioning)' : ''}
+                          </span>
+                        </div>
+                        <div className="optuna-table-score">
+                          <div className="optuna-table-score-bar" style={{ width: `${nums.overallPct ?? 0}%`, background: '#38bdf8' }} />
+                          <span>
+                            Video progress: {nums.videoIndex}/{nums.videoTotal || 0}
+                            {nums.overallPct != null ? ` (${nums.overallPct.toFixed(1)}%)` : ''}
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  })()}
+                  <div style={{ marginTop: '0.75rem' }}>
+                    <strong style={{ fontSize: '0.9rem' }}>Running trials</strong>
+                    <ul style={{ margin: '0.4rem 0 0 1rem' }}>
+                      {data.trials
+                        .filter((r) => r.state === 'RUNNING')
+                        .slice(0, 8)
+                        .map((r) => {
+                          const ua = r.user_attrs ?? {}
+                          const curVideo = String(ua.progress_current_video ?? '').trim() || 'pending'
+                          const curPhase = phaseLabel(ua.progress_current_phase)
+                          const nums = trialProgressNumbers(r)
+                          return (
+                            <li key={r.number} className="optuna-muted" style={{ fontSize: '0.82rem' }}>
+                              Trial {r.number}{r.number === selectedTrial ? ' (selected)' : ''}: {curVideo} · {curPhase}
+                              {nums.phasePct != null ? ` · ${nums.phasePct.toFixed(1)}%` : ''}
+                            </li>
+                          )
+                        })}
+                    </ul>
+                  </div>
                 </div>
               ) : null}
             </div>
