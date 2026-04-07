@@ -1,0 +1,10 @@
+{
+  "phase": "B",
+  "description": "Full-pipeline ReID/fusion/association sweep on top-5 from Phase A",
+  "dimensions": [
+    "reid_technology_profile",
+    "fusion_weight_profile",
+    "post_processing_association_profile"
+  ],
+  "config_count_target": 20
+}

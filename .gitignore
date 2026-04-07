@@ -1,0 +1,12 @@
+.DS_Store
+.cursor/
+.vscode/
+backups/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local model artifacts and run outputs
+sway_pose_mvp/models/
+sway_pose_mvp/output/

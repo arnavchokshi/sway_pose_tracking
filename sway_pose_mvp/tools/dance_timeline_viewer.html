@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sway — Dance timeline (ViTPose + RTMW-X)</title>
+  <style>
+    :root {
+      --bg: #0e1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --vit: #3fb950;
+      --rtmw: #ffa657;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.45;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    header p {
+      margin: 0.35rem 0 0;
+      font-size: 0.8rem;
+      color: var(--muted);
+      max-width: 52rem;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(280px, 340px) 1fr;
+      gap: 0;
+      min-height: calc(100vh - 88px);
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .controls {
+      padding: 1rem 1.25rem;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    @media (max-width: 900px) {
+      .controls { border-right: none; border-bottom: 1px solid var(--border); }
+    }
+    .panel-block {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.85rem 1rem;
+    }
+    .panel-block h2 {
+      margin: 0 0 0.65rem;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .paths {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-family: ui-monospace, monospace;
+      word-break: break-all;
+      margin: 0 0 0.5rem;
+      line-height: 1.4;
+    }
+    .status-ok { color: var(--vit); font-size: 0.78rem; margin-top: 0.35rem; }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    select, button {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.45rem 0.65rem;
+      font-size: 0.85rem;
+    }
+    button {
+      cursor: pointer;
+      background: #21262d;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.primary {
+      background: #1f6feb;
+      border-color: #388bfd;
+      color: #fff;
+    }
+    button.primary:hover { filter: brightness(1.08); color: #fff; }
+    .timeline-wrap {
+      margin-top: 0.25rem;
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+    .frame-readout {
+      font-variant-numeric: tabular-nums;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 0.35rem;
+    }
+    .legend {
+      display: flex;
+      gap: 1rem;
+      font-size: 0.78rem;
+      margin-top: 0.5rem;
+    }
+    .legend span { display: flex; align-items: center; gap: 0.35rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .dot.vit { background: var(--vit); }
+    .dot.rtmw { background: var(--rtmw); }
+    .viewport {
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      overflow: auto;
+    }
+    .canvas-shell {
+      position: relative;
+      max-width: 100%;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: #000;
+    }
+    video {
+      display: none;
+    }
+    canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      vertical-align: middle;
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.75rem;
+      max-width: 42rem;
+      text-align: center;
+    }
+    .error {
+      color: #f85149;
+      font-size: 0.85rem;
+      margin-top: 0.5rem;
+    }
+    label.pick {
+      display: block;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin: 0.5rem 0 0.25rem;
+    }
+    input[type="file"].pick {
+      width: 100%;
+      font-size: 0.72rem;
+      color: var(--text);
+    }
+    .file-note {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 0.65rem;
+      line-height: 1.45;
+    }
+    .conf-row {
+      margin-top: 0.75rem;
+    }
+    .conf-row label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+    .conf-row label strong {
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    input.sld-vit { accent-color: var(--vit); }
+    input.sld-rtmw { accent-color: var(--rtmw); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Dance timeline viewer</h1>
+    <p>
+      You need two artifacts from <code>sway_pose_mvp/output/newTest/</code> after a full Phase 3 pipeline run:
+      <code>phase3_vitpose_overlay.json</code> (skeleton + RTMW-X points) and <code>phase3_vitpose.mp4</code> (video in sync).
+      If you open this page as <code>file://</code>, use the file pickers below—browsers will not load those paths automatically.
+      With <code>http://localhost/…</code>, Reload fetches the hardcoded paths; pickers still work as an override.
+    </p>
+  </header>
+  <main>
+    <aside class="controls">
+      <div class="panel-block">
+        <h2>Data</h2>
+        <p class="paths" id="pathLines"></p>
+        <div class="row">
+          <button type="button" id="reload">Reload (http only)</button>
+        </div>
+        <label class="pick" for="pickJson">1. phase3_vitpose_overlay.json</label>
+        <input class="pick" id="pickJson" type="file" accept="application/json,.json" />
+        <label class="pick" for="pickMp4">2. phase3_vitpose.mp4</label>
+        <input class="pick" id="pickMp4" type="file" accept="video/mp4,video/*" />
+        <p class="file-note" id="fileNote"></p>
+        <div id="err" class="error" style="display:none"></div>
+        <div id="ok" class="status-ok" style="display:none"></div>
+      </div>
+      <div class="panel-block">
+        <h2>View</h2>
+        <div class="row">
+          <label for="model" style="font-size:0.8rem;color:var(--muted)">Model</label>
+          <select id="model">
+            <option value="both">ViTPose + RTMW-X</option>
+            <option value="vit">ViTPose only</option>
+            <option value="rtmw">RTMW-X only</option>
+          </select>
+        </div>
+        <div class="row" style="margin-top:0.65rem">
+          <label for="dancer" style="font-size:0.8rem;color:var(--muted)">Dancer</label>
+          <select id="dancer">
+            <option value="all">Full dance (all detections)</option>
+            <option value="0">Detection 0</option>
+            <option value="1">Detection 1</option>
+          </select>
+        </div>
+        <div class="legend">
+          <span><i class="dot vit"></i> ViTPose</span>
+          <span><i class="dot rtmw"></i> RTMW-X</span>
+        </div>
+        <div class="conf-row">
+          <label for="vitConf"><span>ViTPose min confidence</span> <strong id="vitConfVal">0.00</strong></label>
+          <input type="range" id="vitConf" class="sld-vit" min="0" max="100" value="0" step="1" />
+        </div>
+        <div class="conf-row">
+          <label for="rtmwConf"><span>RTMW-X min confidence</span> <strong id="rtmwConfVal">0.00</strong></label>
+          <input type="range" id="rtmwConf" class="sld-rtmw" min="0" max="100" value="0" step="1" />
+        </div>
+      </div>
+      <div class="panel-block">
+        <h2>Timeline</h2>
+        <div class="row">
+          <button type="button" id="play" class="primary">Play</button>
+          <button type="button" id="pause">Pause</button>
+        </div>
+        <div class="timeline-wrap">
+          <input type="range" id="scrub" min="0" max="0" value="0" disabled />
+          <div class="frame-readout" id="readout">Frame — / — · —:—</div>
+        </div>
+      </div>
+    </aside>
+    <section class="viewport">
+      <div class="canvas-shell">
+        <video id="video" playsinline muted></video>
+        <canvas id="cv"></canvas>
+      </div>
+      <p class="hint">
+        <code>file://</code>: choose both files from <code>output/newTest</code> above. HTTP: optional
+        <code>cd sway_pose_mvp && python3 -m http.server 8765</code> →
+        <code>http://localhost:8765/tools/dance_timeline_viewer.html</code>.
+        No <code>rtmwx_keypoints_full</code> in JSON → only ViTPose draws (re-run pipeline with current export).
+      </p>
+    </section>
+  </main>
+  <script>
+    /** Hardcoded run folder (relative to this HTML file under tools/). */
+    const OUTPUT_NEWTEST_BASE = "../output/newTest";
+    const OVERLAY_URL = `${OUTPUT_NEWTEST_BASE}/phase3_vitpose_overlay.json`;
+    const VIDEO_URL = `${OUTPUT_NEWTEST_BASE}/phase3_vitpose.mp4`;
+
+    /** Same edges as sway.phase3_vitpose_viz PHASE3_SKEL_BONES (COCO-17). */
+    const COCO_BONES = [
+      [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+      [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+      [0, 1], [0, 2], [1, 3], [2, 4],
+    ];
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("cv");
+    const ctx = canvas.getContext("2d");
+    const scrub = document.getElementById("scrub");
+    const readout = document.getElementById("readout");
+    const errEl = document.getElementById("err");
+    const okEl = document.getElementById("ok");
+    const pathLines = document.getElementById("pathLines");
+    const fileNote = document.getElementById("fileNote");
+    const modelSel = document.getElementById("model");
+    const dancerSel = document.getElementById("dancer");
+
+    const isFileOrigin = location.protocol === "file:";
+    let localVideoObjectUrl = null;
+
+    let overlay = null;
+    let metaFps = 30;
+    let numFrames = 0;
+    let seekPending = false;
+    let lastPaintedFrame = -1;
+
+    function showErr(msg) {
+      errEl.style.display = msg ? "block" : "none";
+      errEl.textContent = msg || "";
+      if (msg) okEl.style.display = "none";
+    }
+
+    function showOk(msg) {
+      okEl.textContent = msg || "";
+      okEl.style.display = msg ? "block" : "none";
+    }
+
+    function applyOverlayData(data) {
+      overlay = data;
+      metaFps = Number((overlay.metadata && overlay.metadata.fps) || 30);
+      const nf =
+        (overlay.metadata && overlay.metadata.num_frames) ||
+        (overlay.frames && overlay.frames.length) ||
+        0;
+      numFrames = nf;
+      scrub.max = String(Math.max(0, numFrames - 1));
+      scrub.disabled = numFrames <= 0;
+      scrub.value = "0";
+      let maxDet = 0;
+      (overlay.frames || []).forEach((fr) => {
+        const d = (fr.detections && fr.detections.length) || 0;
+        maxDet = Math.max(maxDet, d - 1);
+      });
+      updateDancerOptions(Math.max(0, maxDet));
+      setReadout(0);
+    }
+
+    function revokeLocalVideo() {
+      if (localVideoObjectUrl) {
+        URL.revokeObjectURL(localVideoObjectUrl);
+        localVideoObjectUrl = null;
+      }
+    }
+
+    function attachVideoSrc(src, okMsg, errMsg) {
+      const onVidOk = () => {
+        showOk(okMsg);
+      };
+      const onVidBad = () => {
+        showErr(errMsg);
+      };
+      video.addEventListener("loadeddata", onVidOk, { once: true });
+      video.addEventListener("error", onVidBad, { once: true });
+      video.src = src;
+      video.load();
+      seekToFrame(0);
+    }
+
+    function loadOverlayFromText(text, sourceLabel) {
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        showErr("Invalid JSON (" + sourceLabel + "): " + e.message);
+        return false;
+      }
+      try {
+        applyOverlayData(data);
+      } catch (e) {
+        showErr("Overlay parse error: " + e.message);
+        return false;
+      }
+      showErr("");
+      if (video.src) {
+        showOk("Overlay loaded with current video.");
+      } else {
+        showOk("Overlay loaded. Choose phase3_vitpose.mp4 for video, or scrub poses on blank background.");
+      }
+      seekToFrame(0);
+      return true;
+    }
+
+    async function loadAll() {
+      showErr("");
+      showOk("");
+      revokeLocalVideo();
+      pathLines.textContent = `${OVERLAY_URL}\n${VIDEO_URL}`;
+
+      let res;
+      try {
+        res = await fetch(OVERLAY_URL, { cache: "no-store" });
+      } catch (e) {
+        showErr(
+          "Fetch failed (" + String(e.message || e) + "). Open this page via file:// and pick the two files below, or use a local HTTP server."
+        );
+        return;
+      }
+      if (!res.ok) {
+        showErr(`Overlay fetch failed: ${res.status} ${res.statusText} — ${OVERLAY_URL}`);
+        return;
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        showErr("Invalid overlay JSON: " + e.message);
+        return;
+      }
+      try {
+        applyOverlayData(data);
+      } catch (e) {
+        showErr("Overlay parse error: " + e.message);
+        return;
+      }
+
+      attachVideoSrc(
+        VIDEO_URL,
+        "Loaded output/newTest overlay + video.",
+        `Video failed to load (${VIDEO_URL}). Overlay is loaded — scrub still updates poses on a blank frame until the MP4 exists.`
+      );
+    }
+
+    function confToColor(conf) {
+      const c = Math.max(0, Math.min(1, conf));
+      const hue = (120 * c) | 0;
+      return `hsl(${hue}, 85%, 55%)`;
+    }
+
+    function sliderToMinConf(el) {
+      return Math.max(0, Math.min(1, parseInt(el.value, 10) / 100));
+    }
+
+    function updateConfLabels() {
+      document.getElementById("vitConfVal").textContent = sliderToMinConf(document.getElementById("vitConf")).toFixed(2);
+      document.getElementById("rtmwConfVal").textContent = sliderToMinConf(document.getElementById("rtmwConf")).toFixed(2);
+    }
+
+    function drawVitpose(kp, minConf) {
+      if (!kp || kp.length < 17) return;
+      const T = minConf;
+
+      ctx.lineWidth = 2;
+      for (const [a, b] of COCO_BONES) {
+        if (a >= kp.length || b >= kp.length) continue;
+        const ca = kp[a][2];
+        const cb = kp[b][2];
+        if (ca < T || cb < T) continue;
+        const boneConf = Math.min(ca, cb);
+        ctx.strokeStyle = confToColor(boneConf);
+        ctx.beginPath();
+        ctx.moveTo(kp[a][0], kp[a][1]);
+        ctx.lineTo(kp[b][0], kp[b][1]);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#3fb950";
+      for (let i = 0; i < kp.length; i++) {
+        if (kp[i][2] < T) continue;
+        ctx.beginPath();
+        ctx.arc(kp[i][0], kp[i][1], 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawRtmwxDense(kp, minConf) {
+      if (!kp || !kp.length) return;
+      const T = minConf;
+      const r = kp.length > 40 ? 2 : 3;
+      for (let i = 0; i < kp.length; i++) {
+        if (kp[i][2] < T) continue;
+        ctx.fillStyle = confToColor(kp[i][2]);
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.arc(kp[i][0], kp[i][1], r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    function detIndicesToDraw() {
+      const v = dancerSel.value;
+      if (v === "all") return null;
+      return [parseInt(v, 10)];
+    }
+
+    function paintFrame(frameIdx) {
+      if (!overlay || !overlay.frames) return;
+      const fr = overlay.frames[frameIdx];
+      if (!fr) return;
+      const w = video.videoWidth || (overlay.metadata && overlay.metadata.width) || canvas.width;
+      const h = video.videoHeight || (overlay.metadata && overlay.metadata.height) || canvas.height;
+      if (w && h && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (video.readyState >= 2) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      } else {
+        ctx.fillStyle = "#1a1f26";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      const dets = fr.detections || [];
+      const want = detIndicesToDraw();
+      const vitMin = sliderToMinConf(document.getElementById("vitConf"));
+      const rtmwMin = sliderToMinConf(document.getElementById("rtmwConf"));
+      const mode = modelSel.value;
+
+      dets.forEach((det, di) => {
+        if (want !== null && !want.includes(di)) return;
+        const vk = det.vitpose_keypoints;
+        const rk = det.rtmwx_keypoints_full;
+        if (mode === "vit" || mode === "both") {
+          if (vk) drawVitpose(vk, vitMin);
+        }
+        if (mode === "rtmw" || mode === "both") {
+          if (rk) drawRtmwxDense(rk, rtmwMin);
+        }
+      });
+    }
+
+    function updateDancerOptions(maxDet) {
+      const cur = dancerSel.value;
+      dancerSel.innerHTML = "";
+      const all = document.createElement("option");
+      all.value = "all";
+      all.textContent = "Full dance (all detections)";
+      dancerSel.appendChild(all);
+      const n = Math.max(maxDet + 1, 2);
+      for (let i = 0; i < n; i++) {
+        const o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = "Detection " + i;
+        dancerSel.appendChild(o);
+      }
+      if (cur === "all" || dancerSel.querySelector(`option[value="${cur}"]`)) {
+        dancerSel.value = cur;
+      } else {
+        dancerSel.value = "all";
+      }
+    }
+
+    function setReadout(frameIdx) {
+      const t = metaFps > 0 ? frameIdx / metaFps : 0;
+      const mm = Math.floor(t / 60);
+      const ss = (t % 60).toFixed(2);
+      readout.textContent = `Frame ${frameIdx} / ${Math.max(0, numFrames - 1)} · ${mm}:${ss.padStart(5, "0")}`;
+    }
+
+    function onScrubInput() {
+      video.pause();
+      const f = parseInt(scrub.value, 10);
+      setReadout(f);
+      seekToFrame(f);
+    }
+
+    function seekToFrame(f) {
+      if (!numFrames || !metaFps) return;
+      const fi = Math.min(numFrames - 1, Math.max(0, f));
+      if (!video.src) {
+        seekPending = false;
+        scrub.value = String(fi);
+        setReadout(fi);
+        lastPaintedFrame = fi;
+        paintFrame(fi);
+        return;
+      }
+      seekPending = true;
+      video.pause();
+      video.currentTime = fi / metaFps;
+    }
+
+    video.addEventListener("seeked", () => {
+      if (!seekPending) return;
+      seekPending = false;
+      const f = Math.min(numFrames - 1, Math.max(0, Math.round(video.currentTime * metaFps)));
+      scrub.value = String(f);
+      setReadout(f);
+      lastPaintedFrame = f;
+      paintFrame(f);
+    });
+
+    video.addEventListener("loadeddata", () => {
+      const f = parseInt(scrub.value, 10) || 0;
+      lastPaintedFrame = f;
+      paintFrame(f);
+    });
+
+    video.addEventListener("timeupdate", () => {
+      if (!numFrames || seekPending) return;
+      const f = Math.min(numFrames - 1, Math.max(0, Math.round(video.currentTime * metaFps)));
+      if (f === lastPaintedFrame) return;
+      lastPaintedFrame = f;
+      scrub.value = String(f);
+      setReadout(f);
+      paintFrame(f);
+    });
+
+    video.addEventListener("ended", () => {
+      video.pause();
+    });
+
+    document.getElementById("play").addEventListener("click", () => {
+      if (!numFrames || !video.src) return;
+      video.play().catch(() => {});
+    });
+
+    document.getElementById("pause").addEventListener("click", () => {
+      video.pause();
+    });
+
+    scrub.addEventListener("input", onScrubInput);
+
+    modelSel.addEventListener("change", () => {
+      const f = parseInt(scrub.value, 10) || 0;
+      paintFrame(f);
+    });
+    dancerSel.addEventListener("change", () => {
+      const f = parseInt(scrub.value, 10) || 0;
+      paintFrame(f);
+    });
+
+    function onConfSliderInput() {
+      updateConfLabels();
+      const f = parseInt(scrub.value, 10) || 0;
+      paintFrame(f);
+    }
+    document.getElementById("vitConf").addEventListener("input", onConfSliderInput);
+    document.getElementById("rtmwConf").addEventListener("input", onConfSliderInput);
+    updateConfLabels();
+
+    document.getElementById("reload").addEventListener("click", () => {
+      if (isFileOrigin) {
+        showErr("Reload uses network fetch. On file://, use the file pickers or open via http://localhost.");
+        return;
+      }
+      loadAll();
+    });
+
+    document.getElementById("pickJson").addEventListener("change", (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        loadOverlayFromText(reader.result, f.name);
+      };
+      reader.readAsText(f);
+    });
+
+    document.getElementById("pickMp4").addEventListener("change", (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      revokeLocalVideo();
+      localVideoObjectUrl = URL.createObjectURL(f);
+      attachVideoSrc(
+        localVideoObjectUrl,
+        "Loaded overlay + video from disk.",
+        "Could not play this video file in the browser."
+      );
+    });
+
+    pathLines.textContent = `${OVERLAY_URL}\n${VIDEO_URL}`;
+    if (isFileOrigin) {
+      fileNote.textContent =
+        "You opened this page as file:// — select both files from Desktop/…/sway_pose_mvp/output/newTest/ (same names as above).";
+    } else {
+      fileNote.textContent = "Optional: choose files from disk instead of Reload.";
+      loadAll();
+    }
+  </script>
+</body>
+</html>

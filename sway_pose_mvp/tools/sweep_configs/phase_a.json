@@ -1,0 +1,11 @@
+{
+  "phase": "A",
+  "description": "Fast tracking-only technology sweep",
+  "dimensions": [
+    "tracker_algorithm",
+    "association_metric",
+    "tracker_reid_embedding",
+    "detection_thresholds"
+  ],
+  "config_count_target": 16
+}

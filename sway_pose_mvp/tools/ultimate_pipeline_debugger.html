@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sway Ultimate Pipeline Debugger</title>
+  <style>
+    :root {
+      --bg: #0e1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --good: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+      --vit: #3fb950;
+      --rtmw: #ffa657;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 1.25rem;
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.08rem;
+      letter-spacing: -0.02em;
+    }
+    header p {
+      margin: 0.45rem 0 0;
+      font-size: 0.82rem;
+      color: var(--muted);
+      max-width: 78rem;
+      line-height: 1.45;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(320px, 380px) 1fr;
+      min-height: calc(100vh - 96px);
+    }
+    @media (max-width: 1060px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+    @media (max-width: 1060px) {
+      .sidebar {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.9rem;
+    }
+    .panel h2 {
+      margin: 0 0 0.7rem;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .path-list {
+      margin: 0 0 0.55rem;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.72rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    button, select, input[type="file"] {
+      background: #21262d;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.42rem 0.62rem;
+      font-size: 0.84rem;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.primary {
+      background: #1f6feb;
+      border-color: #388bfd;
+      color: #fff;
+    }
+    button.primary:hover {
+      color: #fff;
+      filter: brightness(1.06);
+    }
+    .pick-label {
+      margin: 0.6rem 0 0.22rem;
+      display: block;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+    .hint {
+      margin: 0.6rem 0 0;
+      font-size: 0.76rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .status {
+      margin-top: 0.55rem;
+      font-size: 0.8rem;
+    }
+    .status.good { color: var(--good); }
+    .status.bad { color: var(--bad); }
+    .tabs {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.9rem 1rem 0;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 10;
+    }
+    .tab-btn {
+      background: #11161d;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      padding: 0.45rem 0.75rem;
+      font-size: 0.82rem;
+    }
+    .tab-btn.active {
+      color: var(--text);
+      background: var(--panel);
+      border-color: #4b5560;
+    }
+    .content {
+      padding: 1rem;
+      overflow: auto;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 0.7rem;
+      margin-bottom: 0.85rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+    }
+    .card .k {
+      font-size: 0.73rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .card .v {
+      margin-top: 0.24rem;
+      font-size: 1.06rem;
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+    }
+    .table-wrap {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: auto;
+      margin-bottom: 0.85rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 560px;
+    }
+    th, td {
+      border-bottom: 1px solid #262c33;
+      padding: 0.5rem 0.6rem;
+      font-size: 0.8rem;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+    tbody tr:hover td { background: #11161d; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 0.18rem 0.55rem;
+      border: 1px solid;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .pill.good { color: var(--good); border-color: #2a6e3f; }
+    .pill.bad { color: var(--bad); border-color: #7a3131; }
+    .pill.warn { color: var(--warn); border-color: #7c5d1d; }
+    .overlay-grid {
+      display: grid;
+      grid-template-columns: minmax(300px, 370px) 1fr;
+      gap: 0.85rem;
+    }
+    @media (max-width: 1180px) {
+      .overlay-grid { grid-template-columns: 1fr; }
+    }
+    .canvas-shell {
+      position: relative;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: #000;
+      width: fit-content;
+      max-width: 100%;
+    }
+    video { display: none; }
+    canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+    .muted { color: var(--muted); }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.76rem;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    details {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+    details summary {
+      cursor: pointer;
+      color: var(--text);
+      font-size: 0.82rem;
+    }
+    pre {
+      margin: 0.65rem 0 0;
+      background: #0d1218;
+      border: 1px solid #252d36;
+      border-radius: 6px;
+      padding: 0.6rem;
+      max-height: 260px;
+      overflow: auto;
+      font-size: 0.74rem;
+      line-height: 1.38;
+      color: #dce4ec;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Sway Ultimate Pipeline Debugger</h1>
+    <p>
+      One page for Phase 5 enrollment diagnostics, Phase 3 ViTPose/RTMW-X overlay playback, and final scoring/gate review.
+      Intended for fast pipeline debugging with artifacts from <code>sway_pose_mvp/output/newTest</code>.
+    </p>
+  </header>
+  <main>
+    <aside class="sidebar">
+      <section class="panel">
+        <h2>Artifact Data Source</h2>
+        <p id="paths" class="path-list"></p>
+        <div class="row">
+          <button type="button" id="reload">Reload defaults (http only)</button>
+        </div>
+        <label class="pick-label" for="pickOverlay">phase3_vitpose_overlay.json</label>
+        <input id="pickOverlay" type="file" accept="application/json,.json" />
+        <label class="pick-label" for="pickVideo">phase3_vitpose.mp4</label>
+        <input id="pickVideo" type="file" accept="video/mp4,video/*" />
+        <label class="pick-label" for="pickGallery">gallery_identity_bank.json</label>
+        <input id="pickGallery" type="file" accept="application/json,.json" />
+        <label class="pick-label" for="pickSummary">summary.json</label>
+        <input id="pickSummary" type="file" accept="application/json,.json" />
+        <label class="pick-label" for="pickEval">evaluation_metrics.json</label>
+        <input id="pickEval" type="file" accept="application/json,.json" />
+        <label class="pick-label" for="pickReject">enrollment_reject_log.json (optional)</label>
+        <input id="pickReject" type="file" accept="application/json,.json" />
+        <div id="statusOk" class="status good" style="display:none"></div>
+        <div id="statusErr" class="status bad" style="display:none"></div>
+        <p id="modeNote" class="hint"></p>
+      </section>
+      <section class="panel">
+        <h2>Debug Snapshot</h2>
+        <div id="snapshot" class="mono">No data loaded yet.</div>
+      </section>
+    </aside>
+    <section>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="enrollment">Enrollment</button>
+        <button class="tab-btn" data-tab="overlay">Overlay</button>
+        <button class="tab-btn" data-tab="scoring">Scoring</button>
+      </div>
+      <div class="content">
+        <section class="tab-panel active" id="tab-enrollment">
+          <div id="enrollmentCards" class="cards"></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Dancer</th>
+                  <th>Name</th>
+                  <th>Enrollment Frame</th>
+                  <th>Mask Area</th>
+                  <th>Signals</th>
+                  <th>Spatial Pos</th>
+                </tr>
+              </thead>
+              <tbody id="enrollmentTableBody"></tbody>
+            </table>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Reject Reason</th>
+                  <th>Count</th>
+                </tr>
+              </thead>
+              <tbody id="rejectTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-overlay">
+          <div class="overlay-grid">
+            <div class="panel">
+              <h2>Overlay Controls</h2>
+              <div class="row">
+                <label class="muted" for="modelSel">Model</label>
+                <select id="modelSel">
+                  <option value="both">ViTPose + RTMW-X</option>
+                  <option value="vit">ViTPose only</option>
+                  <option value="rtmw">RTMW-X only</option>
+                </select>
+              </div>
+              <div class="row" style="margin-top:0.6rem;">
+                <label class="muted" for="dancerSel">Dancer</label>
+                <select id="dancerSel">
+                  <option value="all">All detections</option>
+                </select>
+              </div>
+              <div style="margin-top:0.7rem;">
+                <label class="muted" for="vitConf">ViTPose min conf <strong id="vitConfVal">0.00</strong></label>
+                <input id="vitConf" type="range" min="0" max="100" value="0" step="1" />
+              </div>
+              <div style="margin-top:0.7rem;">
+                <label class="muted" for="rtmwConf">RTMW-X min conf <strong id="rtmwConfVal">0.00</strong></label>
+                <input id="rtmwConf" type="range" min="0" max="100" value="0" step="1" />
+              </div>
+              <div class="row" style="margin-top:0.7rem;">
+                <button type="button" id="playBtn" class="primary">Play</button>
+                <button type="button" id="pauseBtn">Pause</button>
+              </div>
+              <div style="margin-top:0.6rem;">
+                <input id="scrub" type="range" min="0" max="0" value="0" disabled />
+                <div id="frameReadout" class="muted" style="margin-top:0.35rem;font-size:0.84rem;">Frame - / -</div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Overlay Viewport</h2>
+              <div class="canvas-shell">
+                <video id="video" playsinline muted></video>
+                <canvas id="cv"></canvas>
+              </div>
+              <p class="hint">
+                Overlay uses <code>vitpose_keypoints</code> and <code>rtmwx_keypoints_full</code>. On <code>file://</code>, pick files manually.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-scoring">
+          <div id="scoringCards" class="cards"></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Gate</th>
+                  <th>Status</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="gateTableBody"></tbody>
+            </table>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Metric</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="metricTableBody"></tbody>
+            </table>
+          </div>
+          <details>
+            <summary>Raw summary.json (loaded)</summary>
+            <pre id="summaryPre">No summary loaded.</pre>
+          </details>
+          <details>
+            <summary>Raw evaluation_metrics.json (loaded)</summary>
+            <pre id="evalPre">No evaluation metrics loaded.</pre>
+          </details>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const OUTPUT_BASE = "../output/newTest";
+    const DEFAULT_PATHS = {
+      overlay: `${OUTPUT_BASE}/phase3_vitpose_overlay.json`,
+      video: `${OUTPUT_BASE}/phase3_vitpose.mp4`,
+      gallery: `${OUTPUT_BASE}/gallery_identity_bank.json`,
+      summary: `${OUTPUT_BASE}/summary.json`,
+      evalMetrics: `${OUTPUT_BASE}/evaluation_metrics.json`,
+      rejectLog: `${OUTPUT_BASE}/enrollment_reject_log.json`,
+    };
+
+    const COCO_BONES = [
+      [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+      [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+      [0, 1], [0, 2], [1, 3], [2, 4],
+    ];
+
+    const state = {
+      overlay: null,
+      gallery: [],
+      summary: null,
+      evalMetrics: null,
+      rejectLog: [],
+      metaFps: 30,
+      numFrames: 0,
+      seekPending: false,
+      lastFrame: -1,
+      localVideoUrl: null,
+    };
+
+    const els = {
+      paths: document.getElementById("paths"),
+      statusOk: document.getElementById("statusOk"),
+      statusErr: document.getElementById("statusErr"),
+      modeNote: document.getElementById("modeNote"),
+      snapshot: document.getElementById("snapshot"),
+      summaryPre: document.getElementById("summaryPre"),
+      evalPre: document.getElementById("evalPre"),
+      enrollmentCards: document.getElementById("enrollmentCards"),
+      enrollmentTableBody: document.getElementById("enrollmentTableBody"),
+      rejectTableBody: document.getElementById("rejectTableBody"),
+      scoringCards: document.getElementById("scoringCards"),
+      gateTableBody: document.getElementById("gateTableBody"),
+      metricTableBody: document.getElementById("metricTableBody"),
+      video: document.getElementById("video"),
+      canvas: document.getElementById("cv"),
+      scrub: document.getElementById("scrub"),
+      frameReadout: document.getElementById("frameReadout"),
+      modelSel: document.getElementById("modelSel"),
+      dancerSel: document.getElementById("dancerSel"),
+      vitConf: document.getElementById("vitConf"),
+      rtmwConf: document.getElementById("rtmwConf"),
+      vitConfVal: document.getElementById("vitConfVal"),
+      rtmwConfVal: document.getElementById("rtmwConfVal"),
+    };
+
+    const ctx = els.canvas.getContext("2d");
+    const isFileOrigin = location.protocol === "file:";
+
+    function showErr(msg) {
+      els.statusErr.style.display = msg ? "block" : "none";
+      els.statusErr.textContent = msg || "";
+      if (msg) {
+        els.statusOk.style.display = "none";
+      }
+    }
+
+    function showOk(msg) {
+      els.statusOk.style.display = msg ? "block" : "none";
+      els.statusOk.textContent = msg || "";
+    }
+
+    function num(v, fallback = 0) {
+      return Number.isFinite(Number(v)) ? Number(v) : fallback;
+    }
+
+    function fmt(v, digits = 3) {
+      if (!Number.isFinite(Number(v))) return "-";
+      return Number(v).toFixed(digits);
+    }
+
+    function esc(str) {
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function mapToRows(obj) {
+      return Object.entries(obj || {})
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => [k, v]);
+    }
+
+    function setTab(tabId) {
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.tab === tabId);
+      });
+      document.querySelectorAll(".tab-panel").forEach((panel) => {
+        panel.classList.toggle("active", panel.id === `tab-${tabId}`);
+      });
+      if (tabId === "overlay") {
+        const f = num(els.scrub.value, 0);
+        paintFrame(f);
+      }
+    }
+
+    function renderSnapshot() {
+      const dancers = Array.isArray(state.gallery) ? state.gallery.length : 0;
+      const gateObj = (state.summary && state.summary.gate_status) || {};
+      const gateCount = Object.keys(gateObj).length;
+      const gatePass = Object.values(gateObj).filter((x) => x && x.passed === true).length;
+      const lines = [
+        `overlay frames: ${state.numFrames}`,
+        `fps: ${fmt(state.metaFps, 2)}`,
+        `gallery dancers: ${dancers}`,
+        `summary loaded: ${Boolean(state.summary)}`,
+        `evaluation metrics loaded: ${Boolean(state.evalMetrics)}`,
+        `reject events: ${Array.isArray(state.rejectLog) ? state.rejectLog.length : 0}`,
+        `gates passing: ${gatePass}/${gateCount}`,
+      ];
+      els.snapshot.textContent = lines.join("\n");
+    }
+
+    function renderEnrollment() {
+      const gallery = Array.isArray(state.gallery) ? state.gallery : [];
+      const frameVals = gallery.map((g) => num(g.enrollment_frame, 0));
+      const minFrame = frameVals.length ? Math.min(...frameVals) : 0;
+      const maxFrame = frameVals.length ? Math.max(...frameVals) : 0;
+      const avgMask = gallery.length
+        ? gallery.reduce((acc, g) => acc + num(g.reference_mask_area, 0), 0) / gallery.length
+        : 0;
+
+      const cards = [
+        ["Enrolled Dancers", String(gallery.length)],
+        ["Enrollment Frame Range", gallery.length ? `${minFrame} - ${maxFrame}` : "-"],
+        ["Avg Reference Mask Area", fmt(avgMask, 1)],
+      ];
+
+      const summaryGate = state.summary && state.summary.gate_status && state.summary.gate_status.enrollment_gate;
+      if (summaryGate) {
+        cards.push([
+          "Enrollment Gate",
+          summaryGate.passed ? "PASS" : "FAIL",
+        ]);
+        cards.push([
+          "Completion Ratio",
+          `${fmt(summaryGate.completion_ratio, 3)} / ${fmt(summaryGate.min_required_ratio, 3)}`,
+        ]);
+      }
+
+      els.enrollmentCards.innerHTML = cards.map(([k, v]) => (
+        `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`
+      )).join("");
+
+      if (!gallery.length) {
+        els.enrollmentTableBody.innerHTML = `<tr><td colspan="6" class="muted">No gallery_identity_bank data loaded.</td></tr>`;
+      } else {
+        els.enrollmentTableBody.innerHTML = gallery.map((g) => {
+          const hasGlobal = Boolean(g.global_embedding);
+          const hasFace = Boolean(g.face_embedding);
+          const partCount = Object.keys(g.part_embeddings || {}).length;
+          const colorCount = Object.keys(g.color_histograms || {}).length;
+          const sig = [
+            `global:${hasGlobal ? "Y" : "N"}`,
+            `face:${hasFace ? "Y" : "N"}`,
+            `part:${partCount}`,
+            `color:${colorCount}`,
+          ].join(" | ");
+          const pos = Array.isArray(g.spatial_position)
+            ? `${fmt(g.spatial_position[0], 3)}, ${fmt(g.spatial_position[1], 3)}`
+            : "-";
+          return `
+            <tr>
+              <td>${esc(g.dancer_id ?? "-")}</td>
+              <td>${esc(g.name || "-")}</td>
+              <td>${esc(g.enrollment_frame ?? "-")}</td>
+              <td>${fmt(g.reference_mask_area, 1)}</td>
+              <td>${esc(sig)}</td>
+              <td>${esc(pos)}</td>
+            </tr>`;
+        }).join("");
+      }
+
+      const reasonCounts = {};
+      (Array.isArray(state.rejectLog) ? state.rejectLog : []).forEach((entry) => {
+        const r = (entry && entry.reason) ? String(entry.reason) : "unknown";
+        reasonCounts[r] = (reasonCounts[r] || 0) + 1;
+      });
+      const rows = Object.entries(reasonCounts).sort((a, b) => b[1] - a[1]);
+      if (!rows.length) {
+        els.rejectTableBody.innerHTML = `<tr><td colspan="2" class="muted">No enrollment_reject_log data loaded.</td></tr>`;
+      } else {
+        els.rejectTableBody.innerHTML = rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
+      }
+    }
+
+    function renderScoring() {
+      const summary = state.summary || {};
+      const gates = summary.gate_status || {};
+      const gateRows = mapToRows(gates);
+      const passCount = gateRows.filter(([, v]) => v && v.passed === true).length;
+      const runValid = summary.run_valid_for_ranking;
+      const evalMetrics = state.evalMetrics || {};
+      const phaseTimes = summary.phase_times_ms || {};
+      const totalMs = num(phaseTimes.total, 0);
+
+      const cards = [
+        ["Run Valid For Ranking", runValid === true ? "YES" : runValid === false ? "NO" : "-"],
+        ["Gates Passing", `${passCount}/${gateRows.length}`],
+        ["Total Runtime (ms)", fmt(totalMs, 1)],
+        ["Mean Temporal Jerk", fmt(evalMetrics.mean_temporal_jerk, 4)],
+        ["Track Switch Rate", fmt(summary.tracking_diagnostics && summary.tracking_diagnostics.track_switch_rate, 4)],
+      ];
+
+      els.scoringCards.innerHTML = cards.map(([k, v]) => (
+        `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`
+      )).join("");
+
+      if (!gateRows.length) {
+        els.gateTableBody.innerHTML = `<tr><td colspan="3" class="muted">No gate_status found in summary.json.</td></tr>`;
+      } else {
+        els.gateTableBody.innerHTML = gateRows.map(([gateName, gateObj]) => {
+          const passed = gateObj && gateObj.passed === true;
+          const cls = passed ? "good" : "bad";
+          const status = passed ? "PASS" : "FAIL";
+          const details = Object.entries(gateObj || {})
+            .filter(([k]) => k !== "passed")
+            .map(([k, v]) => `${k}: ${typeof v === "number" ? fmt(v, 4) : String(v)}`)
+            .join(" | ");
+          return `
+            <tr>
+              <td>${esc(gateName)}</td>
+              <td><span class="pill ${cls}">${status}</span></td>
+              <td>${esc(details || "-")}</td>
+            </tr>`;
+        }).join("");
+      }
+
+      const numericMetrics = Object.entries(evalMetrics || {})
+        .filter(([, v]) => typeof v === "number" && Number.isFinite(v))
+        .sort(([a], [b]) => a.localeCompare(b));
+
+      if (!numericMetrics.length) {
+        els.metricTableBody.innerHTML = `<tr><td colspan="2" class="muted">No numeric metrics found in evaluation_metrics.json.</td></tr>`;
+      } else {
+        els.metricTableBody.innerHTML = numericMetrics
+          .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${fmt(v, 6)}</td></tr>`)
+          .join("");
+      }
+
+      els.summaryPre.textContent = state.summary ? JSON.stringify(state.summary, null, 2) : "No summary loaded.";
+      els.evalPre.textContent = state.evalMetrics ? JSON.stringify(state.evalMetrics, null, 2) : "No evaluation metrics loaded.";
+    }
+
+    function confToColor(conf) {
+      const c = Math.max(0, Math.min(1, num(conf, 0)));
+      const hue = (120 * c) | 0;
+      return `hsl(${hue}, 85%, 55%)`;
+    }
+
+    function sliderToConf(el) {
+      return Math.max(0, Math.min(1, parseInt(el.value, 10) / 100));
+    }
+
+    function updateOverlayLabels() {
+      els.vitConfVal.textContent = sliderToConf(els.vitConf).toFixed(2);
+      els.rtmwConfVal.textContent = sliderToConf(els.rtmwConf).toFixed(2);
+    }
+
+    function drawVitpose(kp, minConf) {
+      if (!Array.isArray(kp) || kp.length < 17) return;
+      ctx.lineWidth = 2;
+      for (const [a, b] of COCO_BONES) {
+        if (!kp[a] || !kp[b]) continue;
+        const ca = num(kp[a][2], 0);
+        const cb = num(kp[b][2], 0);
+        if (ca < minConf || cb < minConf) continue;
+        ctx.strokeStyle = confToColor(Math.min(ca, cb));
+        ctx.beginPath();
+        ctx.moveTo(num(kp[a][0], 0), num(kp[a][1], 0));
+        ctx.lineTo(num(kp[b][0], 0), num(kp[b][1], 0));
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#3fb950";
+      kp.forEach((pt) => {
+        if (num(pt[2], 0) < minConf) return;
+        ctx.beginPath();
+        ctx.arc(num(pt[0], 0), num(pt[1], 0), 3.3, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function drawRtmwxDense(kp, minConf) {
+      if (!Array.isArray(kp) || !kp.length) return;
+      const radius = kp.length > 40 ? 2 : 3;
+      kp.forEach((pt) => {
+        if (num(pt[2], 0) < minConf) return;
+        ctx.fillStyle = confToColor(pt[2]);
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.arc(num(pt[0], 0), num(pt[1], 0), radius, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+    }
+
+    function updateDancerOptions(maxIdx) {
+      const old = els.dancerSel.value;
+      els.dancerSel.innerHTML = "";
+      const all = document.createElement("option");
+      all.value = "all";
+      all.textContent = "All detections";
+      els.dancerSel.appendChild(all);
+      const n = Math.max(maxIdx + 1, 2);
+      for (let i = 0; i < n; i++) {
+        const op = document.createElement("option");
+        op.value = String(i);
+        op.textContent = `Detection ${i}`;
+        els.dancerSel.appendChild(op);
+      }
+      if (old === "all" || els.dancerSel.querySelector(`option[value="${old}"]`)) {
+        els.dancerSel.value = old;
+      } else {
+        els.dancerSel.value = "all";
+      }
+    }
+
+    function detIndicesToDraw() {
+      if (els.dancerSel.value === "all") return null;
+      return [parseInt(els.dancerSel.value, 10)];
+    }
+
+    function setReadout(frameIdx) {
+      const fps = state.metaFps > 0 ? state.metaFps : 30;
+      const t = frameIdx / fps;
+      const mm = Math.floor(t / 60);
+      const ss = (t % 60).toFixed(2).padStart(5, "0");
+      els.frameReadout.textContent = `Frame ${frameIdx} / ${Math.max(0, state.numFrames - 1)} · ${mm}:${ss}`;
+    }
+
+    function paintFrame(frameIdx) {
+      const overlay = state.overlay;
+      if (!overlay || !Array.isArray(overlay.frames)) return;
+      const fr = overlay.frames[frameIdx];
+      if (!fr) return;
+
+      const w = num(els.video.videoWidth, num(overlay.metadata && overlay.metadata.width, 1280));
+      const h = num(els.video.videoHeight, num(overlay.metadata && overlay.metadata.height, 720));
+      if (els.canvas.width !== w || els.canvas.height !== h) {
+        els.canvas.width = w;
+        els.canvas.height = h;
+      }
+      ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+      if (els.video.readyState >= 2) {
+        ctx.drawImage(els.video, 0, 0, els.canvas.width, els.canvas.height);
+      } else {
+        ctx.fillStyle = "#1a1f26";
+        ctx.fillRect(0, 0, els.canvas.width, els.canvas.height);
+      }
+
+      const dets = Array.isArray(fr.detections) ? fr.detections : [];
+      const wanted = detIndicesToDraw();
+      const mode = els.modelSel.value;
+      const vitMin = sliderToConf(els.vitConf);
+      const rtmwMin = sliderToConf(els.rtmwConf);
+
+      dets.forEach((det, idx) => {
+        if (wanted !== null && !wanted.includes(idx)) return;
+        if ((mode === "vit" || mode === "both") && det.vitpose_keypoints) {
+          drawVitpose(det.vitpose_keypoints, vitMin);
+        }
+        if ((mode === "rtmw" || mode === "both") && det.rtmwx_keypoints_full) {
+          drawRtmwxDense(det.rtmwx_keypoints_full, rtmwMin);
+        }
+      });
+    }
+
+    function seekToFrame(frameIdx) {
+      if (!state.numFrames) return;
+      const fi = Math.max(0, Math.min(state.numFrames - 1, frameIdx));
+      if (!els.video.src) {
+        els.scrub.value = String(fi);
+        setReadout(fi);
+        state.lastFrame = fi;
+        paintFrame(fi);
+        return;
+      }
+      state.seekPending = true;
+      els.video.pause();
+      els.video.currentTime = fi / (state.metaFps || 30);
+    }
+
+    function applyOverlay(data) {
+      state.overlay = data;
+      state.metaFps = num(data && data.metadata && data.metadata.fps, 30);
+      state.numFrames = num(
+        data && data.metadata && data.metadata.num_frames,
+        Array.isArray(data && data.frames) ? data.frames.length : 0
+      );
+      els.scrub.max = String(Math.max(0, state.numFrames - 1));
+      els.scrub.value = "0";
+      els.scrub.disabled = state.numFrames <= 0;
+      setReadout(0);
+
+      let maxDet = 0;
+      (Array.isArray(data.frames) ? data.frames : []).forEach((fr) => {
+        maxDet = Math.max(maxDet, (Array.isArray(fr.detections) ? fr.detections.length : 0) - 1);
+      });
+      updateDancerOptions(Math.max(0, maxDet));
+      paintFrame(0);
+    }
+
+    function revokeLocalVideo() {
+      if (state.localVideoUrl) {
+        URL.revokeObjectURL(state.localVideoUrl);
+        state.localVideoUrl = null;
+      }
+    }
+
+    function attachVideo(src, okMsg, errMsg) {
+      els.video.addEventListener("loadeddata", () => {
+        showOk(okMsg);
+        paintFrame(num(els.scrub.value, 0));
+      }, { once: true });
+      els.video.addEventListener("error", () => {
+        showErr(errMsg);
+      }, { once: true });
+      els.video.src = src;
+      els.video.load();
+      seekToFrame(0);
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+      return res.json();
+    }
+
+    async function loadDefaultsFromHttp() {
+      showErr("");
+      showOk("");
+      try {
+        const [overlay, gallery, summary, evalMetrics] = await Promise.all([
+          fetchJson(DEFAULT_PATHS.overlay),
+          fetchJson(DEFAULT_PATHS.gallery),
+          fetchJson(DEFAULT_PATHS.summary),
+          fetchJson(DEFAULT_PATHS.evalMetrics),
+        ]);
+        state.overlay = overlay;
+        state.gallery = Array.isArray(gallery) ? gallery : [];
+        state.summary = summary || null;
+        state.evalMetrics = evalMetrics || null;
+
+        try {
+          state.rejectLog = await fetchJson(DEFAULT_PATHS.rejectLog);
+          if (!Array.isArray(state.rejectLog)) state.rejectLog = [];
+        } catch {
+          state.rejectLog = [];
+        }
+
+        applyOverlay(overlay);
+        attachVideo(
+          DEFAULT_PATHS.video,
+          "Loaded default overlay/video + scoring/enrollment artifacts.",
+          "Video did not load. Overlay and JSON debug tabs still work."
+        );
+      } catch (err) {
+        showErr(`Reload failed: ${String(err.message || err)}. Use file pickers on file:// or when any artifact is missing.`);
+      } finally {
+        renderAll();
+      }
+    }
+
+    function parseJsonText(text, label) {
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        throw new Error(`Invalid JSON for ${label}: ${String(err.message || err)}`);
+      }
+    }
+
+    function bindJsonPicker(inputId, onParsed) {
+      const el = document.getElementById(inputId);
+      el.addEventListener("change", (ev) => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const parsed = parseJsonText(reader.result, file.name);
+            onParsed(parsed);
+            showErr("");
+            showOk(`Loaded ${file.name}.`);
+            renderAll();
+          } catch (err) {
+            showErr(String(err.message || err));
+          }
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    function renderAll() {
+      renderEnrollment();
+      renderScoring();
+      renderSnapshot();
+    }
+
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => setTab(btn.dataset.tab));
+    });
+
+    document.getElementById("reload").addEventListener("click", () => {
+      if (isFileOrigin) {
+        showErr("Reload uses network fetch. On file://, load files with the pickers.");
+        return;
+      }
+      loadDefaultsFromHttp();
+    });
+
+    bindJsonPicker("pickOverlay", (parsed) => {
+      applyOverlay(parsed);
+    });
+    bindJsonPicker("pickGallery", (parsed) => {
+      state.gallery = Array.isArray(parsed) ? parsed : [];
+    });
+    bindJsonPicker("pickSummary", (parsed) => {
+      state.summary = parsed || null;
+    });
+    bindJsonPicker("pickEval", (parsed) => {
+      state.evalMetrics = parsed || null;
+    });
+    bindJsonPicker("pickReject", (parsed) => {
+      state.rejectLog = Array.isArray(parsed) ? parsed : [];
+    });
+
+    document.getElementById("pickVideo").addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      revokeLocalVideo();
+      state.localVideoUrl = URL.createObjectURL(file);
+      attachVideo(
+        state.localVideoUrl,
+        "Loaded local overlay video.",
+        "Could not decode selected video in browser."
+      );
+    });
+
+    els.scrub.addEventListener("input", () => {
+      const f = num(els.scrub.value, 0);
+      setReadout(f);
+      seekToFrame(f);
+    });
+
+    els.modelSel.addEventListener("change", () => paintFrame(num(els.scrub.value, 0)));
+    els.dancerSel.addEventListener("change", () => paintFrame(num(els.scrub.value, 0)));
+    els.vitConf.addEventListener("input", () => {
+      updateOverlayLabels();
+      paintFrame(num(els.scrub.value, 0));
+    });
+    els.rtmwConf.addEventListener("input", () => {
+      updateOverlayLabels();
+      paintFrame(num(els.scrub.value, 0));
+    });
+
+    document.getElementById("playBtn").addEventListener("click", () => {
+      if (!state.numFrames || !els.video.src) return;
+      els.video.play().catch(() => {});
+    });
+    document.getElementById("pauseBtn").addEventListener("click", () => els.video.pause());
+
+    els.video.addEventListener("seeked", () => {
+      if (!state.seekPending) return;
+      state.seekPending = false;
+      const f = Math.max(0, Math.min(state.numFrames - 1, Math.round(els.video.currentTime * (state.metaFps || 30))));
+      els.scrub.value = String(f);
+      state.lastFrame = f;
+      setReadout(f);
+      paintFrame(f);
+    });
+
+    els.video.addEventListener("timeupdate", () => {
+      if (!state.numFrames || state.seekPending) return;
+      const f = Math.max(0, Math.min(state.numFrames - 1, Math.round(els.video.currentTime * (state.metaFps || 30))));
+      if (f === state.lastFrame) return;
+      state.lastFrame = f;
+      els.scrub.value = String(f);
+      setReadout(f);
+      paintFrame(f);
+    });
+
+    els.paths.textContent = [
+      DEFAULT_PATHS.overlay,
+      DEFAULT_PATHS.video,
+      DEFAULT_PATHS.gallery,
+      DEFAULT_PATHS.summary,
+      DEFAULT_PATHS.evalMetrics,
+      DEFAULT_PATHS.rejectLog,
+    ].join("\n");
+
+    if (isFileOrigin) {
+      els.modeNote.textContent = "Opened as file://. Use file pickers to load artifacts from output/newTest.";
+    } else {
+      els.modeNote.textContent = "Opened over http(s). Reload can pull default newTest paths directly.";
+      loadDefaultsFromHttp();
+    }
+
+    updateOverlayLabels();
+    renderAll();
+  </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# Reduce Cursor indexing / file-watcher load (heavy local assets; not source code)
+sway_pose_mvp/models/
+sway_pose_mvp/data/
+sway_pose_mvp/input/
+sway_pose_mvp/pipeline_lab/runs/
+sway_pose_mvp/vendor/
+sway_pose_mvp/datasets/
+sway_pose_mvp/output/
+
+# Python / Node artifacts
+**/__pycache__/
+**/.venv/
+**/venv/
+**/node_modules/
+
+# Large binaries (weights, exports)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.mp4
+*.mov

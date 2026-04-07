@@ -1,0 +1,12 @@
+{
+  "phase": "C",
+  "description": "Full-pipeline pruning and false-positive elimination sweep on top-3 from Phase B",
+  "dimensions": [
+    "stage_polygon",
+    "aspect_ratio_pruning",
+    "mirror_pruning",
+    "tier_b_thresholds",
+    "tier_c_thresholds"
+  ],
+  "config_count_target": 10
+}
