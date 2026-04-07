@@ -1,0 +1,64 @@
+# =============================================================================
+# Research-paper analog — small objects, overlapping people, robust tracking
+# =============================================================================
+# Maps a YOLO+ByteTrack research stack (EfficientViT backbone, CASPPFC neck,
+# OSNet-CA Re-ID, EIoU, two-stage association) onto **this repo’s** runtime.
+#
+# **Not available in Sway as named modules**
+# - EfficientViT backbone, CASPPFC / SPPCSPC+CA neck: standard Ultralytics YOLO26
+#   does not expose these. Use the strongest built-in weights below, or set
+#   ``SWAY_YOLO_WEIGHTS`` to an absolute path to a custom ``.pt`` you trained
+#   (may need ``SWAY_UNLOCK_DETECTION_TUNING=1`` for non-default batch/engine).
+# - OSNet-**CA** (Coordinate Attention): track-time Re-ID uses **OSNet ×0.25**
+#   (``models/osnet_x0_25_msmt17.pt`` from prefetch). There is no separate CA
+#   checkpoint hook; hybrid SAM overlap refinement is the closest “tighten
+#   boxes when people touch” lever in this codebase.
+# - **EIoU** association: BoxMOT provides IoU / GIoU / DIoU / CIoU only.
+#   ``SWAY_BOXMOT_ASSOC_METRIC: eiou`` is accepted and mapped to **CIoU**
+#   (center + aspect terms — closest analog to EIoU’s goals).
+#
+# **Two-stage association**
+# - **ByteTrack** (``SWAY_BOXMOT_TRACKER: bytetrack``): high- vs low-confidence
+#   matching is intrinsic (paper’s stage 1 / stage 2 shape). This path turns
+#   **off** hybrid SAM overlap refiner for speed (see ``main.py``).
+# - **Deep OC-SORT + OSNet** (default block below): appearance + motion/IoU
+#   association together — closer to “stage 1 = Re-ID, stage 2 = geometry”
+#   when you need embeddings through occlusions, at higher cost than ByteTrack.
+# =============================================================================
+
+# --- Part 1 analog: detection (global context + multi-scale + tight boxes) ---
+# Largest crowd-oriented detector in the Lab enum; swap to yolo26x for max capacity.
+SWAY_YOLO_WEIGHTS: yolo26l_dancetrack_crowdhuman
+SWAY_YOLO_CONF: "0.22"
+SWAY_YOLO_DETECTION_STRIDE: "1"
+# Lower = merge more overlapping boxes before track (crowds / tight formations).
+SWAY_PRETRACK_NMS_IOU: "0.62"
+# Run overlap refiner sooner — analogy to “attention to spatial extent” when people touch.
+SWAY_HYBRID_SAM_IOU_TRIGGER: "0.36"
+
+# --- Part 2 analog: tracking (Re-ID + EIoU-like geometry) ---
+SWAY_USE_BOXMOT: "1"
+SWAY_BOXMOT_TRACKER: deepocsort
+SWAY_BOXMOT_REID_ON: "1"
+# Resolved to CIoU inside tracker (see sway/tracker.py).
+SWAY_BOXMOT_ASSOC_METRIC: eiou
+# Slightly longer memory + permissive IoU/CIoU gate — occluded / crowded clips.
+SWAY_BOXMOT_MAX_AGE: "180"
+SWAY_BOXMOT_MATCH_THRESH: "0.28"
+# Optional: explicit Re-ID weights (default: models/osnet_x0_25_msmt17.pt)
+# SWAY_BOXMOT_REID_WEIGHTS: /absolute/path/to/osnet_weights.pt
+
+SWAY_PHASE13_MODE: standard
+
+# =============================================================================
+# Variant B — ByteTrack-only (paper’s two-stage **without** track-time OSNet)
+# =============================================================================
+# Comment out the Part 2 block above and uncomment below. Note: ``main.py`` sets
+# ``SWAY_HYBRID_SAM_OVERLAP=0`` for ByteTrack; re-enable SAM only with
+# ``SWAY_UNLOCK_HYBRID_SAM_TUNING=1`` if you accept the slower path.
+#
+# SWAY_USE_BOXMOT: "1"
+# SWAY_BOXMOT_TRACKER: bytetrack
+# SWAY_BOXMOT_REID_ON: "0"
+# SWAY_YOLO_CONF: "0.20"
+# SWAY_BOXMOT_MAX_AGE: "200"

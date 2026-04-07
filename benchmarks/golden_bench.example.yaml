@@ -1,0 +1,9 @@
+# Copy to golden_bench.yaml and customize. Used with:
+#   python -m tools.golden_bench --config benchmarks/golden_bench.yaml
+#
+# Paths are relative to the sway_pose_mvp repo root.
+#
+# All unit tests live in the consolidated suite (former tests/test_*.py merged).
+
+tests:
+  - tests/test_MASTER_suite.py

@@ -1,0 +1,369 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500&display=swap');
+
+.home-container {
+  --accent: #4a7cff;
+  --accent-dim: rgba(74, 124, 255, 0.25);
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #040610;
+  color: #fff;
+  font-family: 'Inter', sans-serif;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  background: radial-gradient(ellipse at 50% 50%, rgba(6, 9, 26, 0) 0%, rgba(6, 9, 26, 0.1) 30%, rgba(6, 9, 26, 0.7) 80%);
+  pointer-events: none;
+}
+
+.top-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 32px 48px;
+  pointer-events: none;
+}
+
+.logo {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  opacity: 0.4;
+}
+
+.nav {
+  display: flex;
+  gap: 40px;
+  list-style: none;
+}
+
+.nav li {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  opacity: 0.35;
+  pointer-events: auto;
+}
+
+.nav a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.nav li:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.hero {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  text-align: center;
+}
+
+.hero-label {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 6px;
+  text-transform: uppercase;
+  color: var(--accent);
+  opacity: 0.7;
+  margin-bottom: 16px;
+}
+
+.hero-word {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 72px;
+  font-weight: 700;
+  text-transform: uppercase;
+  line-height: 1;
+  text-shadow: 0 0 60px rgba(74, 124, 255, 0.3), 0 0 120px rgba(74, 124, 255, 0.1);
+}
+
+.hero-sub {
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  opacity: 0.3;
+  margin-top: 20px;
+  line-height: 1.6;
+}
+
+.hero-line {
+  width: 40px;
+  height: 1px;
+  background: var(--accent);
+  margin: 24px auto 0;
+  opacity: 0.5;
+}
+
+.panel-left {
+  position: fixed;
+  left: 48px;
+  bottom: 40px;
+  z-index: 2;
+  pointer-events: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 20px;
+}
+
+.panel-left .vertical-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  transform: rotate(180deg);
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 9px;
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  opacity: 0.2;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.panel-left .vertical-label::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 40px;
+  background: var(--accent);
+  opacity: 0.6;
+}
+
+.panel-left .coords {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.panel-left .coords span {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 3px;
+  opacity: 0.15;
+}
+
+.panel-left .coords .accent {
+  color: var(--accent);
+  opacity: 0.5;
+}
+
+.panel-right {
+  position: fixed;
+  right: 48px;
+  bottom: 40px;
+  z-index: 2;
+  pointer-events: none;
+  text-align: right;
+}
+
+.panel-right .stat {
+  margin-bottom: 28px;
+}
+
+.panel-right .stat-value {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 38px;
+  color: var(--accent);
+  line-height: 1;
+  opacity: 0.8;
+}
+
+.panel-right .stat-label {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 9px;
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  opacity: 0.25;
+  margin-top: 4px;
+}
+
+.status-badge {
+  position: fixed;
+  top: 80px;
+  right: 48px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.status-text {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--accent);
+  opacity: 0.6;
+}
+
+.bottom-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 28px 48px;
+  pointer-events: none;
+}
+
+.tag {
+  display: inline-block;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  opacity: 0.25;
+  padding: 6px 22px;
+  pointer-events: auto;
+}
+
+.tag + .tag {
+  border-left: 1px solid var(--accent-dim);
+}
+
+.corner {
+  position: fixed;
+  z-index: 2;
+  width: 30px;
+  height: 30px;
+  pointer-events: none;
+}
+
+.corner::before,
+.corner::after {
+  content: '';
+  position: absolute;
+  background: var(--accent);
+  opacity: 0.2;
+}
+
+.corner--tl {
+  top: 24px;
+  left: 24px;
+}
+.corner--tl::before {
+  top: 0;
+  left: 0;
+  width: 20px;
+  height: 1px;
+}
+.corner--tl::after {
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 20px;
+}
+
+.corner--tr {
+  top: 24px;
+  right: 24px;
+}
+.corner--tr::before {
+  top: 0;
+  right: 0;
+  width: 20px;
+  height: 1px;
+}
+.corner--tr::after {
+  top: 0;
+  right: 0;
+  width: 1px;
+  height: 20px;
+}
+
+.corner--bl {
+  bottom: 24px;
+  left: 24px;
+}
+.corner--bl::before {
+  bottom: 0;
+  left: 0;
+  width: 20px;
+  height: 1px;
+}
+.corner--bl::after {
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  height: 20px;
+}
+
+.corner--br {
+  bottom: 24px;
+  right: 24px;
+}
+.corner--br::before {
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 1px;
+}
+.corner--br::after {
+  bottom: 0;
+  right: 0;
+  width: 1px;
+  height: 20px;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@media (max-width: 900px) {
+  .panel-left,
+  .panel-right {
+    display: none;
+  }
+
+  .top-bar {
+    padding: 24px;
+  }
+
+  .hero-word {
+    font-size: 48px;
+    letter-spacing: 12px;
+  }
+}
+

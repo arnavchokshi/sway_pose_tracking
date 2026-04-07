@@ -1,0 +1,4 @@
+{"kind": "phase_summary", "phase": "1-2", "wall_s": 32.0392, "ts_unix": 1774497341.151208, "debug": {"raw_track_count": 0}}
+{"kind": "phase_summary", "phase": "3", "wall_s": 0.0027, "ts_unix": 1774497341.3658738, "debug": {"track_count": 0}}
+{"kind": "phase_summary", "phase": "4", "wall_s": 0.0002, "ts_unix": 1774497341.5703318, "debug": {"tracks_after_pre_pose_prune": 0}}
+{"kind": "phase_summary", "phase": "5", "wall_s": 2.1557, "ts_unix": 1774497343.938856, "debug": {"occluded_track_frames_skipped": 0}}

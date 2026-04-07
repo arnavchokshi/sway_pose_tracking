@@ -1,0 +1,135 @@
+# Full example matrix for:
+#   python -m tools.validate_pipeline_e2e --matrix-file benchmarks/pipeline_validate_matrix.example.yaml
+#
+# Copy to pipeline_validate_matrix.yaml and extend. Paths are relative to sway_pose_mvp/.
+#
+# Not exhaustive (combinatorial explosion): add rows for optional paths you care about, e.g.:
+#   SWAY_BIDIRECTIONAL_TRACK_PASS: "1"  (+ ffmpeg)
+#   --pose-model rtmpose  (+ MMPose install)
+#   SWAY_YOLO_HALF: "1"  (CUDA)
+presets:
+  - name: smoke_quick
+    description: Fast smoke — no hybrid SAM, no 3D lift, pose stride 2
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_yolo_stride2
+    description: Quick + YOLO every 2nd frame
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+      SWAY_YOLO_DETECTION_STRIDE: "2"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_pose_stride1
+    description: Pose every frame (slower)
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "1"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_track_stats_json
+    description: Smoke run (track_stats.json is always written after Phase 3)
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_yolo_infer_batch_2
+    description: YOLO batched predict (BoxMOT path)
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+      SWAY_UNLOCK_DETECTION_TUNING: "1"
+      SWAY_YOLO_INFER_BATCH: "2"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_vitpose_max_forward
+    description: ViTPose max instances per forward pass
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+      SWAY_VITPOSE_MAX_PER_FORWARD: "4"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_group_video_off
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+      SWAY_UNLOCK_DETECTION_TUNING: "1"
+      SWAY_GROUP_VIDEO: "0"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"
+
+  - name: smoke_global_link_off
+    env:
+      SWAY_UNLOCK_HYBRID_SAM_TUNING: "1"
+      SWAY_HYBRID_SAM_OVERLAP: "0"
+      SWAY_UNLOCK_POSE_TUNING: "1"
+      SWAY_3D_LIFT: "0"
+      SWAY_UNLOCK_PHASE3_STITCH_TUNING: "1"
+      SWAY_GLOBAL_LINK: "0"
+    args:
+      - "--pose-model"
+      - "base"
+      - "--pose-stride"
+      - "2"
+      - "--no-temporal-pose-refine"
+      - "--no-pose-3d-lift"

@@ -10,3 +10,86 @@ __pycache__/
 # Local model artifacts and run outputs
 sway_pose_mvp/models/
 sway_pose_mvp/output/
+
+# Local flight / batch videos (folder stays in repo)
+input/*
+!input/README.md
+!input/.gitkeep
+
+# Large batch queue (same idea as input/)
+data/videos_inbox/*
+!data/videos_inbox/README.md
+
+# Phase-13 sweep: local sequence list (copy from data/ground_truth/sweep_sequences.example.yaml)
+data/ground_truth/sweep_sequences.yaml
+
+# DanceTrack HF cache / temp extract (large; local only)
+dancetrack_hf/
+.dancetrack_extract_tmp/
+dancetrack_fetch.log
+
+crowdhuman_hf/
+.crowdhuman_extract_tmp/
+crowdhuman_fetch.log
+
+# Public training datasets (large; do not commit)
+datasets/dancetrack/
+datasets/dancetrack_yolo/
+datasets/crowdhuman/
+datasets/crowdhuman_yolo/
+
+# Local sweep / experiment run trees (large; do not commit)
+runs/
+_runs/
+
+# Output
+output/
+*.mp4
+*.mov
+*.json
+# Allow JS/TS toolchain manifests (parent *.json rule would hide them)
+!**/package.json
+!**/package-lock.json
+!**/tsconfig.json
+!**/tsconfig.*.json
+
+# Pipeline Lab queued runs (local only)
+pipeline_lab/runs/
+pipeline_lab/tree_presets/last_tree_queue.log
+
+# MotionAGFormer (clone locally for 3D lift; see sway/pose_lift_3d.py)
+vendor/MotionAGFormer/
+vendor/PoseFormerV2/
+
+# Model weights (folder layout tracked; blobs stay local)
+models/*
+!models/README.md
+!models/.gitkeep
+*.pt
+*.onnx
+*.engine
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+.venv_shared/
+
+# Isolated plan workspaces / shared cache assets
+plan_workspaces/
+.cache/
+
+# Node (Pipeline Lab web)
+node_modules/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
